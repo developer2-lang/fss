@@ -3328,7 +3328,7 @@ export const SupabaseService = {
       }
     } catch (err) {
       console.error('Exception deleting bank account:', err);
-      return false;
+      throw err;
     }
   },
 
