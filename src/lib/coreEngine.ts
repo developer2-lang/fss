@@ -596,6 +596,7 @@ const api = {
       savedEntry = id
         ? await api.update('entries', id, e)
         : await api.create('entries', { deleted: false, attachments: [], ...e });
+      syncDisplayedAccountBalances();
       return savedEntry;
     }
     let before: any = null;
@@ -625,6 +626,7 @@ const api = {
         console.warn('Could not sync transaction to Supabase:', sbErr);
       }
     }
+    syncDisplayedAccountBalances();
     return savedEntry;
   },
   async softDelete(id) {
@@ -632,12 +634,6 @@ const api = {
     const e = api.get('entries', id);
     const before = JSON.parse(JSON.stringify(e));
     if (api.isLocked(e.date)) throw new Error(monthLabel(ymOf(e.date), true) + ' is locked.');
-    if (e.type === 'transfer') {
-      const setDeleted = typeof window !== 'undefined' && (window as any).__supabaseSetAccountTransferDeleted;
-      if (typeof setDeleted !== 'function') throw new Error('Supabase account transfer service is not ready.');
-      const result = await setDeleted(e.supabase_id || e.id, true);
-      if (result === false) throw new Error('Could not move the account transfer to Trash in Supabase.');
-    }
     if (e.supabase_tax_statutory_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteTaxStatutoryEntry === 'function') {
       await (window as any).__supabaseDeleteTaxStatutoryEntry(e.supabase_tax_statutory_id);
     }
@@ -650,22 +646,19 @@ const api = {
     if (e.supabase_other_income_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOtherIncomeEntry === 'function') {
       await (window as any).__supabaseDeleteOtherIncomeEntry(e.supabase_other_income_id);
     }
-    if (e.type !== 'transfer' && typeof window !== 'undefined' && typeof (window as any).__supabaseCancelTransaction === 'function') {
-      const cancelled = await (window as any).__supabaseCancelTransaction(e.supabase_id || e.id, e);
-      if (cancelled === false) throw new Error('Could not move the transaction to Trash in Supabase.');
-    }
-    if (e.type === 'transfer') {
-      const deleteTransfer = typeof window !== 'undefined' && (window as any).__supabaseDeleteTransaction;
-      if (typeof deleteTransfer !== 'function') throw new Error('Supabase account transfer service is not ready.');
-      const result = await deleteTransfer(e.supabase_id || e.id, e);
-      if (result === false) throw new Error('Could not permanently delete the account transfer from Supabase.');
-    }
+    // The UI delete action is a real delete in Supabase for every transaction
+    // type. This prevents deleted UI rows from remaining in the cloud tables.
+    const deleteTransaction = typeof window !== 'undefined' && (window as any).__supabaseDeleteTransaction;
+    if (typeof deleteTransaction !== 'function') throw new Error('Supabase transaction delete service is not ready.');
+    const result = await deleteTransaction(e.supabase_id || e.id, e);
+    if (result === false) throw new Error('Could not delete the transaction from Supabase.');
     if (typeof window !== 'undefined') {
       (window as any).__excludeLedgerTransactionFromSummary?.(e.supabase_id || e.id);
     }
     Object.assign(e, { deleted: true, deletedBy: api.me().id, deletedAt: nowISO() });
     await api.log('delete', 'entries', id, describe('entries', e), null, { before, after: JSON.parse(JSON.stringify(e)) });
     Store.persist();
+    syncDisplayedAccountBalances();
     if (e.type !== 'transfer') {
       try {
         await (window as any).__refreshSupabaseAuditLogs?.();
@@ -680,10 +673,11 @@ const api = {
     const before = JSON.parse(JSON.stringify(e));
     if (api.isLocked(e.date)) throw new Error(monthLabel(ymOf(e.date), true) + ' is locked. Unlock it before restoring.');
     if (e.type === 'transfer') {
-      const setDeleted = typeof window !== 'undefined' && (window as any).__supabaseSetAccountTransferDeleted;
-      if (typeof setDeleted !== 'function') throw new Error('Supabase account transfer service is not ready.');
-      const result = await setDeleted(e.supabase_id || e.id, false);
-      if (result === false) throw new Error('Could not restore the account transfer in Supabase.');
+      const saveTransfer = typeof window !== 'undefined' && (window as any).__supabaseSaveAccountTransfer;
+      if (typeof saveTransfer !== 'function') throw new Error('Supabase account transfer service is not ready.');
+      const restored = await saveTransfer(e, null, 'restore', before);
+      if (!restored?.id) throw new Error('Could not restore the account transfer in Supabase.');
+      e.supabase_id = String(restored.id);
     }
     if (typeof window !== 'undefined') {
       (window as any).__includeLedgerTransactionInSummary?.(e.supabase_id || e.id);
@@ -694,6 +688,7 @@ const api = {
     if (e.type !== 'transfer' && typeof window !== 'undefined' && typeof (window as any).__supabaseSaveTransaction === 'function') {
       await (window as any).__supabaseSaveTransaction(e, 'restore', before);
     }
+    syncDisplayedAccountBalances();
   },
   async purge(id, options: { skipRefresh?: boolean; deferPersist?: boolean } = {}) {
     api.guard('entry.purge');
@@ -725,6 +720,7 @@ const api = {
     Store.data.entries = Store.data.entries.filter(x => x.id !== id);
     await api.log('delete', 'entries', id, `Permanently deleted · ${describe('entries', e)}`, null, { before, after: null });
     if (!options.deferPersist) Store.persist();
+    syncDisplayedAccountBalances();
   },
 
   /* ---- recurring ---- */
@@ -4155,6 +4151,22 @@ function renderByAccountCreditedDebitedHTML() {
     }
   }
 
+  // The displayed rows are calculated from live transactions. Persist the same
+  // calculated values so the Supabase table cannot remain stale after a UI change.
+  const syncKey = JSON.stringify(rawRows.map((row: any) => [
+    row.account_name,
+    String(row.transaction_type || '').toLowerCase(),
+    ...['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec', 'fy_to_date']
+      .map(month => row[month] ?? null)
+  ]));
+  if (typeof window !== 'undefined' && typeof (window as any).__syncByAccountCreditedDebited === 'function') {
+    const previousKey = (window as any).__byAccountCreditedDebitedRenderSyncKey;
+    if (previousKey !== syncKey) {
+      (window as any).__byAccountCreditedDebitedRenderSyncKey = syncKey;
+      void (window as any).__syncByAccountCreditedDebited();
+    }
+  }
+
   // Fetch account names dynamically from Supabase and known accounts
   const normAcc = (s: any) => String(s || '').replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
   const accountSet = new Set<string>();
@@ -6615,6 +6627,32 @@ PAGES.recurring = {
 
 /* ============================ MASTERS ============================ */
 const MASTER_TABS = [['client', 'Clients'], ['vendor', 'Vendors'], ['employee', 'Employees'], ['other', 'Other parties'], ['projects', 'Projects'], ['departments', 'Departments'], ['categories', 'Categories'], ['accounts', 'Bank accounts']];
+
+/** Persist the same month-end account balances that are shown in Masters. */
+function syncDisplayedAccountBalances() {
+  if (typeof window === 'undefined' || typeof (window as any).__syncByAccountTransfer !== 'function') return;
+  const periods = fyPeriods(S.fy, 'monthly');
+  const monthName: Record<string, string> = {
+    '01': 'jan', '02': 'feb', '03': 'mar', '04': 'apr', '05': 'may', '06': 'jun',
+    '07': 'jul', '08': 'aug', '09': 'sep', '10': 'oct', '11': 'nov', '12': 'dec'
+  };
+  const rows = api.list('accounts').map((account: any) => {
+    const values: Record<string, number | null> = {
+      jan: null, feb: null, mar: null, apr: null, may: null, jun: null,
+      jul: null, aug: null, sep: null, oct: null, nov: null, dec: null
+    };
+    periods.forEach((period: any) => {
+      const month = monthName[String(period.to || '').slice(5, 7)];
+      if (month) values[month] = Calc.balance(account.id, period.to < TODAY ? period.to : TODAY);
+    });
+    const latestValue = periods.length
+      ? Calc.balance(account.id, periods[periods.length - 1].to < TODAY ? periods[periods.length - 1].to : TODAY)
+      : Calc.balance(account.id, TODAY);
+    return { bank_name: account.name, ...values, fy_to_date: latestValue, shares: null };
+  });
+  void (window as any).__syncByAccountTransfer(rows);
+}
+
 function masterDef(tab) {
   const kinds = ['client', 'vendor', 'employee', 'other'];
   if (kinds.includes(tab)) return {
@@ -6731,6 +6769,7 @@ const permKey = (perm, act) => ['party', 'project'].includes(perm) ? perm + '.' 
 PAGES.masters = {
   title: 'Masters',
   render() {
+    syncDisplayedAccountBalances();
     const tab = S.master, def = masterDef(tab);
     const recs = api.list(def.col).filter(def.filter).slice().sort((a, b) => (b.active - a.active) || String(a.code || a.name).localeCompare(String(b.code || b.name)));
     const canAdd = api.can(permKey(def.perm, 'create'));

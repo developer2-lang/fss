@@ -4738,7 +4738,7 @@ export const SupabaseService = {
         if (!data?.length) throw new Error('Supabase did not confirm permanent deletion of the transaction.');
       }
 
-      void (async () => {
+      await (async () => {
         try {
           let mirrorMatch: any = null;
           if (await isFssTransactionsAvailable()) {
