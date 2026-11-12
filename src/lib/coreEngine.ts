@@ -5590,7 +5590,6 @@ function openEntryForm({ mode = 'new', entry = null, rec = null, period = null, 
   F.sub = F.kind ? subOfEntry(F.kind, v) : null;
   F.period = F.kind === 'tax' ? (/for (\w+ \d{4})/.test(v.description || '') ? null : addMonths(ymOf(v.date || TODAY), -1)) : null;
   if (F.kind === 'tax' && !F.period) { const m = (v.description || '').match(/for (\w+) (\d{4})/); F.period = m ? m[2] + '-' + pad2(MONTH_LONG.indexOf(m[1]) + 1) : addMonths(ymOf(v.date || TODAY), -1); }
-  F.piMode = F.kind === 'client' ? (v.piId || !v.partyId ? 'pi' : 'nopi') : 'pi';
   F.showGst = +v.gstRate > 0; F.showTds = +v.tdsRate > 0;
   if (F.kind && !entry && !rec && preset.kind) F.kind = preset.kind;
   if (preset.taxSub) F.sub = preset.taxSub; if (preset.taxPeriod) F.period = preset.taxPeriod;
@@ -5684,9 +5683,6 @@ function openEntryForm({ mode = 'new', entry = null, rec = null, period = null, 
     if (a === 'kind') { startKind(F, b.dataset.v); F.errs = {}; draw(); const first = $('.ef-main select, .ef-main input', body); first && first.focus(); return; }
     if (a === 'kind-reset') { F.kind = null; F.errs = {}; return draw(); }
     if (a === 'sub') { if (F.kind === 'employee') setEmpSub(F, b.dataset.v); else setTaxSub(F, b.dataset.v); return draw(); }
-    if (a === 'pick-pi') { pickPI(F, b.dataset.id); return draw(); }
-    if (a === 'nopi') { F.piMode = 'nopi'; if (v.piId) { v.piId = '';['projectId', 'refNo', 'description', 'categoryId'].forEach(k => { if (F.auto[k]) { v[k] = ''; F.auto[k] = false; } }); if (F.auto.departmentId) { v.departmentId = ''; F.auto.departmentId = false; F.deptAuto = true; } v.taxable = ''; } F.open.cat = !v.categoryId; F.open.dept = !v.departmentId; return draw(); }
-    if (a === 'usepi') { F.piMode = 'pi'; return draw(); }
     if (a === 'open') { const k = b.dataset.k; if (k === 'more') F.more = !F.more; else if (k === 'email') F.emailOpen = !F.emailOpen; else if (k === 'gst') { F.showGst = true; if (!+v.gstRate) { v.gstRate = 18; const p = api.get('parties', v.partyId); v.gstType = p && p.gstType !== 'none' ? p.gstType : 'intra'; F.gstAuto = true; } } else if (k === 'tds') { F.showTds = true; if (!+v.tdsRate) { v.tdsRate = F.kind === 'vendor' ? 2 : 10; F.tdsAuto = true; } } else if (k === 'allcats') F.allCats = !F.allCats; else F.open[k] = !F.open[k]; return draw(); }
     if (a === 'use-suggest') { v.taxable = +b.dataset.v; F.gstAuto = F.tdsAuto = true; return draw(); }
     if (a === 'pick-file') return $('#fFiles', body).click();
@@ -5740,7 +5736,7 @@ function resetForKind(F, k) {
   const v = F.v, K = KIND[k];
   Object.assign(v, { type: K.type, partyKind: K.pk || '', partyId: '', categoryId: '', departmentId: '', projectId: '', piId: '', gstRate: 0, gstType: 'none', gstAmount: 0, tdsRate: 0, tdsAmount: 0, itc: K.type === 'outflow', toAccountId: '' });
   if (!F.mode.startsWith('template') && F.mode !== 'edit') { v.description = ''; v.refNo = ''; }
-  Object.assign(F, { deptAuto: true, gstAuto: true, tdsAuto: true, showGst: false, showTds: false, open: {}, auto: {}, allCats: false, remembered: null, piMode: 'pi', email: null });
+  Object.assign(F, { deptAuto: true, gstAuto: true, tdsAuto: true, showGst: false, showTds: false, open: {}, auto: {}, allCats: false, remembered: null, email: null });
 }
 function _startKind(F, k, keepValues) {
   const prevKind = F.kind; F.kind = k;
@@ -5815,25 +5811,17 @@ function _setClient(F, id) {
       F.auto.departmentId = false;
     }
   }
-  const unpaid = api.list('pis').filter(p => p.clientId === id && p.status !== 'cancelled' && Sales.piState(p).outstanding > 0);
-  F.piMode = unpaid.length ? 'pi' : 'nopi';
-  if (unpaid.length === 1) pickPI(F, unpaid[0].id);
-  else { const p = api.get('parties', id); v.gstRate = 18; v.gstType = p && p.gstType !== 'none' ? p.gstType : 'intra'; v.tdsRate = 10; F.showGst = F.showTds = true; F.gstAuto = F.tdsAuto = true; const L = lastEntry(e => e.partyId === id && e.type === 'inflow'); if (L) { v.accountId = L.accountId; v.paymentMode = L.paymentMode; } }
-  F.open.cat = F.piMode === 'nopi' && !v.categoryId;
+  const p = api.get('parties', id);
+  v.gstRate = 18;
+  v.gstType = p && p.gstType !== 'none' ? p.gstType : 'intra';
+  v.tdsRate = 10;
+  F.showGst = F.showTds = true;
+  F.gstAuto = F.tdsAuto = true;
+  const L = lastEntry(e => e.partyId === id && e.type === 'inflow');
+  if (L) { v.accountId = L.accountId; v.paymentMode = L.paymentMode; }
+  F.open.cat = !v.categoryId;
 }
 function setClient(F, id) { const r = _setClient(F, id); applyBankLock(F); return r; }
-function _pickPI(F, id) {
-  const v = F.v, pi = api.get('pis', id); if (!pi) return;
-  const o = Sales.orderOfPI(pi), st = Sales.piState(pi);
-  Object.assign(v, { piId: pi.id, partyId: pi.clientId, partyKind: 'client', projectId: pi.projectId || '', taxable: st.outstandingTaxable || pi.taxable, gstRate: pi.gstRate, gstType: pi.gstType, tdsRate: pi.tdsRate, categoryId: catForPI(pi) });
-  if (F.deptAuto && o) v.departmentId = o.departmentId;
-  F.auto = { ...F.auto, categoryId: true, departmentId: true, projectId: true };
-  if (F.auto.refNo !== false) { v.refNo = pi.taxInvoiceNo || pi.piNo; F.auto.refNo = true; }
-  if (F.auto.description !== false) { v.description = pi.milestone; F.auto.description = true; }
-  F.showGst = +pi.gstRate > 0; F.showTds = true; F.gstAuto = F.tdsAuto = true; F.piMode = 'pi';
-  const L = lastEntry(e => e.partyId === pi.clientId && e.type === 'inflow'); if (L) { v.accountId = L.accountId; v.paymentMode = L.paymentMode; }
-}
-function pickPI(F, id) { const r = _pickPI(F, id); applyBankLock(F); return r; }
 
 /* ---- rendering ---- */
 function billDateField(F, f) {
@@ -5908,18 +5896,11 @@ function formBody(F) {
     m += `<div class="fsec"><div class="fgrid">${f('categoryId', 'What for *', sel('categoryId', catSelectOptions(catsFor(F), v.categoryId)), '', `<a href="#" data-f-act="open" data-k="allcats">${F.allCats ? 'Show the usual categories' : 'Show all categories'}</a>`)}${partySel('other', F.kind === 'other_out' ? 'Paid to' : 'Received from', 'Select')}${v.categoryId ? deptChip() : ''}</div></div>`;
     if (v.categoryId) m += `<div class="fsec"><div class="fgrid c4">${money_('taxable', 'Amount' + (F.showGst ? ' before GST' : '') + ' *', F.remembered ? 'Last time: ' + money(F.remembered.amount) + ' on ' + fmtDate(F.remembered.date) : '', 'span2')}${gstTds(F.kind === 'other_in' ? 'TDS deducted by payer' : 'TDS deducted')}${F.kind === 'other_out' && F.showTds && +v.tdsRate && typeof tdsSectionField === 'function' ? tdsSectionField(F, f, sel) : ''}</div>${gstTdsLinks('TDS')}</div>`;
   } else if (F.kind === 'client') {
-    const clients = api.list('parties').filter(p => p.kind === 'client' && (p.active || p.id === v.partyId)).map(p => ({ p, n: api.list('pis').filter(x => x.clientId === p.id && x.status !== 'cancelled' && Sales.piState(x).outstanding > 0).length })).sort((a, b) => (b.n > 0) - (a.n > 0) || a.p.name.localeCompare(b.p.name));
-    m += `<div class="fsec"><div class="fgrid">${f('partyId', 'Client *', `<div class="row" style="flex-wrap:nowrap;gap:6px"><select class="select" data-f="partyId"><option value="">Select client</option>${clients.map(x => `<option value="${x.p.id}"${x.p.id === v.partyId ? ' selected' : ''}>${esc(x.p.name)}${x.n ? ` · ${x.n} unpaid PI${x.n > 1 ? 's' : ''}` : ''}</option>`).join('')}</select><button type="button" class="btn" style="padding:0 10px" data-f-act="new-party">${icon('plus')}</button></div>`, 'span2')}</div></div>`;
+    const clients = api.list('parties').filter(p => p.kind === 'client' && (p.active || p.id === v.partyId)).sort((a, b) => a.name.localeCompare(b.name));
+    m += `<div class="fsec"><div class="fgrid">${f('partyId', 'Client *', `<div class="row" style="flex-wrap:nowrap;gap:6px"><select class="select" data-f="partyId"><option value="">Select client</option>${clients.map(p => `<option value="${p.id}"${p.id === v.partyId ? ' selected' : ''}>${esc(p.name)}</option>`).join('')}</select><button type="button" class="btn" style="padding:0 10px" data-f-act="new-party">${icon('plus')}</button></div>`, 'span2')}</div></div>`;
     if (v.partyId) {
-      const unpaid = api.list('pis').filter(p => (p.clientId === v.partyId && p.status !== 'cancelled' && Sales.piState(p).outstanding > 0) || p.id === v.piId).sort((a, b) => a.dueDate.localeCompare(b.dueDate));
-      if (F.piMode === 'pi' && !isTpl) {
-        m += `<div class="fsec"><div class="fsec-h">Which invoice is this payment for?</div><div class="ef-pis">${unpaid.map(p => { const st = Sales.piState(p); return `<button type="button" class="ef-pi ${v.piId === p.id ? 'on' : ''}" data-f-act="pick-pi" data-id="${p.id}"><span class="ef-radio"></span><div class="grow"><b class="mono">${esc(p.piNo.split('/').slice(-2).join('/'))}</b> <span class="muted">· ${esc(nameOf('projects', p.projectId))}</span><div class="muted" style="font-size:12px">${esc(p.milestone)}</div></div><div style="text-align:right"><div class="num" style="font-weight:600">${money(st.outstanding)}</div>${st.overdueDays ? `<span class="chip overdue">${st.overdueDays}d overdue</span>` : `<span class="muted" style="font-size:11.5px">due ${fmtDate(p.dueDate)}</span>`}</div></button>`; }).join('') || '<div class="muted" style="font-size:13px">No unpaid PIs for this client.</div>'}</div>
-          <button type="button" class="ef-link" data-f-act="nopi" style="margin-top:8px">No PI — advance or other receipt</button></div>`;
-        if (v.piId) m += `<div class="fsec"><div class="fgrid c4">${money_('taxable', 'Invoice value settled, before GST *', 'Full balance pre-filled · change for a part payment', 'span2')}${f('gstRate', 'GST', sel('gstRate', opts(GST_RATES.map(r => [r, r + '%']), v.gstRate)))}${f('tdsRate', 'TDS by client', sel('tdsRate', opts(TDS_RATES.map(r => [r, r + '%']), v.tdsRate)))}</div>${taxInvoiceToggle(F)}</div>`;
-      } else {
-        m += `<div class="fsec">${unpaid.length && !isTpl ? `<div class="notice info" style="margin-bottom:12px">${icon('info')}<div>Recording without a PI. <a href="#" data-f-act="usepi">Link it to one of ${unpaid.length} unpaid PI${unpaid.length > 1 ? 's' : ''} instead</a></div></div>` : ''}<div class="fgrid">${catChip()}${f('projectId', 'Project', sel('projectId', projOptions(v.partyId, v.projectId, 'No project')))}${deptChip()}</div></div>
-          <div class="fsec"><div class="fgrid c4">${money_('taxable', 'Amount before GST *', '', 'span2')}${gstTds('TDS by client')}</div>${gstTdsLinks('TDS')}</div>`;
-      }
+      m += `<div class="fsec"><div class="fgrid">${catChip()}${f('projectId', 'Project', sel('projectId', projOptions(v.partyId, v.projectId, 'No project')))}${deptChip()}</div></div>
+        <div class="fsec"><div class="fgrid c4">${money_('taxable', 'Amount before GST *', '', 'span2')}${gstTds('TDS by client')}</div>${gstTdsLinks('TDS')}</div>`;
     }
   }
   // attachments (compact)
@@ -5933,13 +5914,14 @@ function formBody(F) {
     ${F.kind === 'transfer' ? f('description', 'Description', inp('description', 'placeholder="e.g. Petty cash top-up"'), 'span2') : ''}</div></div>`;
   // more details
   if (ready && F.kind !== 'transfer') {
-    m += `<button type="button" class="ef-more ${F.more ? 'open' : ''}" data-f-act="open" data-k="more">${icon('chev')} More details <span class="faint">${['description', F.kind === 'client' && F.piMode === 'pi' ? 'invoice no.' : '', 'project', 'notes', F.showGst ? 'GST type & ITC' : '', F.mode === 'new' ? 'repeat' : ''].filter(Boolean).join(' · ')}</span></button>`;
+    m += `<button type="button" class="ef-more ${F.more ? 'open' : ''}" data-f-act="open" data-k="more">${icon('chev')} More details <span class="faint">${['description', F.kind === 'client' && v.piId ? 'invoice no.' : '', 'project', 'notes', F.showGst ? 'GST type & ITC' : '', F.mode === 'new' ? 'repeat' : ''].filter(Boolean).join(' · ')}</span></button>`;
     if (F.more) m += `<div class="fsec ef-morebox"><div class="fgrid">
       ${f('description', 'Description', inp('description', 'placeholder="What was this for?"'), 'span2')}
-      ${(F.kind === 'client' && F.piMode === 'pi') || F.kind === 'other_out' || F.kind === 'other_in' || F.kind === 'employee' ? f('refNo', F.kind === 'client' ? 'Invoice no.' : 'Reference no.', inp('refNo')) : ''}
-      ${['vendor', 'employee', 'other_out', 'other_in'].includes(F.kind) || (F.kind === 'client' && F.piMode === 'pi') ? f('projectId', 'Project', sel('projectId', projOptions(F.kind === 'client' ? v.partyId : '', v.projectId, 'No project'))) : ''}
+      ${(F.kind === 'client' && v.piId) || F.kind === 'other_out' || F.kind === 'other_in' || F.kind === 'employee' ? f('refNo', F.kind === 'client' ? 'Invoice no.' : 'Reference no.', inp('refNo')) : ''}
+      ${['vendor', 'employee', 'other_out', 'other_in'].includes(F.kind) ? f('projectId', 'Project', sel('projectId', projOptions('', v.projectId, 'No project'))) : ''}
       ${F.kind !== 'tax' ? f('departmentId', 'Department', sel('departmentId', deptOptions(v.departmentId))) : ''}
       ${F.showGst && +v.gstRate ? f('gstType', 'GST type', sel('gstType', opts([['intra', GST_TYPES.intra], ['inter', GST_TYPES.inter]], v.gstType))) + f('gstAmount', 'GST amount (₹)', inp('gstAmount', 'type="number" step="0.01" min="0"'), '', 'Auto · override if the bill differs') : ''}
+      ${F.kind === 'client' && v.piId ? taxInvoiceToggle(F) : ''}
       ${F.showTds && +v.tdsRate ? f('tdsAmount', 'TDS amount (₹)', inp('tdsAmount', 'type="number" step="0.01" min="0"'), '', 'Auto · override if needed') : ''}
       ${K.type === 'outflow' && F.showGst && +v.gstRate ? `<div class="field" style="justify-content:flex-end"><label class="check" style="height:38px"><input type="checkbox" data-f="itc" ${v.itc ? 'checked' : ''}> Input GST claimable</label></div>` : ''}
       ${!isTpl ? f('notes', 'Notes', `<textarea class="textarea" data-f="notes" rows="2">${esc(v.notes || '')}</textarea>`, 'span3') : ''}
