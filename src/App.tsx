@@ -1048,7 +1048,9 @@ export function deduplicateEntries(entries: any[]): any[] {
     const toAccount = norm(e.toAccountId || e.transferToAccountName || e.toAccountName);
     const reference = norm(e.txnRef || e.refNo || e.reference_no || e.reference_number);
     const description = norm(e.description);
-    const signature = `${date}|${type}|${amt}|${netAmt}|${category}|${party}|${project}|${account}|${toAccount}|${reference}|${description}`;
+    const signature = type === 'inflow'
+      ? `${date}|${type}|${amt}|${netAmt}|${party}|${account}|${reference}`
+      : `${date}|${type}|${amt}|${netAmt}|${category}|${party}|${project}|${account}|${toAccount}|${reference}|${description}`;
     if (seenSignatures.has(signature)) {
       continue;
     }
@@ -1758,6 +1760,49 @@ export const App: React.FC = () => {
         SupabaseService.loadCancelledTransactionsFromSupabase()
       ]);
 
+      // Keep an account-scoped authoritative copy for balance calculations.
+      // The ledger already uses this filtered Supabase path; using it here
+      // prevents stale local rows from changing Balance today.
+      try {
+        const openingDate = Store.data.settings?.openingDate || '1900-01-01';
+        const accountRows = await Promise.all((Store.data.accounts || []).map((account: any) =>
+          SupabaseService.queryFssTransactions({
+            account: account.name,
+            from: openingDate,
+            to: '9999-12-31'
+          })
+        ));
+        const authoritativeRows = accountRows.flat();
+        const seen = new Set<string>();
+        const normalizeTransactionPart = (value: any) =>
+          String(value ?? '').trim().toLowerCase().replace(/[â€“â€”]/g, '-').replace(/\s+/g, ' ');
+        Store.data.authoritativeAccountTransactions = authoritativeRows.filter((row: any) => {
+          const type = normalizeTransactionPart(row.transaction_type || row.type);
+          const amount = Math.abs(Number(row.net_cash ?? row.amount ?? row.taxable_amount) || 0).toFixed(2);
+          const baseKey = [
+            normalizeTransactionPart(row.transaction_date || row.date),
+            type,
+            amount,
+            normalizeTransactionPart(row.reference_number || row.reference_no),
+            normalizeTransactionPart(row.party_name || row.party),
+            normalizeTransactionPart(row.account_name || row.account),
+            normalizeTransactionPart(row.transfer_from_account_name),
+            normalizeTransactionPart(row.transfer_to_account_name)
+          ].join('|');
+          // Receipt and import rows can use different labels for the same
+          // bank movement. Match inflows by their bank identity fields.
+          const key = type === 'inflow'
+            ? `inflow|${baseKey}`
+            : `${baseKey}|${normalizeTransactionPart(row.category)}|${normalizeTransactionPart(row.description)}|${normalizeTransactionPart(row.project_name || row.project)}|${normalizeTransactionPart(row.department)}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+      } catch (accountLoadError) {
+        console.warn('Could not load account-scoped transactions for balances:', accountLoadError);
+        Store.data.authoritativeAccountTransactions = [];
+      }
+
       if (supabaseTransactions && Store.data?.entries) {
         const transactionIds = new Set(supabaseTransactions.map((transaction: any) => String(transaction.id)));
         Store.data.supabaseTransactionIds = [...transactionIds];
@@ -1779,9 +1824,18 @@ export const App: React.FC = () => {
           return isFormBacked || entry.isUserCreated;
         });
         supabaseTransactions.forEach((st: any) => {
+          // A Supabase row has a stable ID. Passing every local row here lets
+          // convertFssTransactionToLocal match an unrelated legacy row that
+          // happens to have the same date, type, amount, and description.
+          // That is especially dangerous for transfers and account-specific
+          // inflows. Hydrate by cloud identity; unsynced local rows are kept
+          // by the cleanup above and are not candidates for a cloud row.
+          const matchingCloudEntries = Store.data.entries.filter((entry: any) =>
+            String(entry.supabase_id || '') === String(st.id)
+          );
           const entryRecord = convertFssTransactionToLocal(
             st,
-            Store.data.entries,
+            matchingCloudEntries,
             Store.data.parties || [],
             Store.data.projects || [],
             Store.data.departments || [],
@@ -1789,12 +1843,18 @@ export const App: React.FC = () => {
             Store.data.accounts || []
           );
           const normStr = (s: any) => String(s || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+          const sameTransferAccounts = (candidate: any) => {
+            if (String(st.transaction_type || '').toLowerCase() !== 'transfer') return true;
+            return String(candidate.accountId || '') === String(entryRecord.accountId || '') &&
+              String(candidate.toAccountId || '') === String(entryRecord.toAccountId || '');
+          };
           const existingIdx = Store.data.entries.findIndex(
             (e: any) => (e.supabase_id && e.supabase_id === st.id) ||
                         (e.id === st.id || e.id === `e_${st.id}`) ||
                         (st.reference_number && e.refNo && normStr(e.refNo) === normStr(st.reference_number)) ||
                         (e.date === st.transaction_date &&
                          String(e.type || '').toLowerCase() === String(st.transaction_type || '').toLowerCase() &&
+                         sameTransferAccounts(e) &&
                          Math.abs((Number(e.taxable) || Number(e.amount) || 0) - (Number(st.taxable_amount) || Number(st.net_cash) || 0)) < 1 &&
                          Boolean(normStr(e.description) && normStr(st.description) &&
                          (normStr(e.description) === normStr(st.description) || normStr(e.description).includes(normStr(st.description)) || normStr(st.description).includes(normStr(e.description)))))
@@ -3375,6 +3435,21 @@ export const App: React.FC = () => {
         const before = entry ? { ...entry, deleted: !deleted, status: deleted ? 'Active' : 'Cancelled' } : null;
         const result = await SupabaseService.setAccountTransferDeleted(id, deleted, deletedBy);
         if (result) {
+          // Keep the local cache in the same state as Supabase immediately.
+          // Without this, balance cards could keep counting a deleted transfer
+          // until the next full hydration/reload.
+          if (entry) {
+            entry.deleted = deleted;
+            entry.status = deleted ? 'Cancelled' : 'Active';
+            entry.deletedAt = deleted ? new Date().toISOString() : null;
+            entry.deletedBy = deleted ? deletedBy : null;
+            Store.persist();
+          }
+          if (deleted) {
+            (window as any).__excludeLedgerTransactionFromSummary?.(id);
+          } else {
+            (window as any).__includeLedgerTransactionInSummary?.(id);
+          }
           const after = entry ? { ...entry, deleted, status: deleted ? 'Cancelled' : 'Active' } : null;
           await recordSupabaseAudit(
             deleted ? 'delete' : 'restore',
@@ -3384,6 +3459,7 @@ export const App: React.FC = () => {
             before,
             after
           );
+          render({ keepScroll: true });
         }
         return result;
       };

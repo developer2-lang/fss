@@ -879,6 +879,22 @@ export function computeByAccountCreditedDebitedRows(
 
   const rows: any[] = [];
 
+  // Use the transaction's actual cash impact. Local entries may keep
+  // `amount` as the taxable value, so falling back to amount first makes
+  // the account summary disagree with the ledger net total.
+  const netCashForEntry = (entry: any): number => {
+    if (entry.net_cash != null && entry.net_cash !== '') return Math.abs(Number(entry.net_cash) || 0);
+    if (entry.netCash != null && entry.netCash !== '') return Math.abs(Number(entry.netCash) || 0);
+    if (String(entry.type || entry.transaction_type || '').toLowerCase() === 'transfer') {
+      return Math.abs(Number(entry.amount) || 0);
+    }
+    return Math.abs(
+      Number(entry.netAmount != null && entry.netAmount !== ''
+        ? entry.netAmount
+        : (+entry.taxable || 0) + (+entry.gstAmount || 0) - (+entry.tdsAmount || 0)) || 0
+    );
+  };
+
   for (const accName of accountNames) {
     const normTarget = normalizeAccountName(accName);
     const targetAcc = (accounts || []).find((a: any) => normalizeAccountName(a.name) === normTarget);
@@ -974,20 +990,13 @@ export function computeByAccountCreditedDebitedRows(
       // 1. Debited (Outflows & Transfers out)
       const debitedEntries = matching.filter(e => {
         if (e.type === 'outflow' || String(e.transaction_type || '').toLowerCase() === 'outflow') return matchesAccount(e, false);
-        if (e.type === 'transfer') return matchesAccount(e, false);
+        // Transfers move money between the company's own accounts. They are
+        // shown in Transactions and handled by account balances, but must not
+        // inflate this credited/debited cash summary.
         return false;
       });
       const debitedSum = debitedEntries.reduce((sum, e) => {
-        const val = Math.abs(Number(
-          e.net_cash != null && e.net_cash !== ''
-            ? e.net_cash
-            : e.amount != null && e.amount !== '' && e.amount !== 0
-              ? e.amount
-              : e.netAmount != null && e.netAmount !== ''
-                ? e.netAmount
-                : (+e.taxable || 0) + (+e.gstAmount || 0) - (+e.tdsAmount || 0)
-        ));
-        return sum + val;
+        return sum + netCashForEntry(e);
       }, 0);
       debitedRow[col] = debitedEntries.length > 0
         ? Math.round(debitedSum * 100) / 100
@@ -996,20 +1005,12 @@ export function computeByAccountCreditedDebitedRows(
       // 2. Credited (Inflows & Transfers in)
       const creditedEntries = matching.filter(e => {
         if (e.type === 'inflow' || String(e.transaction_type || '').toLowerCase() === 'inflow') return matchesAccount(e, true);
-        if (e.type === 'transfer') return matchesAccount(e, true);
+        // Keep transfers out of this summary so it agrees with the ledger's
+        // net cash total for the selected account.
         return false;
       });
       const creditedSum = creditedEntries.reduce((sum, e) => {
-        const val = Math.abs(Number(
-          e.net_cash != null && e.net_cash !== ''
-            ? e.net_cash
-            : e.amount != null && e.amount !== '' && e.amount !== 0
-              ? e.amount
-              : e.netAmount != null && e.netAmount !== ''
-                ? e.netAmount
-                : (+e.taxable || 0) + (+e.gstAmount || 0) - (+e.tdsAmount || 0)
-        ));
-        return sum + val;
+        return sum + netCashForEntry(e);
       }, 0);
       creditedRow[col] = creditedEntries.length > 0
         ? Math.round(creditedSum * 100) / 100

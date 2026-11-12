@@ -919,11 +919,30 @@ const Calc = {
     const open = a.openingBalanceDate || Store.data.settings.openingDate;
     if (upto < open) return 0;
     let b = +a.openingBalance || 0;
-    for (const e of Calc.live()) {
+    // Use exactly the same de-duplicated rows rendered by the Transactions
+    // page. This keeps Balance today, ledger totals, and transfer direction
+    // consistent for every account.
+    const entries = typeof getAllDeduplicatedTransactions === 'function'
+      ? getAllDeduplicatedTransactions()
+      : Calc.live();
+    for (const e of entries) {
+      if (!e || e.deleted || String(e.status || '').toLowerCase().includes('cancel')) continue;
       if (e.date < open || e.date > upto) continue;
-      if (e.type === 'inflow' && e.accountId === accId) b += e.amount;
-      else if (e.type === 'outflow' && e.accountId === accId) b -= e.amount;
-      else if (e.type === 'transfer') { if (e.accountId === accId) b -= e.amount; if (e.toAccountId === accId) b += e.amount; }
+      const amount = Math.abs(Number(e.amount ?? e.netCash ?? e.net_cash ?? e.taxable) || 0);
+      const entryType = String(e.type || e.transaction_type || '').toLowerCase();
+      const account = api.get('accounts', accId);
+      const accountName = String(account?.name || '').trim().toLowerCase();
+      const sourceMatches = String(e.accountId ?? '') === String(accId) ||
+        String(e.account_name || e.accountName || '').trim().toLowerCase() === accountName ||
+        String(e.transfer_from_account_name || e.transferFromAccountName || '').trim().toLowerCase() === accountName;
+      const destinationMatches = String(e.toAccountId ?? '') === String(accId) ||
+        String(e.transfer_to_account_name || e.transferToAccountName || '').trim().toLowerCase() === accountName;
+      if (entryType === 'inflow' && sourceMatches) b += amount;
+      else if (entryType === 'outflow' && sourceMatches) b -= amount;
+      else if (entryType === 'transfer') {
+        if (sourceMatches) b -= amount;
+        if (destinationMatches) b += amount;
+      }
     }
     return r2(b);
   },
@@ -1631,6 +1650,25 @@ const userName = id => (Store.data.users.find(u => u.id === id) || {}).name || '
 const typeChip = t => `<span class="chip ${t}">${TYPE_LABEL[t]}</span>`;
 const amtClass = e => e.type === 'inflow' ? 'in' : e.type === 'outflow' ? 'out' : 'xfer';
 const signedAmt = e => (e.type === 'inflow' ? '+' : e.type === 'outflow' ? '−' : '') + money(e.amount);
+function ledgerTransferDirection(e) {
+  if (e.type !== 'transfer') return e.type === 'inflow' ? 'in' : 'out';
+  const selected = S.ledger.accountId;
+  if (selected) {
+    const target = (Store.data.accounts || []).find(a => a.id === selected || a.supabase_id === selected);
+    const matches = id => id != null && (String(id) === String(selected) || Boolean(target?.supabase_id && String(id) === String(target.supabase_id)));
+    const targetName = String(target?.name || selected).trim().toLowerCase();
+    const fromName = String(e.transferFromAccountName || e.transfer_from_account_name || '').trim().toLowerCase();
+    const toName = String(e.transferToAccountName || e.transfer_to_account_name || '').trim().toLowerCase();
+    if (matches(e.toAccountId)) return 'in';
+    if (matches(e.accountId)) return 'out';
+    if (toName && toName === targetName) return 'in';
+    if (fromName && fromName === targetName) return 'out';
+  }
+  // In the unfiltered ledger a transfer is listed against its source account.
+  return 'out';
+}
+const ledgerAmtClass = e => ledgerTransferDirection(e);
+const ledgerSignedAmt = e => (ledgerTransferDirection(e) === 'in' ? '+' : ledgerTransferDirection(e) === 'out' ? '−' : '') + money(e.amount);
 function entryTitle(e) {
   if (e.type === 'transfer') return 'Transfer';
   const cName = e.categoryName || (typeof nameOf === 'function' ? nameOf('categories', e.categoryId) : '');
@@ -2246,7 +2284,8 @@ function ledgerFiltered() {
       const targetId = targetAcc ? targetAcc.id : L.accountId;
 
       const entryAccName = norm(e.accountName || e.account_name || e.paid_from || e.received_into || e.account || nameOf('accounts', e.accountId) || '');
-      const toAccName = norm(nameOf('accounts', e.toAccountId) || '');
+      const toAccName = norm(e.transferToAccountName || e.transfer_to_account_name || nameOf('accounts', e.toAccountId) || '');
+      const fromTransferName = norm(e.transferFromAccountName || e.transfer_from_account_name || '');
 
       const isTargetFixed = targetName.includes('fixed') || targetName.includes('fd');
       const isEntryFixed = entryAccName.includes('fixed') || entryAccName.includes('fd') || toAccName.includes('fixed') || toAccName.includes('fd');
@@ -2264,9 +2303,11 @@ function ledgerFiltered() {
 
       const matchName = targetName && (
         entryAccName === targetName ||
+        fromTransferName === targetName ||
         toAccName === targetName ||
         (entryAccName && (entryAccName.includes(targetName) || targetName.includes(entryAccName))) ||
         (toAccName && (toAccName.includes(targetName) || targetName.includes(toAccName))) ||
+        (fromTransferName && (fromTransferName.includes(targetName) || targetName.includes(fromTransferName))) ||
         (entryAccName.replace(/[-–\s]/g, '') === targetName.replace(/[-–\s]/g, ''))
       );
 
@@ -2350,11 +2391,11 @@ function ledgerResults() {
       <td style="max-width:220px"><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(e.type === 'transfer' ? entryParty(e) : e.partyName || nameOf('parties', e.partyId) || '—')}</div>${e.projectName ? `<div class="cell-sub">${esc(e.projectCode || e.projectName)}</div>` : ''}</td>
       <td class="nowrap">${esc(e.departmentName || nameOf('departments', e.departmentId) || '—')}</td>
       <td class="num">${e.type === 'transfer' ? '' : money(e.taxable)}</td><td class="num muted">${e.gstAmount ? money(e.gstAmount) : ''}</td><td class="num muted">${e.tdsAmount ? money(e.tdsAmount) : ''}</td>
-      <td class="num ${amtClass(e)}" style="font-weight:600">${signedAmt(e)}</td>
+      <td class="num ${ledgerAmtClass(e)}" style="font-weight:600">${ledgerSignedAmt(e)}</td>
       <td class="nowrap"><div>${esc(e.accountName || nameOf('accounts', e.accountId))}</div><div class="cell-sub">${esc(e.paymentMode)}</div></td>
       <td class="nowrap">${e.attachments && e.attachments.length ? `<span title="${e.attachments.length} attachment(s)" style="display:inline-block;width:15px">${icon('clip')}</span>` : ''}${api.isLocked(e.date) ? `<span title="Month locked" style="display:inline-block;width:15px;margin-left:4px">${icon('lock')}</span>` : ''} <button class="icon-btn xs" title="Edit transaction" data-act="edit-fss-transaction" data-id="${esc(e.id)}">${icon('edit')}</button> <button class="icon-btn xs" title="Delete transaction" data-act="delete-fss-transaction" data-id="${esc(e.id)}">${icon('trash')}</button></td></tr>`).join('')}
     </tbody></table></div>`;
-  const cards = `<div class="lcards">${slice.map(e => `<div class="lcard"><button class="grow" style="border:0;background:none;text-align:left;color:inherit;padding:0" data-act="open-entry" data-id="${esc(e.id)}"><div class="t">${esc(entryTitle(e))}</div><div class="s">${esc(entryParty(e))}</div><div class="s">${fmtDate(e.date)} · ${esc(e.departmentName || e.paymentMode)}</div></button><div><div class="amt ${amtClass(e)}">${signedAmt(e)}</div><div class="row" style="gap:4px;margin-top:4px"><button class="icon-btn xs" title="Edit transaction" data-act="edit-fss-transaction" data-id="${esc(e.id)}">${icon('edit')}</button><button class="icon-btn xs" title="Delete transaction" data-act="delete-fss-transaction" data-id="${esc(e.id)}">${icon('trash')}</button></div></div></div>`).join('')}</div>`;
+  const cards = `<div class="lcards">${slice.map(e => `<div class="lcard"><button class="grow" style="border:0;background:none;text-align:left;color:inherit;padding:0" data-act="open-entry" data-id="${esc(e.id)}"><div class="t">${esc(entryTitle(e))}</div><div class="s">${esc(entryParty(e))}</div><div class="s">${fmtDate(e.date)} · ${esc(e.departmentName || e.paymentMode)}</div></button><div><div class="amt ${ledgerAmtClass(e)}">${ledgerSignedAmt(e)}</div><div class="row" style="gap:4px;margin-top:4px"><button class="icon-btn xs" title="Edit transaction" data-act="edit-fss-transaction" data-id="${esc(e.id)}">${icon('edit')}</button><button class="icon-btn xs" title="Delete transaction" data-act="delete-fss-transaction" data-id="${esc(e.id)}">${icon('trash')}</button></div></div></div>`).join('')}</div>`;
   const pager = `<div class="pager"><span>Showing ${L.page * per + 1}–${Math.min(rows.length, L.page * per + per)} of ${rows.length}</span><span class="spacer"></span>
     <button class="btn btn-sm" data-act="lpage" data-d="-1" ${L.page ? '' : 'disabled'}>Previous</button><span>Page ${L.page + 1} / ${pages}</span><button class="btn btn-sm" data-act="lpage" data-d="1" ${L.page < pages - 1 ? '' : 'disabled'}>Next</button></div>`;
   return strip + loadStatus + table + cards + pager;
@@ -4849,24 +4890,14 @@ PAGES.cashflow = {
       label: 'Closing balance by account',
       vals: periods.map(() => 0),
       children: api.list('accounts').map(a => {
-        const overrides = (a as any).monthlyBalances || (Store.data?.account_monthly_balances && Store.data.account_monthly_balances[String(a.id)]);
         return {
           key: scope + 'acc:' + a.id,
           id: a.id,
           label: a.name,
-          vals: periods.map((p: any, i: number) => {
-            const mKey = p.months?.[0] || p.label || '';
-            const colKey = M_COL_MAP[String(p.months?.[0] || '').slice(5, 7)] || '';
-            if (overrides) {
-              if (mKey && overrides[mKey] !== undefined && overrides[mKey] !== null && overrides[mKey] !== '' && !isNaN(Number(overrides[mKey]))) {
-                return Number(overrides[mKey]);
-              }
-              if (colKey && overrides[colKey] !== undefined && overrides[colKey] !== null && overrides[colKey] !== '' && !isNaN(Number(overrides[colKey]))) {
-                return Number(overrides[colKey]);
-              }
-            }
-            return Calc.balance(a.id, p.to < TODAY ? p.to : TODAY);
-          }),
+          // Closing balances must come from live entries. Cached monthly values
+          // can otherwise hide a transfer and leave the old source/destination
+          // balances visible after the transfer is saved.
+          vals: periods.map((p: any) => Calc.balance(a.id, p.to < TODAY ? p.to : TODAY)),
           bal: true
         };
       })
@@ -6689,7 +6720,10 @@ function masterDef(tab) {
       col: 'accounts', filter: () => true, perm: 'account', usage: a => Calc.live().filter(e => e.accountId === a.id || e.toAccountId === a.id),
       fields: [['name', 'Account name *', 'text', { req: 1, span: 2 }], ['type', 'Type', 'select', { options: () => Object.entries(ACCOUNT_TYPES) }], ['number', 'Account no. (masked)', 'text'], ['openingBalance', 'Opening balance (₹)', 'number', { hint: () => 'As of ' + fmtDate(Store.data.settings.openingDate) }]],
       defaults: { type: 'bank', openingBalance: 0 },
-      cols: [['Account', a => `<div class="cell-main">${esc(a.name)}</div><div class="cell-sub">${esc(a.number || '')}</div>`], ['Type', a => esc(ACCOUNT_TYPES[a.type])], ['Opening', a => `<span class="num">${money(a.openingBalance)}</span>`], ['Balance today', a => `<b class="num">${money(Calc.balance(a.id, TODAY))}</b>`]]
+      cols: [['Account', a => `<div class="cell-main">${esc(a.name)}</div><div class="cell-sub">${esc(a.number || '')}</div>`], ['Type', a => esc(ACCOUNT_TYPES[a.type])], ['Opening', a => `<span class="num">${money(a.openingBalance)}</span>`], ['Balance today', a => {
+        const balance = Calc.balance(a.id, TODAY);
+        return `<button type="button" class="num ${balance < 0 ? 'out' : ''}" data-act="ledger-acc" data-id="${esc(a.id)}" aria-label="View transactions for ${esc(a.name)}" title="View transactions for ${esc(a.name)}" style="border:0;background:none;padding:0;cursor:pointer;font:inherit;font-weight:600">${money(balance)}</button>`;
+      }]]
     },
   }[tab];
 }
