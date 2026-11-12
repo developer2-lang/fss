@@ -747,6 +747,11 @@ const BY_ACCOUNT_TRANSFER_MONTH_COLS = [
   'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'
 ] as const;
 
+// This Supabase object is deployed as a view in some environments, so it cannot
+// accept PATCH/INSERT requests. Keep the live computed summary in the UI once a
+// write is rejected instead of retrying on every render.
+let byAccountCreditedDebitedWritable: boolean | null = null;
+
 function normalizeByAccountTransferName(value: any): string {
   return String(value || '')
     .replace(/[â€“â€”]/g, '-')
@@ -8800,6 +8805,9 @@ export const SupabaseService = {
     startYear = new Date().getMonth() >= 3 ? new Date().getFullYear() : new Date().getFullYear() - 1
   ): Promise<any[]> {
     if (!supabase) return computedRows;
+    if (byAccountCreditedDebitedWritable === false) {
+      return recomputeByAccountCreditedDebitedFyAndShares(computedRows);
+    }
     try {
       const financialYear = formatAccountSummaryFinancialYear(startYear);
       const { data: existing, error: loadErr } = await supabase
@@ -8841,11 +8849,11 @@ export const SupabaseService = {
             .eq('account_name', match.account_name)
             .eq('transaction_type', String(match.transaction_type || '').toUpperCase());
           if (updateErr) {
-            if (/cannot update view|read-only|not updateable/i.test(updateErr.message || '')) {
-              console.warn('fss_by_account_credited_debited is read-only; keeping the computed local summary.');
-              return recomputeByAccountCreditedDebitedFyAndShares(computedRows);
-            }
-            throw new Error(`Could not update account summary for "${row.account_name}" (${row.transaction_type}): ${updateErr.message}`);
+            // Supabase may report a read-only view as HTTP 500/Internal Server
+            // Error rather than including the words "read-only".
+            byAccountCreditedDebitedWritable = false;
+            console.warn('fss_by_account_credited_debited is read-only; keeping the computed local summary.');
+            return recomputeByAccountCreditedDebitedFyAndShares(computedRows);
           }
           row.id = match.id;
         } else {
@@ -8853,11 +8861,9 @@ export const SupabaseService = {
             .from('fss_by_account_credited_debited')
             .insert([payload]);
           if (insErr) {
-            if (/cannot insert into view|read-only|not insertable/i.test(insErr.message || '')) {
-              console.warn('fss_by_account_credited_debited is read-only; keeping the computed local summary.');
-              return recomputeByAccountCreditedDebitedFyAndShares(computedRows);
-            }
-            throw new Error(`Could not insert account summary for "${row.account_name}" (${row.transaction_type}): ${insErr.message}`);
+            byAccountCreditedDebitedWritable = false;
+            console.warn('fss_by_account_credited_debited is read-only; keeping the computed local summary.');
+            return recomputeByAccountCreditedDebitedFyAndShares(computedRows);
           }
           row.id = `${row.account_name}::${normType}`;
         }
