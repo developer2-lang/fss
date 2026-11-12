@@ -26,6 +26,7 @@ function replaceMasterRows(
     return {
       ...converted,
       id: local?.id ?? converted.id,
+      monthlyBalances: local?.monthlyBalances || converted.monthlyBalances,
       supabase_id: remote.id,
       _localOrder: local ? localRows.indexOf(local) : localRows.length + remoteIndex
     };
@@ -143,6 +144,7 @@ function transactionAuditSummary(transaction: any): string {
 }
 
 let creditedDebitedSyncQueue: Promise<void> = Promise.resolve();
+let byAccountTransferSyncKey = '';
 
 function syncCreditedDebitedFromEntries(entries?: any[]): Promise<void> {
   const sync = async () => {
@@ -4050,6 +4052,56 @@ export const App: React.FC = () => {
         }
       };
 
+      (window as any).__updateAccountBalanceCell = async (
+        accId: string | number,
+        accName: string,
+        periodKey: string,
+        periodCol: string,
+        periodIdx: number,
+        newValue: number | string | null
+      ) => {
+        const numVal = (newValue === '' || newValue === null || newValue === undefined || isNaN(Number(newValue))) ? 0 : Number(newValue);
+        let acc = (Store.data?.accounts || []).find((a: any) =>
+          String(a.id) === String(accId) ||
+          String(a.supabase_id || '') === String(accId) ||
+          String(a.name || '').trim().toLowerCase() === String(accName || '').trim().toLowerCase()
+        );
+        if (acc) {
+          acc.monthlyBalances = acc.monthlyBalances || {};
+          if (periodKey) acc.monthlyBalances[periodKey] = numVal;
+          if (periodCol) acc.monthlyBalances[periodCol] = numVal;
+          if (periodIdx === 0) {
+            acc.openingBalance = numVal;
+          }
+        }
+        if (Store.data) {
+          Store.data.account_monthly_balances = Store.data.account_monthly_balances || {};
+          const key = String(acc?.id || accId);
+          Store.data.account_monthly_balances[key] = Store.data.account_monthly_balances[key] || {};
+          if (periodKey) Store.data.account_monthly_balances[key][periodKey] = numVal;
+          if (periodCol) Store.data.account_monthly_balances[key][periodCol] = numVal;
+          Store.persist();
+        }
+
+        if (isSupabaseConfigured && acc && periodIdx === 0) {
+          try {
+            await SupabaseService.saveBankAccount({
+              id: acc.supabase_id || acc.id,
+              account_name: acc.name,
+              account_type: acc.type,
+              account_number_masked: acc.number,
+              opening_balance: numVal,
+              opening_balance_date: acc.openingBalanceDate || Store.data?.settings?.openingDate || '2025-04-01'
+            });
+          } catch (sbErr) {
+            console.warn('Could not mirror account opening balance to Supabase:', sbErr);
+          }
+        }
+
+        render({ keepScroll: true });
+        return numVal;
+      };
+
       (window as any).__updateByAccountCreditedDebitedCell = async (id: number | string, monthCol: string, newValue: number | string | null) => {
         if (!isSupabaseConfigured) return null;
         setCloudStatus(prev => ({ ...prev, syncing: true, error: null }));
@@ -4138,6 +4190,21 @@ export const App: React.FC = () => {
           setCloudStatus(prev => ({ ...prev, error: err?.message || 'Account totals could not be synchronized.' }));
         }
         return null;
+      };
+
+      (window as any).__syncByAccountTransfer = async (rows: any[]) => {
+        if (!isSupabaseConfigured) return rows || [];
+        const syncKey = JSON.stringify(rows || []);
+        if (syncKey === byAccountTransferSyncKey) return rows || [];
+        byAccountTransferSyncKey = syncKey;
+        try {
+          return await SupabaseService.syncByAccountTransferToSupabase(rows || []);
+        } catch (err: any) {
+          byAccountTransferSyncKey = '';
+          console.error('Error in __syncByAccountTransfer:', err);
+          setCloudStatus(prev => ({ ...prev, error: err?.message || 'By account balances could not be synchronized.' }));
+          return null;
+        }
       };
 
       // Delete handlers for Cash Outflow (fss_outflow_*) tables
@@ -4385,9 +4452,11 @@ export const App: React.FC = () => {
       delete (window as any).__addOfficeVariableExpense;
       delete (window as any).__loadByAccountCreditedDebited;
       delete (window as any).__updateByAccountCreditedDebitedCell;
+      delete (window as any).__updateAccountBalanceCell;
       delete (window as any).__insertByAccountCreditedDebited;
       delete (window as any).__deleteByAccountCreditedDebited;
       delete (window as any).__syncByAccountCreditedDebited;
+      delete (window as any).__syncByAccountTransfer;
 
       // Clean up outflow delete handlers
       const outflowDeleteNames = [

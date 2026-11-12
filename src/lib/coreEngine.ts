@@ -4838,15 +4838,55 @@ PAGES.cashflow = {
         tree[type].sort((a, b) => sum(b.vals) - sum(a.vals));
       }
     }
-    const accNode = { key: scope + 'acc', label: 'Closing balance by account', vals: periods.map(() => 0), children: api.list('accounts').map(a => ({ key: scope + 'acc:' + a.id, label: a.name, vals: periods.map(p => Calc.balance(a.id, p.to < TODAY ? p.to : TODAY)), bal: true })) };
-    const allNodes = [...tree.inflow, ...tree.outflow];
-    prepareTree(scope, allNodes);
     const M_COL_MAP: Record<string, string> = {
       '01': 'jan_26', '02': 'feb_26', '03': 'mar_26',
       '04': 'apr_26', '05': 'may_26', '06': 'jun_26',
       '07': 'jul_26', '08': 'aug_26', '09': 'sep_26',
       '10': 'oct_26', '11': 'nov_26', '12': 'dec_26'
     };
+    const accNode = {
+      key: scope + 'acc',
+      label: 'Closing balance by account',
+      vals: periods.map(() => 0),
+      children: api.list('accounts').map(a => {
+        const overrides = (a as any).monthlyBalances || (Store.data?.account_monthly_balances && Store.data.account_monthly_balances[String(a.id)]);
+        return {
+          key: scope + 'acc:' + a.id,
+          id: a.id,
+          label: a.name,
+          vals: periods.map((p: any, i: number) => {
+            const mKey = p.months?.[0] || p.label || '';
+            const colKey = M_COL_MAP[String(p.months?.[0] || '').slice(5, 7)] || '';
+            if (overrides) {
+              if (mKey && overrides[mKey] !== undefined && overrides[mKey] !== null && overrides[mKey] !== '' && !isNaN(Number(overrides[mKey]))) {
+                return Number(overrides[mKey]);
+              }
+              if (colKey && overrides[colKey] !== undefined && overrides[colKey] !== null && overrides[colKey] !== '' && !isNaN(Number(overrides[colKey]))) {
+                return Number(overrides[colKey]);
+              }
+            }
+            return Calc.balance(a.id, p.to < TODAY ? p.to : TODAY);
+          }),
+          bal: true
+        };
+      })
+    };
+    accNode.vals = periods.map((_, i) => sum(accNode.children, (c: any) => c.vals[i]));
+    if (typeof window !== 'undefined' && typeof (window as any).__syncByAccountTransfer === 'function' && accNode.children.length > 0) {
+      const transferMonthRows = accNode.children.map((account: any) => {
+        const values: Record<string, number | null> = { jan: null, feb: null, mar: null, apr: null, may: null, jun: null, jul: null, aug: null, sep: null, oct: null, nov: null, dec: null };
+        const monthName: Record<string, string> = { '01': 'jan', '02': 'feb', '03': 'mar', '04': 'apr', '05': 'may', '06': 'jun', '07': 'jul', '08': 'aug', '09': 'sep', '10': 'oct', '11': 'nov', '12': 'dec' };
+        periods.forEach((period: any, index: number) => {
+          const month = monthName[String(period.to || '').slice(5, 7)];
+          if (month) values[month] = account.vals[index] ?? null;
+        });
+        const latestValue = periods.length ? account.vals[periods.length - 1] ?? null : null;
+        return { bank_name: account.label, ...values, fy_to_date: latestValue, shares: null };
+      });
+      void (window as any).__syncByAccountTransfer(transferMonthRows);
+    }
+    const allNodes = [...tree.inflow, ...tree.outflow];
+    prepareTree(scope, allNodes);
     const storedSummaryEnabled = (window as any).__cashflowUseStoredSummary !== false
       && S.fy === 2026 && C.by === 'category' && C.period === 'monthly';
     const storedOutflowByName = new Map(
@@ -4893,7 +4933,20 @@ PAGES.cashflow = {
       computedClosing.push(closingBalance);
     });
     const opening = valuesFromStatement('Opening Balance', computedOpening);
-    const closing = valuesFromStatement('Closing Balance', computedClosing);
+    const closing = valuesFromStatement('Closing Balance', computedClosing).map((computedVal, index) => {
+      const hasOverrides = accNode.children.some((c: any) => {
+        const acc = api.get('accounts', c.id);
+        const p: any = periods[index];
+        const mKey = p?.months?.[0] || p?.label || '';
+        const colKey = M_COL_MAP[String(p?.months?.[0] || '').slice(5, 7)] || '';
+        const ovr = (acc as any)?.monthlyBalances || (Store.data?.account_monthly_balances && Store.data.account_monthly_balances[String(c.id)]);
+        return ovr && (ovr[mKey] !== undefined || (colKey && ovr[colKey] !== undefined));
+      });
+      if (hasOverrides) {
+        return sum(accNode.children, (c: any) => c.vals[index]);
+      }
+      return computedVal;
+    });
     if (C.by === 'category' && C.period === 'monthly') {
       const statementLabels = [
         'Operating costs', 'Project costs', 'Tax & statutory', 'Capex', 'Financing & owner'
@@ -5144,6 +5197,25 @@ PAGES.cashflow = {
     }).join('')
       + `<td class="num tot-c" ${n.drill ? drillAttr(type, n.drill, fyF, lastTo) : ''}>${money(sum(n.vals))}</td><td class="num share"><span class="${depth ? 'faint' : 'muted'}">${fmtPct(pct(sum(n.vals), base))}</span></td>`;
     const balCells = vals => periods.map((p, i) => `<td class="num ${p.cur ? 'cur' : ''} ${vals[i] < 0 ? 'out' : ''}">${money(vals[i])}</td>`).join('') + '<td class="num tot-c"></td><td></td>';
+    const accBalCells = (accountNode: any) => {
+      const latestVal = accountNode.vals && accountNode.vals.length ? accountNode.vals[accountNode.vals.length - 1] : 0;
+      return periods.map((p: any, i: number) => {
+        const val = accountNode.vals[i];
+        const numVal = (val !== null && val !== undefined && !isNaN(Number(val))) ? Number(val) : 0;
+        const mKey = p.months?.[0] || p.label || '';
+        const mCol = M_COL_MAP[String(p.months?.[0] || '').slice(5, 7)] || '';
+        return `<td class="num acc-bal-cell ${p.cur ? 'cur' : ''} ${numVal < 0 ? 'out' : ''}"
+          data-acc-id="${esc(accountNode.id)}"
+          data-acc-name="${esc(accountNode.label)}"
+          data-period-idx="${i}"
+          data-period-key="${esc(mKey)}"
+          data-period-col="${esc(mCol)}"
+          data-period-label="${esc(p.label)}"
+          data-val="${numVal}"
+          title="Double-click to edit ${esc(accountNode.label)} balance (${esc(p.label)})"
+          style="cursor:pointer;">${money(numVal)}</td>`;
+      }).join('') + `<td class="num tot-c ${latestVal < 0 ? 'out' : ''}">${money(latestVal)}</td><td class="num share"></td>`;
+    };
     const secRow = (label, vals, total, cls) => `<tr class="sec ${cls}"><td>${label}</td>${vals.map((v, i) => `<td class="num ${periods[i].cur ? 'cur' : ''}">${money(v)}</td>`).join('')}<td class="num tot-c">${money(total)}</td><td class="num share">${fmtPct(total > 0 ? 100 : 0)}</td></tr>`;
     const accOpen = OPEN.has(accNode.key);
     if (!len) return `<div class="card"><div class="empty"><b>No months to show yet</b>${esc(fyLabel(fy))} hasn't started.</div></div>`;
@@ -5163,7 +5235,7 @@ PAGES.cashflow = {
         <tr class="net"><td>Net cashflow</td>${periods.map((p, i) => `<td class="num ${p.cur ? 'cur' : ''} ${netCashFlow[i] >= 0 ? 'in' : 'out'}">${money(netCashFlow[i], { sign: true })}</td>`).join('')}<td class="num tot-c ${NET >= 0 ? 'in' : 'out'}">${money(NET, { sign: true })}</td><td></td></tr>
         <tr class="bal"><td>Closing balance</td>${balCells(closing)}</tr>
         <tr class="d0 node ${accOpen ? 'is-open' : ''}"><td><button class="tw ${accOpen ? 'open' : ''}" data-act="tree" data-k="${accNode.key}">${icon('chev')}<span>By account</span><span class="tw-n">${accNode.children.length}</span></button></td>${periods.map(() => '<td></td>').join('')}<td></td><td></td></tr>
-        ${accOpen ? accNode.children.map(a => `<tr class="d1 leaf"><td><span class="tw-leaf">${esc(a.label)}</span></td>${balCells(a.vals)}</tr>`).join('') : ''}
+        ${accOpen ? accNode.children.map(a => `<tr class="d1 leaf"><td><span class="tw-leaf">${esc(a.label)}</span></td>${accBalCells(a)}</tr>`).join('') : ''}
       </tbody></table></div></div>
       <div class="muted" style="font-size:12px;margin-top:10px">Net cash after GST and TDS. Balances include bank, FD and petty cash; transfers between them are excluded. Months that haven't started are hidden. Click a row name to expand it, or any figure to see its entries.</div>
       ${renderByAccountCreditedDebitedHTML()}`;
@@ -7536,10 +7608,103 @@ function initCdCellEdit(td: HTMLElement) {
   });
 }
 
+function initAccBalCellEdit(td: HTMLElement) {
+  if (!td || td.querySelector('input')) return;
+  const accId = td.dataset.accId || '';
+  const accName = td.dataset.accName || 'Account';
+  const periodKey = td.dataset.periodKey || '';
+  const periodCol = td.dataset.periodCol || '';
+  const periodLabel = td.dataset.periodLabel || '';
+  const periodIdx = parseInt(td.dataset.periodIdx || '0', 10);
+  const initialVal = td.dataset.val !== undefined ? td.dataset.val : '0';
+  const origHTML = td.innerHTML;
+
+  td.innerHTML = `<input type="number" step="any" class="acc-bal-inline-input" value="${Number(initialVal) || 0}" style="width:100%;min-width:70px;text-align:right;background:var(--surface);border:1px solid var(--accent, #1E7A4F);color:var(--ink);border-radius:4px;padding:2px 4px;font-family:inherit;font-size:inherit;font-weight:600;outline:none;box-sizing:border-box;" />`;
+  const inp = td.querySelector('input') as HTMLInputElement;
+  if (!inp) return;
+  inp.focus();
+  inp.select();
+
+  let committed = false;
+  const commit = async () => {
+    if (committed) return;
+    committed = true;
+    const raw = inp.value.trim();
+    if (raw === '') {
+      td.innerHTML = origHTML;
+      return;
+    }
+    const newVal = Number(raw);
+    if (isNaN(newVal)) {
+      td.innerHTML = origHTML;
+      return;
+    }
+    if (newVal === Number(initialVal)) {
+      td.innerHTML = origHTML;
+      return;
+    }
+
+    td.innerHTML = `<span style="opacity:0.6">${money(newVal)}</span>`;
+    try {
+      if (typeof (window as any).__updateAccountBalanceCell === 'function') {
+        await (window as any).__updateAccountBalanceCell(accId, accName, periodKey, periodCol, periodIdx, newVal);
+        toast(`Updated ${accName} balance for ${periodLabel || periodKey}: ${money(newVal)}`);
+      } else {
+        let acc = api.get('accounts', accId) || (Store.data?.accounts || []).find((a: any) =>
+          String(a.id) === String(accId) ||
+          String(a.name || '').trim().toLowerCase() === String(accName || '').trim().toLowerCase()
+        );
+        if (acc) {
+          (acc as any).monthlyBalances = (acc as any).monthlyBalances || {};
+          if (periodKey) (acc as any).monthlyBalances[periodKey] = newVal;
+          if (periodCol) (acc as any).monthlyBalances[periodCol] = newVal;
+          if (periodIdx === 0) (acc as any).openingBalance = newVal;
+        }
+        if (Store.data) {
+          Store.data.account_monthly_balances = Store.data.account_monthly_balances || {};
+          const key = String(acc?.id || accId);
+          Store.data.account_monthly_balances[key] = Store.data.account_monthly_balances[key] || {};
+          if (periodKey) Store.data.account_monthly_balances[key][periodKey] = newVal;
+          if (periodCol) Store.data.account_monthly_balances[key][periodCol] = newVal;
+          Store.persist();
+        }
+        toast(`Updated ${accName} balance: ${money(newVal)}`);
+        render({ keepScroll: true });
+      }
+    } catch (err: any) {
+      toast(`Failed to save balance: ${err?.message || err}`, 'error');
+      td.innerHTML = origHTML;
+    }
+  };
+
+  inp.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      if ((e as any).isComposing) return;
+      e.preventDefault();
+      inp.blur();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      committed = true;
+      td.innerHTML = origHTML;
+    }
+  });
+
+  inp.addEventListener('blur', () => {
+    commit();
+  });
+}
+
 function bindGlobal() {
   if (_globalBound) return;
   _globalBound = true;
   document.addEventListener('dblclick', async (ev: any) => {
+    const accTd = ev.target?.closest?.('td.acc-bal-cell');
+    if (accTd) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      initAccBalCellEdit(accTd);
+      return;
+    }
     const cdTd = ev.target?.closest?.('td.cd-cell');
     if (cdTd) {
       ev.preventDefault();

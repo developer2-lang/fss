@@ -743,6 +743,18 @@ const BY_ACCOUNT_CD_DB_MONTH_COL: Record<typeof BY_ACCOUNT_CD_MONTH_COLS[number]
   december: 'dec'
 };
 
+const BY_ACCOUNT_TRANSFER_MONTH_COLS = [
+  'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'
+] as const;
+
+function normalizeByAccountTransferName(value: any): string {
+  return String(value || '')
+    .replace(/[â€“â€”]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
 function formatAccountSummaryFinancialYear(startYear: number): string {
   return `${startYear}-${String((startYear + 1) % 100).padStart(2, '0')}`;
 }
@@ -8840,6 +8852,63 @@ export const SupabaseService = {
       console.error('syncByAccountCreditedDebitedToSupabase failed:', err?.message || err);
       throw err;
     }
+  },
+
+  /** Keep the cashflow statement's closing balance by account in sync with the legacy summary table. */
+  async syncByAccountTransferToSupabase(rows: any[]): Promise<any[]> {
+    if (!supabase) return rows || [];
+    const cleanRows = (rows || []).filter(row => String(row?.bank_name || '').trim());
+    const { data: existing, error: loadErr } = await supabase
+      .from('fss_by_account_transfer')
+      .select('id, bank_name, jan, feb, mar, apr, may, jun, jul, aug, sep, oct, nov, dec, fy_to_date, shares');
+    if (loadErr) throw new Error(`Could not read fss_by_account_transfer: ${loadErr.message}`);
+
+    const existingRows = existing || [];
+    const usedIds = new Set<number>();
+    const sameValue = (left: any, right: any) => {
+      if (left === null || left === undefined || left === '') return right === null || right === undefined || right === '';
+      if (right === null || right === undefined || right === '') return false;
+      return Number(left) === Number(right);
+    };
+
+    for (const row of cleanRows) {
+      const payload: Record<string, any> = { bank_name: String(row.bank_name).trim() };
+      for (const month of BY_ACCOUNT_TRANSFER_MONTH_COLS) {
+        const value = row[month];
+        payload[month] = value === null || value === undefined || value === '' || !Number.isFinite(Number(value))
+          ? null
+          : Math.round(Number(value) * 100) / 100;
+      }
+      payload.fy_to_date = row.fy_to_date == null ? null : Math.round(Number(row.fy_to_date) * 100) / 100;
+      payload.shares = row.shares == null ? null : Math.round(Number(row.shares) * 10) / 10;
+
+      const match = existingRows.find(existingRow =>
+        normalizeByAccountTransferName(existingRow.bank_name) === normalizeByAccountTransferName(row.bank_name)
+      );
+      if (match) {
+        usedIds.add(Number(match.id));
+        const changed = Object.keys(payload).some(key => key === 'bank_name'
+          ? String(match[key] || '').trim() !== String(payload[key] || '').trim()
+          : !sameValue(match[key], payload[key]));
+        if (changed) {
+          const { error } = await supabase.from('fss_by_account_transfer').update(payload).eq('id', match.id);
+          if (error) throw new Error(`Could not update fss_by_account_transfer for "${row.bank_name}": ${error.message}`);
+        }
+      } else {
+        const { data: inserted, error } = await supabase.from('fss_by_account_transfer').insert([payload]).select('id').single();
+        if (error) throw new Error(`Could not insert fss_by_account_transfer row for "${row.bank_name}": ${error.message}`);
+        if (inserted?.id != null) usedIds.add(Number(inserted.id));
+      }
+    }
+
+    // Remove stale account rows so deleting an account in the UI is reflected in Supabase.
+    for (const stale of existingRows) {
+      if (!usedIds.has(Number(stale.id)) && cleanRows.length > 0) {
+        const { error } = await supabase.from('fss_by_account_transfer').delete().eq('id', stale.id);
+        if (error) throw new Error(`Could not delete stale fss_by_account_transfer row: ${error.message}`);
+      }
+    }
+    return cleanRows;
   },
 };
 
