@@ -3294,38 +3294,69 @@ export const SupabaseService = {
    * Deletes a bank account from fss_bank_accounts by id or account_name
    */
   async deleteBankAccount(accountIdOrName: string | number): Promise<boolean> {
-    if (!supabase || !accountIdOrName) return false;
+    if (!supabase) throw new Error('Supabase is not configured; cannot delete bank accounts.');
+    if (!accountIdOrName) throw new Error('A bank account ID or name is required.');
+
     try {
       const numId = Number(accountIdOrName);
-      if (!isNaN(numId)) {
-        const { data: deleted, error } = await supabase
-          .from('fss_bank_accounts')
-          .delete()
-          .eq('id', numId)
-          .select('id');
-        if (error) {
-          console.error('Error deleting bank account from fss_bank_accounts by id:', error.message);
-          if (/violates foreign key|referenced from table/i.test(error.message || '')) {
-            throw new Error('This bank account cannot be deleted because transactions still use it. Delete or reassign those transactions first.');
-          }
-          throw new Error(`Could not delete bank account: ${error.message}`);
-        }
-        return Array.isArray(deleted) && deleted.length > 0;
-      } else {
-        const { data: deleted, error } = await supabase
-          .from('fss_bank_accounts')
-          .delete()
-          .eq('account_name', String(accountIdOrName))
-          .select('id');
-        if (error) {
-          console.error('Error deleting bank account from fss_bank_accounts by name:', error.message);
-          if (/violates foreign key|referenced from table/i.test(error.message || '')) {
-            throw new Error('This bank account cannot be deleted because transactions still use it. Delete or reassign those transactions first.');
-          }
-          throw new Error(`Could not delete bank account: ${error.message}`);
-        }
-        return Array.isArray(deleted) && deleted.length > 0;
+      const accountQuery = supabase.from('fss_bank_accounts').select('id, account_name');
+      const { data: accounts, error: accountError } = !isNaN(numId)
+        ? await accountQuery.eq('id', numId)
+        : await accountQuery.eq('account_name', String(accountIdOrName));
+
+      if (accountError) {
+        console.error('Error finding bank account in fss_bank_accounts:', accountError.message);
+        throw new Error(`Failed to find bank account in Supabase: ${accountError.message}`);
       }
+      if (!accounts?.length) {
+        throw new Error('Supabase did not find a matching bank account. Check its ID and your database permissions.');
+      }
+
+      for (const account of accounts) {
+        const { error: fromError } = await supabase
+          .from('fss_table_transactions')
+          .update({
+            transfer_from_account_id: null,
+            transfer_from_account_name: account.account_name
+          })
+          .eq('transfer_from_account_id', account.id);
+        if (fromError) {
+          console.error('Error preserving source account details on transfers:', fromError.message);
+          throw new Error(`Could not prepare account transfers for deletion: ${fromError.message}`);
+        }
+
+        const { error: toError } = await supabase
+          .from('fss_table_transactions')
+          .update({
+            transfer_to_account_id: null,
+            transfer_to_account_name: account.account_name
+          })
+          .eq('transfer_to_account_id', account.id);
+        if (toError) {
+          console.error('Error preserving destination account details on transfers:', toError.message);
+          throw new Error(`Could not prepare account transfers for deletion: ${toError.message}`);
+        }
+      }
+
+      const accountIds = accounts.map(account => account.id);
+      const { data: deleted, error: deleteError } = await supabase
+        .from('fss_bank_accounts')
+        .delete()
+        .in('id', accountIds)
+        .select('id');
+
+      if (deleteError) {
+        console.error('Error deleting bank account from fss_bank_accounts:', deleteError.message);
+        if (/violates foreign key|referenced from table/i.test(deleteError.message || '')) {
+          throw new Error('This bank account cannot be deleted because other records still use it.');
+        }
+        throw new Error(`Failed to delete bank account from Supabase: ${deleteError.message}`);
+      }
+      if (deleted?.length !== accountIds.length) {
+        throw new Error('Supabase did not delete every matching bank account. Check your database permissions.');
+      }
+
+      return true;
     } catch (err) {
       console.error('Exception deleting bank account:', err);
       throw err;

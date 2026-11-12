@@ -7452,12 +7452,13 @@ const ACT = {
           const sbId = a.supabase_id || (!isNaN(Number(a.id)) ? Number(a.id) : null);
           const deleted = await (window as any).__supabaseDeleteBankAccount(sbId || a.name);
           if (!deleted) {
-            toast('Bank account was not deleted from Supabase.', 'error');
+            toast('Bank account was not deleted. It remains in the list.', 'error');
             return;
           }
         }
       } catch (err: any) {
-        toast(err?.message || 'Bank account could not be deleted.', 'error');
+        console.error('Failed to delete bank account:', err);
+        toast('Could not delete bank account: ' + (err?.message || 'Supabase delete failed.'), 'error');
         return;
       }
       const idx = Store.data.accounts.findIndex(x => x.id === a.id);

@@ -3118,7 +3118,7 @@ export const App: React.FC = () => {
       };
 
       (window as any).__supabaseDeleteBankAccount = async (accountIdOrName: string | number) => {
-        if (!isSupabaseConfigured) return false;
+        if (!isSupabaseConfigured) return true;
         const ok = await SupabaseService.deleteBankAccount(accountIdOrName);
         if (ok) {
           setCloudStatus(prev => ({
