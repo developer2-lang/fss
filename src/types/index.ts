@@ -249,11 +249,12 @@ export interface AuditLog {
   id: string;
   ts: string;
   userId: string;
+  userName?: string;
   action: string;
   entity: string;
   entityId: string;
   summary: string;
-  changes?: Array<{ field: string; from: any; to: any }>;
+  changes?: any;
 }
 
 export interface AppSettings {

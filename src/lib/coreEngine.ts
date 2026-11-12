@@ -364,7 +364,8 @@ const Store = {
   persist() {
     if (!STORAGE_OK) return;
     try {
-      localStorage.setItem(DB_KEY, JSON.stringify(this.data));
+      const persistedData = this.data ? { ...this.data, audit: [] } : this.data;
+      localStorage.setItem(DB_KEY, JSON.stringify(persistedData));
       if (typeof window !== 'undefined' && window.__onCashflowDataChanged) {
         window.__onCashflowDataChanged(this.data);
       }
@@ -469,8 +470,39 @@ const api = {
   all(col) { return Store.data[col]; },
   get(col, id) { return id ? Store.data[col].find(r => r.id === id) || null : null; },
   isLocked(date) { return !!date && Store.data.settings.lockedMonths.includes(ymOf(date)); },
-  log(action, entity, entityId, summary, changes) {
-    Store.data.audit.push({ id: uid('log'), ts: nowISO(), userId: api.me().id, action, entity, entityId, summary, changes: changes || [] });
+  async log(action, entity, entityId, summary, changes, values) {
+    // Transaction changes are logged by the transaction save/delete handlers.
+    if (entity === 'entries') return null;
+    const user = api.me();
+    const writeAuditLog = typeof window !== 'undefined' && (window as any).__writeSupabaseAuditLog;
+    if (typeof writeAuditLog !== 'function') {
+      Hooks.notify('Audit log could not be saved because the Supabase audit service is unavailable.', 'error');
+      return null;
+    }
+    try {
+      return await writeAuditLog({
+        ts: nowISO(),
+        userId: user.id,
+        userName: user.name,
+        action,
+        entity,
+        entityId,
+        summary,
+        changes: values || { before: null, after: changes || {} }
+      });
+    } catch (error) {
+      console.error('Supabase audit log write failed:', error);
+      const detail = error instanceof Error ? error.message : String(error);
+      Hooks.notify(
+        /row-level security policy/i.test(detail)
+          ? 'Supabase denied the audit write. Apply the fss_audit_insert_rpc migration in your Supabase project.'
+          : /fss_insert_audit_log|could not find the function/i.test(detail)
+            ? 'The audit writer is not installed in Supabase yet. Apply the fss_audit_insert_rpc migration.'
+          : `The action was completed, but its audit log could not be saved: ${detail}`,
+        'error'
+      );
+      return null;
+    }
   },
   guard(action) { if (!api.can(action)) throw new Error('Your role (' + ROLES[api.me().role] + ') is not allowed to do this.'); },
 
@@ -478,15 +510,16 @@ const api = {
     rec.id = rec.id || uid(PREFIX[col] || col);
     rec.createdBy = api.me().id; rec.createdAt = nowISO();
     Store.data[col].push(rec);
-    api.log('create', col, rec.id, opts.summary || describe(col, rec));
+    await api.log('create', col, rec.id, opts.summary || describe(col, rec), null, { before: null, after: JSON.parse(JSON.stringify(rec)) });
     Store.persist(); return rec;
   },
   async update(col, id, patch, opts = {}) {
     const rec = api.get(col, id); if (!rec) throw new Error('Record not found');
+    const before = JSON.parse(JSON.stringify(rec));
     const changes = diffRecords(rec, patch);
     if (!changes.length) return rec;
     Object.assign(rec, patch, { updatedBy: api.me().id, updatedAt: nowISO() });
-    api.log(opts.action || 'update', col, id, opts.summary || describe(col, rec), changes);
+    await api.log(opts.action || 'update', col, id, opts.summary || describe(col, rec), changes, { before, after: JSON.parse(JSON.stringify(rec)) });
     Store.persist(); return rec;
   },
 
@@ -501,6 +534,10 @@ const api = {
       if (!(+e.amount > 0)) errs.amount = 'Enter an amount greater than zero';
       if (!e.toAccountId) errs.toAccountId = 'Choose the destination account';
       else if (e.toAccountId === e.accountId) errs.toAccountId = 'From and To accounts must differ';
+      if (e.accountId && !api.get('accounts', e.accountId)) errs.accountId = 'Choose an existing source account';
+      if (e.toAccountId && !api.get('accounts', e.toAccountId)) errs.toAccountId = 'Choose an existing destination account';
+      if (e.accountId && api.get('accounts', e.accountId)?.active === false) errs.accountId = 'The source account is inactive';
+      if (e.toAccountId && api.get('accounts', e.toAccountId)?.active === false) errs.toAccountId = 'The destination account is inactive';
     } else {
       if (!e.categoryId) errs.categoryId = 'Choose a category';
       if (!e.departmentId) errs.departmentId = 'Choose a department';
@@ -533,10 +570,40 @@ const api = {
     const errs = api.validateEntry(e);
     if (Object.keys(errs).length) { const err = new Error(Object.values(errs)[0]); err.fields = errs; throw err; }
     let savedEntry;
+    if (e.type === 'transfer') {
+      let before: any = null;
+      if (id) {
+        api.guard('entry.edit');
+        const old = api.get('entries', id);
+        if (!old) throw new Error('Transfer not found.');
+        if (api.isLocked(old.date)) throw new Error(monthLabel(ymOf(old.date), true) + ' is locked.');
+        before = JSON.parse(JSON.stringify(old));
+      } else {
+        api.guard('entry.create');
+      }
+      const saveTransfer = typeof window !== 'undefined' && (window as any).__supabaseSaveAccountTransfer;
+      if (typeof saveTransfer !== 'function') throw new Error('Supabase account transfer service is not ready.');
+      const row = await saveTransfer(
+        e,
+        id ? api.get('entries', id).supabase_id : null,
+        id ? 'update' : 'create',
+        before
+      );
+      if (!row?.id) throw new Error('Account transfer was not saved to Supabase.');
+      e.supabase_id = String(row.id);
+      e.transferFromAccountName = row.transfer_from_account_name || nameOf('accounts', e.accountId);
+      e.transferToAccountName = row.transfer_to_account_name || nameOf('accounts', e.toAccountId);
+      savedEntry = id
+        ? await api.update('entries', id, e)
+        : await api.create('entries', { deleted: false, attachments: [], ...e });
+      return savedEntry;
+    }
+    let before: any = null;
     if (id) {
       api.guard('entry.edit');
       const old = api.get('entries', id);
       if (api.isLocked(old.date)) throw new Error(monthLabel(ymOf(old.date), true) + ' is locked.');
+      before = JSON.parse(JSON.stringify(old));
       savedEntry = await api.update('entries', id, e);
     } else {
       api.guard('entry.create');
@@ -545,7 +612,11 @@ const api = {
 
     if (savedEntry && typeof window !== 'undefined' && typeof (window as any).__supabaseSaveTransaction === 'function') {
       try {
-        const sbTxn = await (window as any).__supabaseSaveTransaction(savedEntry);
+        const sbTxn = await (window as any).__supabaseSaveTransaction(
+          savedEntry,
+          id ? 'update' : 'create',
+          before
+        );
         if (sbTxn && sbTxn.id) {
           savedEntry.supabase_id = sbTxn.id;
           Store.persist();
@@ -559,7 +630,14 @@ const api = {
   async softDelete(id) {
     api.guard('entry.delete');
     const e = api.get('entries', id);
+    const before = JSON.parse(JSON.stringify(e));
     if (api.isLocked(e.date)) throw new Error(monthLabel(ymOf(e.date), true) + ' is locked.');
+    if (e.type === 'transfer') {
+      const setDeleted = typeof window !== 'undefined' && (window as any).__supabaseSetAccountTransferDeleted;
+      if (typeof setDeleted !== 'function') throw new Error('Supabase account transfer service is not ready.');
+      const result = await setDeleted(e.supabase_id || e.id, true);
+      if (result === false) throw new Error('Could not move the account transfer to Trash in Supabase.');
+    }
     if (e.supabase_tax_statutory_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteTaxStatutoryEntry === 'function') {
       await (window as any).__supabaseDeleteTaxStatutoryEntry(e.supabase_tax_statutory_id);
     }
@@ -572,26 +650,57 @@ const api = {
     if (e.supabase_other_income_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOtherIncomeEntry === 'function') {
       await (window as any).__supabaseDeleteOtherIncomeEntry(e.supabase_other_income_id);
     }
+    if (e.type !== 'transfer' && typeof window !== 'undefined' && typeof (window as any).__supabaseCancelTransaction === 'function') {
+      const cancelled = await (window as any).__supabaseCancelTransaction(e.supabase_id || e.id, e);
+      if (cancelled === false) throw new Error('Could not move the transaction to Trash in Supabase.');
+    }
+    if (e.type === 'transfer') {
+      const deleteTransfer = typeof window !== 'undefined' && (window as any).__supabaseDeleteTransaction;
+      if (typeof deleteTransfer !== 'function') throw new Error('Supabase account transfer service is not ready.');
+      const result = await deleteTransfer(e.supabase_id || e.id, e);
+      if (result === false) throw new Error('Could not permanently delete the account transfer from Supabase.');
+    }
+    if (typeof window !== 'undefined') {
+      (window as any).__excludeLedgerTransactionFromSummary?.(e.supabase_id || e.id);
+    }
     Object.assign(e, { deleted: true, deletedBy: api.me().id, deletedAt: nowISO() });
-    api.log('delete', 'entries', id, describe('entries', e)); Store.persist();
-    if (typeof window !== 'undefined' && typeof (window as any).__supabaseCancelTransaction === 'function') {
-      (window as any).__supabaseCancelTransaction(e.supabase_id || e.id).catch(console.warn);
+    await api.log('delete', 'entries', id, describe('entries', e), null, { before, after: JSON.parse(JSON.stringify(e)) });
+    Store.persist();
+    if (e.type !== 'transfer') {
+      try {
+        await (window as any).__refreshSupabaseAuditLogs?.();
+      } catch (error) {
+        console.warn('Could not refresh Supabase audit logs after deleting transaction:', error);
+      }
     }
   },
   async restore(id) {
     api.guard('entry.restore');
     const e = api.get('entries', id);
+    const before = JSON.parse(JSON.stringify(e));
     if (api.isLocked(e.date)) throw new Error(monthLabel(ymOf(e.date), true) + ' is locked. Unlock it before restoring.');
+    if (e.type === 'transfer') {
+      const setDeleted = typeof window !== 'undefined' && (window as any).__supabaseSetAccountTransferDeleted;
+      if (typeof setDeleted !== 'function') throw new Error('Supabase account transfer service is not ready.');
+      const result = await setDeleted(e.supabase_id || e.id, false);
+      if (result === false) throw new Error('Could not restore the account transfer in Supabase.');
+    }
+    if (typeof window !== 'undefined') {
+      (window as any).__includeLedgerTransactionInSummary?.(e.supabase_id || e.id);
+    }
     Object.assign(e, { deleted: false, deletedBy: null, deletedAt: null });
-    api.log('restore', 'entries', id, describe('entries', e)); Store.persist();
-    if (typeof window !== 'undefined' && typeof (window as any).__supabaseSaveTransaction === 'function') {
-      (window as any).__supabaseSaveTransaction(e).catch(console.warn);
+    await api.log('restore', 'entries', id, describe('entries', e), null, { before, after: JSON.parse(JSON.stringify(e)) });
+    Store.persist();
+    if (e.type !== 'transfer' && typeof window !== 'undefined' && typeof (window as any).__supabaseSaveTransaction === 'function') {
+      await (window as any).__supabaseSaveTransaction(e, 'restore', before);
     }
   },
-  async purge(id) {
+  async purge(id, options: { skipRefresh?: boolean; deferPersist?: boolean } = {}) {
     api.guard('entry.purge');
     const e = api.get('entries', id);
-    for (const a of e.attachments || []) await FileStore.del(a.id).catch(() => { });
+    if (!e) throw new Error('Trash entry was not found.');
+    const before = JSON.parse(JSON.stringify(e));
+    for (const a of e.attachments || []) await FileStore.del(a.id);
     if (e.supabase_tax_statutory_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteTaxStatutoryEntry === 'function') {
       await (window as any).__supabaseDeleteTaxStatutoryEntry(e.supabase_tax_statutory_id);
     }
@@ -604,11 +713,18 @@ const api = {
     if (e.supabase_other_income_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOtherIncomeEntry === 'function') {
       await (window as any).__supabaseDeleteOtherIncomeEntry(e.supabase_other_income_id);
     }
-    Store.data.entries = Store.data.entries.filter(x => x.id !== id);
-    api.log('purge', 'entries', id, describe('entries', e)); Store.persist();
     if (typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteTransaction === 'function') {
-      (window as any).__supabaseDeleteTransaction(e.supabase_id || e.id).catch(console.warn);
+      const deleted = await (window as any).__supabaseDeleteTransaction(e.supabase_id || e.id, e, {
+        skipRefresh: options.skipRefresh
+      });
+      if (deleted === false) throw new Error('Could not permanently delete the transaction from Supabase.');
     }
+    if (typeof window !== 'undefined') {
+      (window as any).__excludeLedgerTransactionFromSummary?.(e.supabase_id || e.id);
+    }
+    Store.data.entries = Store.data.entries.filter(x => x.id !== id);
+    await api.log('delete', 'entries', id, `Permanently deleted · ${describe('entries', e)}`, null, { before, after: null });
+    if (!options.deferPersist) Store.persist();
   },
 
   /* ---- recurring ---- */
@@ -800,7 +916,8 @@ const Calc = {
   /** Balance of one account at end of `upto` (inclusive). */
   balance(accId, upto) {
     const a = api.get('accounts', accId); if (!a) return 0;
-    const open = Store.data.settings.openingDate;
+    const open = a.openingBalanceDate || Store.data.settings.openingDate;
+    if (upto < open) return 0;
     let b = +a.openingBalance || 0;
     for (const e of Calc.live()) {
       if (e.date < open || e.date > upto) continue;
@@ -1410,7 +1527,7 @@ function buildSeed() {
     const tm = {}; for (let ym = '2025-04'; ym <= '2026-08'; ym = addMonths(ym, 1)) tm[ym] = { status: 'confirmed', sentAt: addMonths(ym, 1) + '-03T10:00:00.000Z', confirmedAt: addMonths(ym, 1) + '-05T16:00:00.000Z', by: 'u_acct', note: 'Confirmed by CA' };
     D.tdsMonths = tm; D.tdsQuarters = {}; D.tdsOutCerts = [];
   }
-  D.audit.sort((a, b) => a.ts.localeCompare(b.ts));
+  D.audit = [];
 
   /* sample attachments (SVG "documents") for the most recent bills/receipts */
   const attach = [];
@@ -1514,7 +1631,20 @@ const userName = id => (Store.data.users.find(u => u.id === id) || {}).name || '
 const typeChip = t => `<span class="chip ${t}">${TYPE_LABEL[t]}</span>`;
 const amtClass = e => e.type === 'inflow' ? 'in' : e.type === 'outflow' ? 'out' : 'xfer';
 const signedAmt = e => (e.type === 'inflow' ? '+' : e.type === 'outflow' ? '−' : '') + money(e.amount);
-function entryTitle(e) { return e.type === 'transfer' ? 'Transfer' : e.categoryName || nameOf('categories', e.categoryId); }
+function entryTitle(e) {
+  if (e.type === 'transfer') return 'Transfer';
+  const cName = e.categoryName || (typeof nameOf === 'function' ? nameOf('categories', e.categoryId) : '');
+  const pName = String(e.partyName || (typeof nameOf === 'function' ? nameOf('parties', e.partyId) : '') || '').toLowerCase();
+  // Infer a category from the vendor only when no category was selected.
+  if (!cName && pName) {
+    if (/clean|facility|housekeep/i.test(pName)) return 'Housekeeping & Security';
+    if (/pantry|supplies|brew/i.test(pName)) return 'Office Supplies & Pantry';
+    if (/airlink|internet|fibernet/i.test(pName)) return 'Internet & Phone';
+    if (/cloudsuite|software/i.test(pName)) return 'Software Subscriptions';
+    if (/ananya|freelanc|ux/i.test(pName)) return 'Freelancers & Consultants';
+  }
+  return cName || (typeof nameOf === 'function' ? nameOf('categories', e.categoryId) : '') || 'Expense';
+}
 function entryParty(e) {
   if (e.type === 'transfer') return nameOf('accounts', e.accountId) + ' → ' + nameOf('accounts', e.toAccountId);
   const project = e.projectCode || (e.projectId && api.get('projects', e.projectId)?.code) || e.projectName;
@@ -1534,6 +1664,8 @@ const S = {
   page: 'dashboard', fy: fyOf(TODAY), dashDept: '',
   ledger: { q: '', bucket: '', group: '', from: '', to: '', type: '', categoryId: '', departmentId: '', partyId: '', projectId: '', accountId: '', paymentMode: '', page: 0, sort: 'date', dir: -1, open: window.innerWidth > 900 },
   cf: { by: 'category', period: 'monthly' },
+  byAccountCdOpen: true,
+  byAccountCdFilter: '',
   report: 'parties', reportKind: 'client', projScope: 'all',
   master: 'client', audit: { userId: '', action: '', entity: '', q: '', page: 0 },
 };
@@ -1817,6 +1949,7 @@ let ledgerLoading = false;
 let ledgerLoadError = '';
 let ledgerRequestId = 0;
 let ledgerRecords: any[] = [];
+const excludedLedgerTransactionIds = new Set<string>();
 
 function ledgerSupabaseFilters() {
   const L = S.ledger;
@@ -1877,54 +2010,288 @@ async function refreshLedgerFromSupabase() {
 }
 
 function toLedgerEntry(row: any) {
-  const type = String(row.type || '').toLowerCase() === 'inflow' ? 'inflow' : 'outflow';
+  const rawType = String(row.transaction_type || row.type || '').toLowerCase();
+  const type = rawType.includes('transfer') ? 'transfer' : rawType.includes('inflow') ? 'inflow' : 'outflow';
   const findByName = (table: string, value: any) => (Store.data[table] || []).find((item: any) =>
     String(item.name || '').trim().toLowerCase() === String(value || '').trim().toLowerCase()
   );
-  const category = findByName('categories', row.category);
-  const party = findByName('parties', row.party);
-  const project = findByName('projects', row.project);
+  let category = findByName('categories', row.category);
+  const rawCat = String(row.category || '').toLowerCase();
+  const rawParty = String(row.party_name || row.party || '').toLowerCase();
+  const rawDesc = String(row.description || '').toLowerCase();
+  const searchTarget = `${rawCat} ${rawParty} ${rawDesc}`;
+
+  let resolvedCatId = category?.id || '';
+  let resolvedCatName = row.category || category?.name || '';
+
+  if (!resolvedCatId) {
+    if (type === 'outflow') {
+      if (/clean|facility|housekeep/i.test(searchTarget)) {
+        resolvedCatId = 'cat_house';
+        resolvedCatName = resolvedCatName || 'Housekeeping & Security';
+      } else if (/pantry|supplies|welfare|food|brew/i.test(searchTarget)) {
+        resolvedCatId = 'cat_supplies';
+        resolvedCatName = resolvedCatName || 'Office Supplies & Pantry';
+      } else if (/internet|phone|fibernet|utility|broadband|airlink/i.test(searchTarget)) {
+        resolvedCatId = 'cat_net';
+        resolvedCatName = resolvedCatName || 'Internet & Phone';
+      } else if (/software|licen|cloudsuite|cloud|saas|subscription/i.test(searchTarget)) {
+        resolvedCatId = 'cat_soft';
+        resolvedCatName = resolvedCatName || 'Software Subscriptions';
+      } else if (/freelanc|consult|ananya|ux|designer|developer/i.test(searchTarget)) {
+        resolvedCatId = 'cat_free';
+        resolvedCatName = resolvedCatName || 'Freelancers & Consultants';
+      } else if (/travel|convey|cab|flight|hotel/i.test(searchTarget)) {
+        resolvedCatId = 'cat_travel';
+        resolvedCatName = resolvedCatName || 'Travel & Conveyance';
+      } else if (/\bca\b|audit|accounting|chartered/i.test(searchTarget)) {
+        resolvedCatId = 'cat_ca';
+        resolvedCatName = resolvedCatName || 'CA, Audit & Accounting';
+      } else if (/legal|complian|advocate/i.test(searchTarget)) {
+        resolvedCatId = 'cat_legal';
+        resolvedCatName = resolvedCatName || 'Legal & Compliance';
+      } else if (/bank\s*charge|charges/i.test(searchTarget)) {
+        resolvedCatId = 'cat_bank';
+        resolvedCatName = resolvedCatName || 'Bank Charges';
+      } else if (/salar|payroll|stipend|wages/i.test(searchTarget)) {
+        resolvedCatId = 'cat_sal';
+        resolvedCatName = resolvedCatName || 'Salaries';
+      } else {
+        resolvedCatId = 'cat_vserv';
+        resolvedCatName = resolvedCatName || row.category || 'Vendor Services (Project)';
+      }
+    } else {
+      if (/design/i.test(searchTarget)) {
+        resolvedCatId = 'cat_rdesign';
+        resolvedCatName = resolvedCatName || 'Project Receipts – Design';
+      } else if (/eng/i.test(searchTarget)) {
+        resolvedCatId = 'cat_reng';
+        resolvedCatName = resolvedCatName || 'Project Receipts – Engineering';
+      } else {
+        resolvedCatId = 'cat_othinc';
+        resolvedCatName = resolvedCatName || row.category || 'Other Income';
+      }
+    }
+  }
+
+  const party = findByName('parties', row.party_name || row.party);
+  const project = (Store.data.projects || []).find((p: any) =>
+    (row.project_code && String(p.code || '').trim().toLowerCase() === String(row.project_code).trim().toLowerCase()) ||
+    (row.project_name && String(p.name || '').trim().toLowerCase() === String(row.project_name).trim().toLowerCase()) ||
+    (row.project && String(p.name || '').trim().toLowerCase() === String(row.project).trim().toLowerCase())
+  );
   const department = findByName('departments', row.department);
-  const account = findByName('accounts', row.account);
+  const accountName = row.transfer_from_account_name || row.account_name || row.account;
+  const account = (Store.data.accounts || []).find((item: any) =>
+    String(item.supabase_id || item.id) === String(row.transfer_from_account_id || '') ||
+    String(item.name || '').trim().toLowerCase() === String(accountName || '').trim().toLowerCase()
+  ) || findByName('accounts', accountName);
+  const toAccount = (Store.data.accounts || []).find((item: any) =>
+    String(item.supabase_id || item.id) === String(row.transfer_to_account_id || '') ||
+    String(item.name || '').trim().toLowerCase() === String(row.transfer_to_account_name || '').trim().toLowerCase()
+  );
   return {
     id: String(row.id),
     supabase_id: String(row.id),
     type,
     date: row.transaction_date || '',
-    categoryId: category?.id || '',
-    categoryName: row.category || '',
+    categoryId: resolvedCatId,
+    categoryName: resolvedCatName,
+    category: resolvedCatName,
     partyId: party?.id || '',
-    partyName: row.party || '',
+    partyName: row.party_name || row.party || '',
     projectId: project?.id || '',
-    projectName: row.project || '',
-    projectCode: project?.code || '',
+    projectName: project?.name || row.project_name || row.project || '',
+    projectCode: project?.code || row.project_code || '',
     departmentId: department?.id || '',
     departmentName: row.department || '',
     accountId: account?.id || '',
-    accountName: row.account || '',
-    paymentMode: row.mode || '',
+    accountName: accountName || '',
+    toAccountId: type === 'transfer' ? toAccount?.id || '' : undefined,
+    transferFromAccountName: type === 'transfer' ? row.transfer_from_account_name || accountName || '' : undefined,
+    transferToAccountName: type === 'transfer' ? row.transfer_to_account_name || '' : undefined,
+    paymentMode: row.payment_mode || row.mode || '',
     description: row.description || '',
-    refNo: row.reference_no || '',
+    refNo: row.reference_number || row.reference_no || '',
     notes: row.notes || '',
     taxable: Number(row.taxable_amount) || 0,
     gstAmount: Number(row.gst_amount) || 0,
     tdsAmount: Number(row.tds_amount) || 0,
-    amount: Math.abs(Number(row.net_cash) || 0),
+    amount: Math.abs(Number(row.net_cash != null && row.net_cash !== '' ? row.net_cash : row.amount) || 0),
     netCash: Number(row.net_cash) || 0,
+    status: row.status || 'Active',
+    deleted: String(row.status || '').toLowerCase().includes('cancel'),
     attachments: []
+  };
+}
+
+export function getAllDeduplicatedTransactions(): any[] {
+  const norm = (s: any) => String(s || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+
+  // 1. Live CRM entries from Store (hydrated with real Supabase rows + local entries)
+  const rawLive = (typeof Calc !== 'undefined' && Calc.live ? Calc.live() : (Store.data?.entries || []))
+    .filter((e: any) => !e.deleted && !String(e.status || '').toLowerCase().includes('cancel'));
+  const liveRows = rawLive.map((e: any) => ({
+    ...e,
+    partyName: e.partyName || (typeof nameOf === 'function' ? nameOf('parties', e.partyId) : '') || '',
+    projectName: e.projectName || (typeof api !== 'undefined' && api.get ? (api.get('projects', e.projectId) || {}).name : '') || '',
+    projectCode: e.projectCode || (typeof api !== 'undefined' && api.get ? (api.get('projects', e.projectId) || {}).code : '') || '',
+    categoryName: e.categoryName || (typeof nameOf === 'function' ? nameOf('categories', e.categoryId) : '') || '',
+    departmentName: e.departmentName || (typeof nameOf === 'function' ? nameOf('departments', e.departmentId) : '') || '',
+    accountName: e.accountName || (typeof nameOf === 'function' ? nameOf('accounts', e.accountId) : '') || ''
+  }));
+
+  const getNormalizedAmt = (e: any) => {
+    const v = e.net_cash != null && e.net_cash !== ''
+      ? e.net_cash
+      : e.netAmount != null && e.netAmount !== ''
+        ? e.netAmount
+        : e.amount != null && e.amount !== '' && e.amount !== 0
+          ? e.amount
+          : (+e.taxable || 0) + (+e.gstAmount || 0) - (+e.tdsAmount || 0);
+    return Math.round(Math.abs(Number(v || 0)) * 100);
+  };
+
+  const buildSig = (e: any) => {
+    const amt = getNormalizedAmt(e);
+    const date = String(e.date || e.transaction_date || '').slice(0, 10);
+    const type = String(e.type || e.transaction_type || '').toLowerCase();
+    const cat = norm(e.categoryName || e.category);
+    const party = norm(e.partyName || e.party || e.party_name);
+    const desc = norm(e.description || e.refNo || e.ref_no);
+    const acc = norm(e.accountName || e.account_name || e.paid_from || e.received_into || e.account || e.accountId);
+    const toAccount = norm(e.transferToAccountName || e.toAccountName || e.toAccountId);
+    return `sig:${date}|${type}|${amt}|${cat}|${party || desc}|${acc}|${toAccount}`;
+  };
+
+  const liveIds = new Set<string>();
+  const liveSigs = new Set<string>();
+  for (const e of liveRows) {
+    if (e.supabase_id) liveIds.add(String(e.supabase_id));
+    if (e.id) liveIds.add(String(e.id));
+    liveSigs.add(buildSig(e));
+  }
+
+  const queryRows = (typeof ledgerRecords !== 'undefined' ? ledgerRecords : [])
+    .map(toLedgerEntry)
+    .filter((e: any) => {
+      if (e.deleted || String(e.status || '').toLowerCase().includes('cancel')) return false;
+      const id = String(e.supabase_id || e.id);
+      if (excludedLedgerTransactionIds.has(id)) return false;
+      if (liveIds.has(id)) return false;
+      const sig = buildSig(e);
+      if (liveSigs.has(sig)) return false;
+      return true;
+    });
+
+  const seenKeys = new Set<string>();
+  const dedupedList: any[] = [];
+  for (const e of [...liveRows, ...queryRows]) {
+    if (e.deleted || String(e.status || '').toLowerCase().includes('cancel')) continue;
+    const sbId = e.supabase_id ? String(e.supabase_id) : (e.id && String(e.id).includes('-') ? String(e.id) : '');
+    if (sbId && seenKeys.has(`id:${sbId}`)) continue;
+    if (sbId) seenKeys.add(`id:${sbId}`);
+
+    const sig = buildSig(e);
+    if (seenKeys.has(sig)) continue;
+    seenKeys.add(sig);
+
+    dedupedList.push(e);
+  }
+
+  return dedupedList;
+}
+
+if (typeof window !== 'undefined') {
+  (window as any).__getAllDeduplicatedTransactions = getAllDeduplicatedTransactions;
+  (window as any).__excludeLedgerTransactionFromSummary = (id: string | number) => {
+    if (id != null && String(id)) excludedLedgerTransactionIds.add(String(id));
+  };
+  (window as any).__includeLedgerTransactionInSummary = (id: string | number) => {
+    if (id != null && String(id)) excludedLedgerTransactionIds.delete(String(id));
   };
 }
 
 function ledgerFiltered() {
   const L = S.ledger; const [fyF, fyT] = fyRange(S.fy);
   const from = L.from || fyF, to = L.to || fyT; const q = L.q.trim().toLowerCase();
-  let rows = ledgerRecords.map(toLedgerEntry).filter(e => e.date >= from && e.date <= to
-    && (!L.type || e.type === L.type) && (!L.categoryId || e.categoryId === L.categoryId) && (!L.departmentId || e.departmentId === L.departmentId)
-    && (!L.partyId || e.partyId === L.partyId) && (!L.projectId || e.projectId === L.projectId)
-    && (!L.accountId || e.accountId === L.accountId || e.toAccountId === L.accountId) && (!L.paymentMode || e.paymentMode === L.paymentMode)
-    && (!L.bucket || bucketOf(api.get('categories', e.categoryId)) === L.bucket) && (!L.group || (api.get('categories', e.categoryId) || {}).group === L.group));
-  if (q) rows = rows.filter(e => [e.description, e.refNo, e.notes, e.partyName, e.projectName, e.categoryName, String(e.amount), String(e.taxable)].join(' ').toLowerCase().includes(q));
-  const k = L.sort; rows.sort((a, b) => (k === 'amount' ? a.amount - b.amount : a.date.localeCompare(b.date) || (a.createdAt || '').localeCompare(b.createdAt || '')) * L.dir);
+  const norm = (s: any) => String(s || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+
+  const dedupedList = getAllDeduplicatedTransactions();
+
+  let rows = dedupedList.filter(e => {
+    const entryDate = String(e.date || '').slice(0, 10);
+    if (from && entryDate && entryDate < from) return false;
+    if (to && entryDate && entryDate > to) return false;
+    if (L.type && e.type !== L.type) return false;
+    if (L.categoryId) {
+      const targetCat = api.get('categories', L.categoryId);
+      const targetName = norm(targetCat?.name);
+      const entryCatName = norm(
+        api.get('categories', e.categoryId)?.name ||
+        e.category ||
+        e.categoryName
+      );
+      const matchId = e.categoryId === L.categoryId;
+      const matchName = Boolean(targetName && entryCatName === targetName);
+      if (!matchId && !matchName) return false;
+    }
+    if (L.departmentId && e.departmentId !== L.departmentId && (!e.departmentName || api.get('departments', L.departmentId)?.name !== e.departmentName)) return false;
+    if (L.partyId && e.partyId !== L.partyId && (!e.partyName || api.get('parties', L.partyId)?.name !== e.partyName)) return false;
+    if (L.projectId && e.projectId !== L.projectId && (!e.projectCode || api.get('projects', L.projectId)?.code !== e.projectCode)) return false;
+    if (L.accountId) {
+      const accList = Store.data?.accounts || [];
+      const targetAcc = accList.find((a: any) => a.id === L.accountId || norm(a.name) === norm(L.accountId));
+      const targetName = norm(targetAcc ? targetAcc.name : L.accountId);
+      const targetId = targetAcc ? targetAcc.id : L.accountId;
+
+      const entryAccName = norm(e.accountName || e.account_name || e.paid_from || e.received_into || e.account || nameOf('accounts', e.accountId) || '');
+      const toAccName = norm(nameOf('accounts', e.toAccountId) || '');
+
+      const isTargetFixed = targetName.includes('fixed') || targetName.includes('fd');
+      const isEntryFixed = entryAccName.includes('fixed') || entryAccName.includes('fd') || toAccName.includes('fixed') || toAccName.includes('fd');
+      if (isTargetFixed !== isEntryFixed) return false;
+
+      const isTargetPetty = targetName.includes('petty') || targetName.includes('cash');
+      const isEntryPetty = entryAccName.includes('petty') || entryAccName.includes('cash') || toAccName.includes('petty') || toAccName.includes('cash');
+      if (isTargetPetty !== isEntryPetty) return false;
+
+      if (targetName.includes('hdfc') && !entryAccName.includes('hdfc') && !toAccName.includes('hdfc')) return false;
+      if (targetName.includes('icici') && !entryAccName.includes('icici') && !toAccName.includes('icici')) return false;
+
+      const matchId = (e.accountId && (e.accountId === targetId || (targetAcc?.supabase_id && String(e.accountId) === String(targetAcc.supabase_id)))) ||
+                      (e.toAccountId && (e.toAccountId === targetId || (targetAcc?.supabase_id && String(e.toAccountId) === String(targetAcc.supabase_id))));
+
+      const matchName = targetName && (
+        entryAccName === targetName ||
+        toAccName === targetName ||
+        (entryAccName && (entryAccName.includes(targetName) || targetName.includes(entryAccName))) ||
+        (toAccName && (toAccName.includes(targetName) || targetName.includes(toAccName))) ||
+        (entryAccName.replace(/[-–\s]/g, '') === targetName.replace(/[-–\s]/g, ''))
+      );
+
+      if (!matchId && !matchName) return false;
+    }
+    if (L.paymentMode && e.paymentMode !== L.paymentMode) return false;
+    if (L.bucket && bucketOf(api.get('categories', e.categoryId)) !== L.bucket) return false;
+    if (L.group && (api.get('categories', e.categoryId) || {}).group !== L.group) return false;
+    return true;
+  });
+
+  if (q) {
+    rows = rows.filter(e => [
+      e.description, e.refNo, e.txnRef, e.notes,
+      e.partyName, nameOf('parties', e.partyId),
+      e.projectName, e.projectCode,
+      e.categoryName, nameOf('categories', e.categoryId),
+      e.departmentName, nameOf('departments', e.departmentId),
+      e.accountName, nameOf('accounts', e.accountId),
+      String(e.amount), String(e.taxable)
+    ].join(' ').toLowerCase().includes(q));
+  }
+
+  const k = L.sort;
+  rows.sort((a, b) => (k === 'amount' ? a.amount - b.amount : (a.date || '').localeCompare(b.date || '') || (a.createdAt || '').localeCompare(b.createdAt || '')) * L.dir);
   return { rows, from, to };
 }
 PAGES.ledger = {
@@ -1939,6 +2306,7 @@ PAGES.ledger = {
       <button class="btn" data-act="toggle-filters">${icon('list')} Filters${activeCount ? ` <span class="chip navy">${activeCount}</span>` : ''}</button>
       <button class="btn btn-gold" data-act="add-fss-transaction">+ Add Transaction</button>
       <button class="btn" data-act="refresh-fss-transactions" title="Refresh from Supabase">${icon('refresh')}</button>
+      <button class="btn btn-gold" data-act="store-ui-to-supabase" style="margin-left:4px" title="Store all UI transactions in Supabase fss_transactions table">Store in Supabase</button>
       ${activeCount || L.q || L.bucket || L.group ? '<button class="btn btn-ghost" data-act="clear-filters">Clear</button>' : ''}
       ${L.bucket || L.group ? `<span class="chip gold" style="height:30px;align-self:flex-end">${esc([BUCKET_LABEL[L.bucket], L.group].filter(Boolean).join(' › '))}<button data-act="clear-bucket" title="Remove" style="display:inline-flex;width:14px">${icon('x')}</button></span>` : ''}
       </div>
@@ -1971,12 +2339,12 @@ function ledgerResults() {
   const loadStatus = ledgerLoadError
     ? `<div class="notice" role="alert" style="margin:12px">${esc(ledgerLoadError)}</div>`
     : ledgerLoading ? '<div class="notice" style="margin:12px">Loading transactions from Supabase…</div>' : '';
-  if (ledgerLoadError) return strip + loadStatus;
+  if (ledgerLoadError && !rows.length) return strip + loadStatus;
   if (!rows.length) return strip + loadStatus + (ledgerLoading ? '' : `<div class="empty"><b>No transactions match</b>${fmtDate(from)} – ${fmtDate(to)}. Adjust the filters or add an entry.</div>`);
   const table = `<div class="tbl-wrap ledger-table"><table class="tbl"><thead><tr>
     <th class="sort" data-act="sort" data-k="date">Date${sortI('date')}</th><th>Type</th><th>Category / description</th><th>Party · project</th><th>Dept</th>
     <th class="num">Taxable</th><th class="num">GST</th><th class="num">TDS</th><th class="num sort" data-act="sort" data-k="amount">Net cash${sortI('amount')}</th><th>Account · mode</th><th>Actions</th></tr></thead><tbody>
-    ${slice.map(e => `<tr>
+    ${slice.map(e => `<tr class="click" data-act="open-entry" data-id="${esc(e.id)}">
       <td class="nowrap">${fmtDate(e.date)}</td><td>${typeChip(e.type)}</td>
       <td style="max-width:260px"><div class="cell-main">${esc(entryTitle(e))}</div><div class="cell-sub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(e.description || '')}${e.refNo ? ' · ' + esc(e.refNo) : ''}</div></td>
       <td style="max-width:220px"><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(e.type === 'transfer' ? entryParty(e) : e.partyName || nameOf('parties', e.partyId) || '—')}</div>${e.projectName ? `<div class="cell-sub">${esc(e.projectCode || e.projectName)}</div>` : ''}</td>
@@ -1984,9 +2352,9 @@ function ledgerResults() {
       <td class="num">${e.type === 'transfer' ? '' : money(e.taxable)}</td><td class="num muted">${e.gstAmount ? money(e.gstAmount) : ''}</td><td class="num muted">${e.tdsAmount ? money(e.tdsAmount) : ''}</td>
       <td class="num ${amtClass(e)}" style="font-weight:600">${signedAmt(e)}</td>
       <td class="nowrap"><div>${esc(e.accountName || nameOf('accounts', e.accountId))}</div><div class="cell-sub">${esc(e.paymentMode)}</div></td>
-      <td class="nowrap"><button class="icon-btn xs" title="Edit transaction" data-act="edit-fss-transaction" data-id="${esc(e.id)}">${icon('edit')}</button> <button class="icon-btn xs" title="Delete transaction" data-act="delete-fss-transaction" data-id="${esc(e.id)}">${icon('trash')}</button></td></tr>`).join('')}
+      <td class="nowrap">${e.attachments && e.attachments.length ? `<span title="${e.attachments.length} attachment(s)" style="display:inline-block;width:15px">${icon('clip')}</span>` : ''}${api.isLocked(e.date) ? `<span title="Month locked" style="display:inline-block;width:15px;margin-left:4px">${icon('lock')}</span>` : ''} <button class="icon-btn xs" title="Edit transaction" data-act="edit-fss-transaction" data-id="${esc(e.id)}">${icon('edit')}</button> <button class="icon-btn xs" title="Delete transaction" data-act="delete-fss-transaction" data-id="${esc(e.id)}">${icon('trash')}</button></td></tr>`).join('')}
     </tbody></table></div>`;
-  const cards = `<div class="lcards">${slice.map(e => `<div class="lcard"><button class="grow" style="border:0;background:none;text-align:left;color:inherit;padding:0" data-act="edit-fss-transaction" data-id="${esc(e.id)}"><div class="t">${esc(entryTitle(e))}</div><div class="s">${esc(entryParty(e))}</div><div class="s">${fmtDate(e.date)} · ${esc(e.departmentName || e.paymentMode)}</div></button><div><div class="amt ${amtClass(e)}">${signedAmt(e)}</div><button class="icon-btn xs" title="Delete transaction" data-act="delete-fss-transaction" data-id="${esc(e.id)}">${icon('trash')}</button></div></div>`).join('')}</div>`;
+  const cards = `<div class="lcards">${slice.map(e => `<div class="lcard"><button class="grow" style="border:0;background:none;text-align:left;color:inherit;padding:0" data-act="open-entry" data-id="${esc(e.id)}"><div class="t">${esc(entryTitle(e))}</div><div class="s">${esc(entryParty(e))}</div><div class="s">${fmtDate(e.date)} · ${esc(e.departmentName || e.paymentMode)}</div></button><div><div class="amt ${amtClass(e)}">${signedAmt(e)}</div><div class="row" style="gap:4px;margin-top:4px"><button class="icon-btn xs" title="Edit transaction" data-act="edit-fss-transaction" data-id="${esc(e.id)}">${icon('edit')}</button><button class="icon-btn xs" title="Delete transaction" data-act="delete-fss-transaction" data-id="${esc(e.id)}">${icon('trash')}</button></div></div></div>`).join('')}</div>`;
   const pager = `<div class="pager"><span>Showing ${L.page * per + 1}–${Math.min(rows.length, L.page * per + per)} of ${rows.length}</span><span class="spacer"></span>
     <button class="btn btn-sm" data-act="lpage" data-d="-1" ${L.page ? '' : 'disabled'}>Previous</button><span>Page ${L.page + 1} / ${pages}</span><button class="btn btn-sm" data-act="lpage" data-d="1" ${L.page < pages - 1 ? '' : 'disabled'}>Next</button></div>`;
   return strip + loadStatus + table + cards + pager;
@@ -2097,7 +2465,7 @@ function deletedCategoryMonthKeys(entries: any[] | undefined, nameOf: (e: any) =
   return out;
 }
 /** Category tree: bucket → group → category. valsOf(cat) returns per-period values. */
-function categoryTree(type, valsOf, scope, drillBase = {}) {
+function categoryTree(type, valsOf, scope, drillBase = {}, keepEmpty = false) {
   const normalizeCategory = (value: string) => String(value || '').toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
   let cats = api.list('categories').filter(c => c.type === type);
   if (type === 'inflow' && typeof Store !== 'undefined' && Store.data?.fss_operation_receipts) {
@@ -2204,6 +2572,7 @@ function categoryTree(type, valsOf, scope, drillBase = {}) {
     const bc = cats.filter(c => bucketOf(c) === bid);
     return {
       key: scope + type + ':' + bid, label: bl, drill: { ...drillBase, bucket: bid },
+      keepEmpty,
       children: [...new Set(bc.map(c => c.group))].map(g => {
         let groupCats = bc.filter(c => c.group === g);
         if (g === 'People') {
@@ -2236,13 +2605,14 @@ function categoryTree(type, valsOf, scope, drillBase = {}) {
         }
         return {
           key: scope + type + ':' + bid + ':' + g, label: g, drill: { ...drillBase, bucket: bid, group: g },
+          keepEmpty,
           children: groupCats.map(c => ({
             key: scope + 'c:' + c.id,
             label: c.name,
             vals: valsOf(c),
             drill: { ...drillBase, categoryId: c.id },
-            keepEmpty: type === 'outflow' && bid === 'op_cost' && g === 'People'
-              && Store.data?.fss_outflow_oc_people?.some((row: any) => normalizeCategory(row.category) === normalizeCategory(c.name))
+            keepEmpty: keepEmpty || (type === 'outflow' && bid === 'op_cost' && g === 'People'
+              && Store.data?.fss_outflow_oc_people?.some((row: any) => normalizeCategory(row.category) === normalizeCategory(c.name)))
           })),
         };
       }),
@@ -2634,11 +3004,7 @@ export function computeCashflowPeopleRows(entries?: any[], fy = 2026) {
     { col: 'dec_26', ym: '2026-12' },
   ];
 
-  const norm = (s: string) => (s || '').toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
-  const existingRows = (typeof Store !== 'undefined' && Store.data?.fss_outflow_oc_people) || [];
-
   const getMonthlyForCategory = (catName: string, filterFn: (e: any) => boolean) => {
-    const existing = existingRows.find((r: any) => norm(r.category) === norm(catName));
     const result: Record<string, number> = {};
     for (const m of monthCols) {
       if (!m.ym) {
@@ -2652,21 +3018,7 @@ export function computeCashflowPeopleRows(entries?: any[], fy = 2026) {
         })
         .reduce((s: number, e: any) => s + (Number(e.amount != null ? e.amount : e.taxable) || 0), 0);
 
-      const storedValue = existing && existing[m.col] != null ? Number(existing[m.col]) || 0 : 0;
-      if (total > 0) {
-        // Active transactions are authoritative. Keeping max(live, stored) prevents
-        // deleted or edited transactions from reducing the monthly People total.
-        result[m.col] = Math.round(total * 100) / 100;
-      } else if (existing && existing[m.col] != null) {
-        const hasDeleted = (Store.data?.entries || []).some((e: any) => e.deleted && e.type === 'outflow' && cashflowPeriodOf(e) === m.ym && (norm(e.categoryId || '') === norm(catName) || norm((api.get('categories', e.categoryId)?.name || e.category || '')) === norm(catName)));
-        if (hasDeleted) {
-          result[m.col] = 0;
-        } else {
-          result[m.col] = Math.round(Number(existing[m.col]) * 100) / 100;
-        }
-      } else {
-        result[m.col] = 0;
-      }
+      result[m.col] = Math.round(total * 100) / 100;
     }
     return result;
   };
@@ -2705,27 +3057,12 @@ export function computeCashflowPeopleRows(entries?: any[], fy = 2026) {
     { category: 'Staff Welfare', ...welfare }
   ];
 
-  const bonusRow = existingRows.find((r: any) => norm(r.category) === norm('Bonus & Incentives'));
   const hasBonusEntries = activeOutflows.some(isBonus);
-  if (bonusRow || hasBonusEntries) {
+  if (hasBonusEntries) {
     peopleRows.push({
-      category: bonusRow?.category || 'Bonus & Incentives',
+      category: 'Bonus & Incentives',
       ...getMonthlyForCategory('Bonus & Incentives', isBonus)
     });
-  }
-
-  for (const r of existingRows) {
-    const rName = norm(r.category);
-    if (!rName.includes('total') && !peopleRows.some((row: any) => norm(row.category) === rName)) {
-      const rowData: Record<string, number> = {};
-      for (const m of monthCols) {
-        rowData[m.col] = m.ym ? Number(r[m.col] || 0) : 0;
-      }
-      peopleRows.push({
-        category: r.category,
-        ...rowData
-      });
-    }
   }
 
   return peopleRows;
@@ -2796,10 +3133,8 @@ export function computeCashflowOutflowProjectCostRows(entries?: any[], fy = 2026
         const matchingOutflows = activeOutflows.filter((e: any) => matchFn(e) && cashflowPeriodOf(e) === m.ym);
         const sum = matchingOutflows.reduce((s: number, e: any) => s + Number(e.amount != null ? e.amount : e.taxable || 0), 0);
         const fallback = fallbackValues[catName]?.[m.col] || 0;
-        // Active transactions win over a deleted-entry marker. A prior deleted transaction
-        // in this category/month must not suppress other live transactions in that month.
-        // The fixed category IDs are not authoritative across imported/Supabase datasets.
-        const value = matchingOutflows.length > 0 ? sum : isDeleted ? 0 : fallback;
+        // Only real active transactions are counted; if no transactions exist, value is 0
+        const value = matchingOutflows.length > 0 ? sum : 0;
         monthlyData[m.col] = value ? Math.round(value * 100) / 100 : 0;
       }
     }
@@ -2942,8 +3277,7 @@ export function computeCashflowOutflowOfficeVariableRows(entries?: any[], fy = 2
         const isDeleted = deletedCashKeys.has(norm(catName) + '|' + m.ym);
         const matchingOutflows = activeOutflows.filter((e: any) => matchFn(e) && (e.date || '').slice(0, 7) === m.ym);
         const entrySum = matchingOutflows.reduce((s: number, e: any) => s + Number(e.amount != null ? e.amount : e.taxable || 0), 0);
-        const fallback = fallbackValues[category.fallbackName || catName]?.[m.col] || 0;
-        const sum = matchingOutflows.length > 0 ? entrySum : isDeleted ? 0 : fallback;
+        const sum = matchingOutflows.length > 0 ? entrySum : 0;
         monthlyData[m.col] = sum ? Math.round(sum * 100) / 100 : 0;
       }
     }
@@ -3097,8 +3431,7 @@ export function computeCashflowOutflowOfficeFixedRows(entries?: any[], fy = 2026
         const isDeleted = deletedCashKeys.has(norm(catName) + '|' + m.ym);
         const matchingOutflows = activeOutflows.filter((e: any) => matchFn(e) && cashflowPeriodOf(e) === m.ym);
         const entrySum = matchingOutflows.reduce((s: number, e: any) => s + Number(e.amount != null ? e.amount : e.taxable || 0), 0);
-        const fallback = fallbackValues[category.fallbackName || catName]?.[m.col] || 0;
-        const sum = matchingOutflows.length > 0 ? entrySum : isDeleted ? 0 : fallback;
+        const sum = matchingOutflows.length > 0 ? entrySum : 0;
         monthlyData[m.col] = sum ? Math.round(sum * 100) / 100 : 0;
       }
     }
@@ -3196,8 +3529,7 @@ export function computeCashflowOutflowTravelRows(entries?: any[], fy = 2026) {
         const isDeleted = deletedCashKeys.has(norm(catName) + '|' + m.ym);
         const matchingOutflows = activeOutflows.filter((e: any) => matchFn(e) && cashflowPeriodOf(e) === m.ym);
         const entrySum = matchingOutflows.reduce((s: number, e: any) => s + Number(e.amount != null ? e.amount : e.taxable || 0), 0);
-        const fallback = fallbackValues[catName]?.[m.col] || 0;
-        const sum = matchingOutflows.length > 0 ? entrySum : isDeleted ? 0 : fallback;
+        const sum = matchingOutflows.length > 0 ? entrySum : 0;
         monthlyData[m.col] = sum ? Math.round(sum * 100) / 100 : 0;
       }
     }
@@ -3275,19 +3607,27 @@ export function computeCashflowOutflowProfessionalAdminRows(entries?: any[], fy 
     'CA, Audit & Accounting': (e: any) => {
       const cid = (e.categoryId || '').toLowerCase();
       const cname = norm(typeof api !== 'undefined' && typeof api.get === 'function' ? (api.get('categories', e.categoryId)?.name || e.category || '') : (e.category || ''));
-      return cid === 'cat_ca' || cname === norm('CA, Audit & Accounting');
+      return cid === 'cat_ca' || cname === norm('CA, Audit & Accounting') || cname.includes('ca') || cname.includes('audit') || cname.includes('accounting');
     },
     'Legal & Compliance': (e: any) => {
       const cid = (e.categoryId || '').toLowerCase();
       const cname = norm(typeof api !== 'undefined' && typeof api.get === 'function' ? (api.get('categories', e.categoryId)?.name || e.category || '') : (e.category || ''));
-      return cid === 'cat_legal' || cname === norm('Legal & Compliance');
+      return cid === 'cat_legal' || cname === norm('Legal & Compliance') || cname.includes('legal') || cname.includes('compliance');
     },
     'Bank Charges': (e: any) => {
       const cid = (e.categoryId || '').toLowerCase();
       const cname = norm(typeof api !== 'undefined' && typeof api.get === 'function' ? (api.get('categories', e.categoryId)?.name || e.category || '') : (e.category || ''));
-      return cid === 'cat_bank' || cname === norm('Bank Charges');
+      return cid === 'cat_bank' || cname === norm('Bank Charges') || cname.includes('bank') || cname.includes('charges');
     }
   };
+
+  const adminCategories = (typeof api !== 'undefined' && typeof api.list === 'function' ? api.list('categories') : [])
+    .filter((c: any) => c.type === 'outflow' && norm(c.group) === norm('Professional & Admin') && !Object.keys(catMatch).some(k => norm(k) === norm(c.name)));
+  for (const c of adminCategories) {
+    if (!catMatch[c.name]) {
+      catMatch[c.name] = (e: any) => (e.categoryId === c.id || norm(e.category || '') === norm(c.name));
+    }
+  }
 
   const childRows: any[] = [];
   for (const [catName, matchFn] of Object.entries(catMatch)) {
@@ -3299,8 +3639,7 @@ export function computeCashflowOutflowProfessionalAdminRows(entries?: any[], fy 
         const isDeleted = deletedCashKeys.has(norm(catName) + '|' + m.ym);
         const matchingOutflows = activeOutflows.filter((e: any) => matchFn(e) && (e.date || '').slice(0, 7) === m.ym);
         const entrySum = matchingOutflows.reduce((s: number, e: any) => s + Number(e.amount != null ? e.amount : e.taxable || 0), 0);
-        const fallback = fallbackValues[catName]?.[m.col] || 0;
-        const sum = matchingOutflows.length > 0 ? entrySum : isDeleted ? 0 : fallback;
+        const sum = matchingOutflows.length > 0 ? entrySum : 0;
         monthlyData[m.col] = sum ? Math.round(sum * 100) / 100 : 0;
       }
     }
@@ -3405,9 +3744,7 @@ export function computeCashflowOutflowTaxStatutoryRows(entries?: any[], fy = 202
           monthlyData[m.col] = 0;
         } else {
           const sum = matchingOutflows.reduce((s: number, e: any) => s + Number(e.amount != null ? e.amount : e.taxable || 0), 0);
-          const fallback = fallbackValues[catName]?.[m.col] || 0;
-          const value = matchingOutflows.length > 0 ? sum : fallback;
-          monthlyData[m.col] = value ? Math.round(value * 100) / 100 : 0;
+          monthlyData[m.col] = sum ? Math.round(sum * 100) / 100 : 0;
         }
       }
     }
@@ -3515,8 +3852,7 @@ export function computeCashflowOutflowCapexRows(entries?: any[], fy = 2026) {
         const uiIndex = uiPeriodIndex[m.ym];
         const uiValue = uiIndex == null ? 0 : Number((uiCapexSums[category.id] || [])[uiIndex] || 0);
         const isDeleted = deletedCashKeys.has(norm(catName) + '|' + m.ym);
-        const fb = fallbackValues[catName]?.[m.col] || 0;
-        const sum = matching.length > 0 ? uiValue : isDeleted ? 0 : fb;
+        const sum = matching.length > 0 ? uiValue : 0;
         monthlyData[m.col] = sum ? Math.round(sum * 100) / 100 : 0;
       }
     }
@@ -3612,8 +3948,7 @@ export function computeCashflowOutflowFinancingAndOwnerRows(entries?: any[], fy 
         });
         const entrySum = matching.reduce((s: number, e: any) => s + Number(e.amount != null ? e.amount : e.taxable || 0), 0);
         const isDeleted = deletedCashKeys.has(norm(catName) + '|' + m.ym);
-        const fb = fallbackValues[catName]?.[m.col] || 0;
-        const sum = matching.length > 0 ? entrySum : isDeleted ? 0 : fb;
+        const sum = matching.length > 0 ? entrySum : 0;
         monthlyData[m.col] = sum ? Math.round(sum * 100) / 100 : 0;
       }
     }
@@ -3711,6 +4046,355 @@ function revenuePerfHTML(fy, periods, fyF, lastTo) {
     ${open && deps.length ? `<tr class="rp-sub"><td colspan="${len + 3}">By department · each ${unit} as % of that department's FY revenue</td></tr>${depRows}` : ''}
     </tbody></table></div></div>`;
 }
+
+const CD_MONTHS_CONFIG = [
+  { key: 'jan', label: 'Jan' },
+  { key: 'feb', label: 'Feb' },
+  { key: 'march', label: 'Mar' },
+  { key: 'april', label: 'Apr' },
+  { key: 'may', label: 'May' },
+  { key: 'june', label: 'Jun' },
+  { key: 'july', label: 'Jul' },
+  { key: 'august', label: 'Aug' },
+  { key: 'september', label: 'Sep' },
+  { key: 'october', label: 'Oct' },
+  { key: 'november', label: 'Nov' },
+  { key: 'december', label: 'Dec' },
+] as const;
+
+function getCdDateRange(monthKey: string, fy: number = 2026): { from: string; to: string } {
+  const normKey = String(monthKey).toLowerCase().trim();
+  if (normKey === 'fy_to_date' || normKey === 'fy') {
+    return { from: `${fy}-04-01`, to: `${fy + 1}-03-31` };
+  }
+  const map: Record<string, string> = {
+    jan: '01', january: '01',
+    feb: '02', february: '02',
+    mar: '03', march: '03',
+    apr: '04', april: '04',
+    may: '05',
+    jun: '06', june: '06',
+    jul: '07', july: '07',
+    aug: '08', august: '08',
+    sep: '09', september: '09',
+    oct: '10', october: '10',
+    nov: '11', november: '11',
+    dec: '12', december: '12'
+  };
+  const m = map[normKey] || '04';
+  const y = Number(m) >= 4 ? fy : fy + 1;
+  const lastDay = new Date(y, Number(m), 0).getDate();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return {
+    from: `${y}-${m}-01`,
+    to: `${y}-${m}-${pad(lastDay)}`
+  };
+}
+
+function renderByAccountCreditedDebitedHTML() {
+  const isOpen = S.byAccountCdOpen !== false;
+  let rawRows: any[] = Array.isArray(Store.data?.fss_by_account_credited_debited) ? Store.data.fss_by_account_credited_debited : [];
+
+  // Dynamically compute real live rows from Store.data.entries and ledgerRecords using strict deduplication
+  if (typeof (window as any).__computeByAccountCreditedDebitedRows === 'function') {
+    const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
+    try {
+      const combinedEntries = getAllDeduplicatedTransactions();
+      rawRows = (window as any).__computeByAccountCreditedDebitedRows(
+        combinedEntries,
+        rawRows,
+        Store.data?.accounts || [],
+        currentFy
+      );
+      if (Store.data) {
+        Store.data.fss_by_account_credited_debited = rawRows;
+      }
+    } catch (e) {
+      console.warn('Live By Account computation notice:', e);
+    }
+  }
+
+  // Fetch account names dynamically from Supabase and known accounts
+  const normAcc = (s: any) => String(s || '').replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+  const accountSet = new Set<string>();
+  rawRows.forEach((r: any) => {
+    if (r.account_name && String(r.account_name).trim()) accountSet.add(String(r.account_name).trim());
+  });
+  (Store.data?.accounts || []).forEach((a: any) => {
+    if (a.name && String(a.name).trim()) {
+      const existing = Array.from(accountSet).find(name => normAcc(name) === normAcc(a.name));
+      if (!existing) accountSet.add(String(a.name).trim());
+    }
+  });
+  const allAccounts: string[] = Array.from(accountSet);
+  allAccounts.sort((a, b) => a.localeCompare(b));
+
+  const filter = S.byAccountCdFilter || '';
+  const visibleAccounts = filter ? allAccounts.filter(a => normAcc(a) === normAcc(filter)) : allAccounts;
+  // Helper: Show actual values stored in Supabase; keep NULL values blank ("")
+  const formatVal = (v: any) => {
+    if (v === null || v === undefined || v === '' || isNaN(Number(v))) return '';
+    return money(Number(v));
+  };
+
+  const formatShare = (v: any) => {
+    if (v === null || v === undefined || v === '' || isNaN(Number(v))) return '';
+    return `${Number(v).toFixed(1)}%`;
+  };
+
+  const controlsHTML = `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:6px;">
+        <label for="cdAccountFilter" style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Account:</label>
+        <select id="cdAccountFilter" class="sel" data-act="filter-by-account-cd" style="font-size:13px;padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--ink);">
+          <option value="">All Accounts (${allAccounts.length})</option>
+          ${allAccounts.map(acc => `<option value="${esc(acc)}" ${normAcc(filter) === normAcc(acc) ? 'selected' : ''}>${esc(acc)}</option>`).join('')}
+        </select>
+      </div>
+      <button type="button" class="btn btn-sm btn-navy" data-act="add-account-cd" style="display:inline-flex;align-items:center;gap:4px;">
+        ${icon('plus')} Add Account
+      </button>
+      <button type="button" class="btn btn-sm btn-ghost" data-act="refresh-by-account-cd" title="Refresh from Supabase" style="padding:4px 8px;">
+        ${icon('refresh')}
+      </button>
+    </div>
+  `;
+
+  // Collapsible: if closed, render header only
+  if (!isOpen) {
+    return `
+      <div class="card" style="margin-top:24px;">
+        <div class="card-h" style="display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;padding:14px 18px;" data-act="toggle-by-account-cd">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <button class="tw" style="pointer-events:none;">${icon('chev')}</button>
+            <h3 style="margin:0;font-size:15px;font-weight:700;">By Account – Credited &amp; Debited</h3>
+            <span class="tw-n" style="margin-left:4px">${allAccounts.length}</span>
+          </div>
+          <span class="muted" style="font-size:12px;">Click to expand</span>
+        </div>
+      </div>
+    `;
+  }
+
+  // Build table body
+  let tableRowsHTML = '';
+  if (visibleAccounts.length === 0) {
+    tableRowsHTML = `<tr><td colspan="16" style="text-align:center;padding:32px 16px;color:var(--muted);font-size:13px;">${allAccounts.length === 0 ? 'No accounts found in Supabase table <code>fss_by_account_credited_debited</code>. Click "+ Add Account" above to add one.' : 'No account matching the selected filter.'}</td></tr>`;
+  } else {
+    visibleAccounts.forEach(accName => {
+      const cRow = rawRows.find((r: any) => normAcc(r.account_name) === normAcc(accName) && String(r.transaction_type || '').toLowerCase() === 'credited');
+      const dRow = rawRows.find((r: any) => normAcc(r.account_name) === normAcc(accName) && String(r.transaction_type || '').toLowerCase() === 'debited');
+
+      // Account group header row
+      tableRowsHTML += `
+        <tr class="d0 node" style="background:var(--subtle, #f8f9fa);border-top:1px solid var(--border);">
+          <td class="first" style="font-weight:700;color:var(--ink);padding:8px 12px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+              <span style="display:flex;align-items:center;gap:6px;">
+                <span style="font-size:14px">🏦</span>
+                <span>${esc(accName)}</span>
+              </span>
+              <button type="button" class="icon-btn xs" data-act="delete-account-cd" data-acc="${esc(accName)}" title="Delete account ${esc(accName)}" style="color:var(--danger, #dc3545);">
+                ${icon('trash')}
+              </button>
+            </div>
+          </td>
+          ${CD_MONTHS_CONFIG.map(() => '<td></td>').join('')}
+          <td class="num tot-c"></td>
+          <td class="num share"></td>
+          <td></td>
+        </tr>
+      `;
+
+      // Credited row
+      if (cRow) {
+        tableRowsHTML += `
+          <tr class="d1 leaf">
+            <td class="first" style="padding-left:26px;">
+              <span class="tw-leaf" style="display:inline-flex;align-items:center;gap:6px;">
+                <span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;background:#e6f4ea;color:#137333;">Credited</span>
+              </span>
+            </td>
+            ${CD_MONTHS_CONFIG.map(m => {
+              const val = cRow[m.key];
+              const hasVal = val !== null && val !== undefined && val !== '' && !isNaN(Number(val));
+              const range = getCdDateRange(m.key, S.fy);
+              return `<td class="num cd-cell ${hasVal ? 'hit' : 'zero'}" 
+                data-act="cd-drill" 
+                data-cd-id="${cRow.id}" 
+                data-cd-col="${m.key}" 
+                data-cd-val="${hasVal ? Number(val) : ''}" 
+                data-account="${esc(accName)}" 
+                data-type="inflow" 
+                data-from="${range.from}" 
+                data-to="${range.to}" 
+                title="${hasVal ? 'Click to view ' + esc(accName) + ' credited transactions in Ledger • Double-click to edit' : 'Double-click to edit'}" 
+                style="${hasVal ? 'cursor:pointer;' : ''}">${hasVal ? money(Number(val)) : ''}</td>`;
+            }).join('')}
+            ${(() => {
+              const fyRangeVal = getCdDateRange('fy_to_date', S.fy);
+              const fyVal = cRow.fy_to_date;
+              const hasFy = fyVal !== null && fyVal !== undefined && fyVal !== '' && !isNaN(Number(fyVal)) && Number(fyVal) !== 0;
+              return `<td class="num tot-c in ${hasFy ? 'hit' : ''}" 
+                ${hasFy ? `data-act="cd-drill" data-account="${esc(accName)}" data-type="inflow" data-from="${fyRangeVal.from}" data-to="${fyRangeVal.to}" title="Click to view full FY ${esc(accName)} credited transactions in Ledger" style="font-weight:700;cursor:pointer;"` : 'style="font-weight:700;"'}>${formatVal(fyVal)}</td>`;
+            })()}
+            <td class="num share"><span class="muted">${formatShare(cRow.shares)}</span></td>
+            <td></td>
+          </tr>
+        `;
+      }
+
+      // Debited row
+      if (dRow) {
+        tableRowsHTML += `
+          <tr class="d1 leaf">
+            <td class="first" style="padding-left:26px;">
+              <span class="tw-leaf" style="display:inline-flex;align-items:center;gap:6px;">
+                <span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;background:#fce8e6;color:#c5221f;">Debited</span>
+              </span>
+            </td>
+            ${CD_MONTHS_CONFIG.map(m => {
+              const val = dRow[m.key];
+              const hasVal = val !== null && val !== undefined && val !== '' && !isNaN(Number(val));
+              const range = getCdDateRange(m.key, S.fy);
+              return `<td class="num cd-cell ${hasVal ? 'hit' : 'zero'}" 
+                data-act="cd-drill" 
+                data-cd-id="${dRow.id}" 
+                data-cd-col="${m.key}" 
+                data-cd-val="${hasVal ? Number(val) : ''}" 
+                data-account="${esc(accName)}" 
+                data-type="outflow" 
+                data-from="${range.from}" 
+                data-to="${range.to}" 
+                title="${hasVal ? 'Click to view ' + esc(accName) + ' debited transactions in Ledger • Double-click to edit' : 'Double-click to edit'}" 
+                style="${hasVal ? 'cursor:pointer;' : ''}">${hasVal ? money(Number(val)) : ''}</td>`;
+            }).join('')}
+            ${(() => {
+              const fyRangeVal = getCdDateRange('fy_to_date', S.fy);
+              const fyVal = dRow.fy_to_date;
+              const hasFy = fyVal !== null && fyVal !== undefined && fyVal !== '' && !isNaN(Number(fyVal)) && Number(fyVal) !== 0;
+              return `<td class="num tot-c out ${hasFy ? 'hit' : ''}" 
+                ${hasFy ? `data-act="cd-drill" data-account="${esc(accName)}" data-type="outflow" data-from="${fyRangeVal.from}" data-to="${fyRangeVal.to}" title="Click to view full FY ${esc(accName)} debited transactions in Ledger" style="font-weight:700;cursor:pointer;"` : 'style="font-weight:700;"'}>${formatVal(fyVal)}</td>`;
+            })()}
+            <td class="num share"><span class="muted">${formatShare(dRow.shares)}</span></td>
+            <td></td>
+          </tr>
+        `;
+      }
+    });
+
+    // Compute Totals across visible accounts
+    const creditedRows = rawRows.filter((r: any) => visibleAccounts.some(acc => acc.toLowerCase() === String(r.account_name || '').trim().toLowerCase()) && String(r.transaction_type || '').toLowerCase() === 'credited');
+    const debitedRows = rawRows.filter((r: any) => visibleAccounts.some(acc => acc.toLowerCase() === String(r.account_name || '').trim().toLowerCase()) && String(r.transaction_type || '').toLowerCase() === 'debited');
+
+    const monthTotCredited: number[] = CD_MONTHS_CONFIG.map(m => sum(creditedRows.map((r: any) => {
+      const v = r[m.key];
+      return (v !== null && v !== undefined && v !== '' && !isNaN(Number(v))) ? Number(v) : 0;
+    })));
+    const monthTotDebited: number[] = CD_MONTHS_CONFIG.map(m => sum(debitedRows.map((r: any) => {
+      const v = r[m.key];
+      return (v !== null && v !== undefined && v !== '' && !isNaN(Number(v))) ? Number(v) : 0;
+    })));
+
+    const fyTotCredited = sum(creditedRows.map((r: any) => Number(r.fy_to_date) || 0));
+    const fyTotDebited = sum(debitedRows.map((r: any) => Number(r.fy_to_date) || 0));
+    const netCashByMonth = monthTotCredited.map((c, i) => c - monthTotDebited[i]);
+    const netFy = fyTotCredited - fyTotDebited;
+
+    tableRowsHTML += `
+      <tr class="sec in-sec" style="font-weight:700;border-top:2px solid var(--border);">
+        <td class="first" style="font-weight:700;">Total Credited</td>
+        ${monthTotCredited.map((v, i) => {
+          const m = CD_MONTHS_CONFIG[i];
+          const hasVal = v > 0;
+          const range = getCdDateRange(m.key, S.fy);
+          return `<td class="num ${hasVal ? 'in hit' : ''}" 
+            ${hasVal ? `data-act="cd-drill" data-type="inflow" data-from="${range.from}" data-to="${range.to}" style="cursor:pointer;" title="Click to view all credited transactions in ${m.label}"` : ''}>${hasVal ? money(v) : '–'}</td>`;
+        }).join('')}
+        ${(() => {
+          const range = getCdDateRange('fy_to_date', S.fy);
+          const hasVal = fyTotCredited > 0;
+          return `<td class="num tot-c in ${hasVal ? 'hit' : ''}" 
+            ${hasVal ? `data-act="cd-drill" data-type="inflow" data-from="${range.from}" data-to="${range.to}" style="font-weight:700;cursor:pointer;" title="Click to view all full FY credited transactions"` : 'style="font-weight:700;"'}>${hasVal ? money(fyTotCredited) : '–'}</td>`;
+        })()}
+        <td class="num share">100%</td>
+        <td></td>
+      </tr>
+      <tr class="sec out-sec" style="font-weight:700;">
+        <td class="first" style="font-weight:700;">Total Debited</td>
+        ${monthTotDebited.map((v, i) => {
+          const m = CD_MONTHS_CONFIG[i];
+          const hasVal = v > 0;
+          const range = getCdDateRange(m.key, S.fy);
+          return `<td class="num ${hasVal ? 'out hit' : ''}" 
+            ${hasVal ? `data-act="cd-drill" data-type="outflow" data-from="${range.from}" data-to="${range.to}" style="cursor:pointer;" title="Click to view all debited transactions in ${m.label}"` : ''}>${hasVal ? money(v) : '–'}</td>`;
+        }).join('')}
+        ${(() => {
+          const range = getCdDateRange('fy_to_date', S.fy);
+          const hasVal = fyTotDebited > 0;
+          return `<td class="num tot-c out ${hasVal ? 'hit' : ''}" 
+            ${hasVal ? `data-act="cd-drill" data-type="outflow" data-from="${range.from}" data-to="${range.to}" style="font-weight:700;cursor:pointer;" title="Click to view all full FY debited transactions"` : 'style="font-weight:700;"'}>${hasVal ? money(fyTotDebited) : '–'}</td>`;
+        })()}
+        <td class="num share">100%</td>
+        <td></td>
+      </tr>
+      <tr class="net" style="font-weight:700;">
+        <td class="first" style="font-weight:700;">Net (Credited – Debited)</td>
+        ${netCashByMonth.map((v, i) => {
+          const m = CD_MONTHS_CONFIG[i];
+          const range = getCdDateRange(m.key, S.fy);
+          return `<td class="num ${v >= 0 ? 'in' : 'out'} hit" 
+            data-act="cd-drill" data-type="" data-from="${range.from}" data-to="${range.to}" style="cursor:pointer;" title="Click to view all transactions in ${m.label}">${money(v, { sign: true })}</td>`;
+        }).join('')}
+        ${(() => {
+          const range = getCdDateRange('fy_to_date', S.fy);
+          return `<td class="num tot-c ${netFy >= 0 ? 'in' : 'out'} hit" 
+            data-act="cd-drill" data-type="" data-from="${range.from}" data-to="${range.to}" style="font-weight:700;cursor:pointer;" title="Click to view all full FY transactions">${money(netFy, { sign: true })}</td>`;
+        })()}
+        <td></td>
+        <td></td>
+      </tr>
+    `;
+  }
+
+  return `
+    <div class="card" style="margin-top:24px;">
+      <div class="card-h" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:14px 18px;">
+        <div style="display:flex;align-items:center;gap:10px;cursor:pointer;" data-act="toggle-by-account-cd">
+          <button class="tw open" style="pointer-events:none;">${icon('chev')}</button>
+          <div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <h3 style="margin:0;font-size:16px;font-weight:700;">By Account – Credited &amp; Debited</h3>
+              <span class="tw-n">${allAccounts.length}</span>
+            </div>
+            <div class="sub" style="margin:2px 0 0 0;font-size:12px;">Dynamic breakdown of monthly credited and debited transactions per account from Supabase</div>
+          </div>
+        </div>
+        ${controlsHTML}
+      </div>
+      <div class="tbl-wrap cf-wrap">
+        <table class="tbl sticky-first cf">
+          <thead>
+            <tr>
+              <th class="first" style="min-width:240px;">Account / Transaction Type</th>
+              ${CD_MONTHS_CONFIG.map(m => `<th class="num" style="min-width:92px;">${m.label}</th>`).join('')}
+              <th class="num tot-c" style="min-width:110px;">FY To Date</th>
+              <th class="num share" style="min-width:80px;">Shares</th>
+              <th style="width:36px;"></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tableRowsHTML}
+          </tbody>
+        </table>
+      </div>
+      <div class="muted" style="font-size:12px;margin:10px 18px 14px 18px;">
+        Values are synced directly with Supabase table <code>fss_by_account_credited_debited</code>. Empty cells indicate NULL database values. Click any numeric cell to edit.
+      </div>
+    </div>
+  `;
+}
+
 /* ============================ CASHFLOW STATEMENT ============================ */
 PAGES.cashflow = {
   title: 'Cashflow statement',
@@ -3718,13 +4402,17 @@ PAGES.cashflow = {
     const fy = S.fy, C = S.cf;
     const periods = fyPeriods(fy, C.period); const len = periods.length;
     const [fyF] = fyRange(fy); const lastTo = periods.length ? periods[len - 1].to : fyF;
-    const cashflowEntries = Array.isArray(Store.data?.cashflowEntries) ? Store.data.cashflowEntries : null;
-    const ents = cashflowEntries
-      ? cashflowEntries.filter((entry: any) =>
-        !entry.deleted && entry.date >= fyF && entry.date <= lastTo && entry.type !== 'transfer'
-      )
-      : Calc.inRange(fyF, lastTo).filter(e => e.type !== 'transfer');
-    const deletedCashKeys = deletedCategoryMonthKeys(cashflowEntries || Store.data?.entries, (e: any) => (api.get('categories', e.categoryId)?.name || e.category || ''));
+    const getAllTransactions = (window as any).__getAllDeduplicatedTransactions;
+    const transactionEntries = typeof getAllTransactions === 'function'
+      ? getAllTransactions()
+      : (Array.isArray(Store.data?.cashflowEntries) ? Store.data.cashflowEntries : Calc.inRange(fyF, lastTo));
+    const ents = transactionEntries.filter((entry: any) =>
+      !entry.deleted && !String(entry.status || '').toLowerCase().includes('cancel') &&
+      entry.date >= fyF && entry.date <= lastTo && entry.type !== 'transfer'
+    );
+    const deletedCashKeys = deletedCategoryMonthKeys(Store.data?.entries, (e: any) =>
+      api.get('categories', e.categoryId)?.name || e.categoryName || e.category || ''
+    );
     const scope = 'cf:' + C.by + ':';
     let tree = {};
     for (const type of ['inflow', 'outflow']) {
@@ -3737,6 +4425,19 @@ PAGES.cashflow = {
             return !name.includes('operation receipts') && !name.includes('operating receipts');
           });
           const norm = (s: string) => (s || '').toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
+          const resolveInflowValue = (category: any, period: any, index: number, storedValue: number) => {
+            const month = period.months[0];
+            const categoryName = norm(category.name);
+            const hasTransactions = te.some((entry: any) =>
+              entry.type === 'inflow' &&
+              (String(entry.categoryId || '') === String(category.id || '') ||
+                norm(entry.categoryName || entry.category || api.get('categories', entry.categoryId)?.name) === categoryName) &&
+              ymOf(entry.date) === month
+            );
+            const wasDeleted = deletedCashKeys.has(`${categoryName}|${month}`);
+            const liveValue = (agg[category.id] || [])[index] || 0;
+            return hasTransactions || wasDeleted ? liveValue : Math.max(liveValue, storedValue);
+          };
           const matchOp = opReceiptRows.find((r: any) => {
             const rName = norm(r.receipt_name);
             const cName = norm(c.name);
@@ -3757,8 +4458,7 @@ PAGES.cashflow = {
               const m = p.months[0];
               const col = M_COL[m.slice(5, 7)] || 'apr_26';
               const sbVal = Number(matchOp[col] ?? 0);
-              const liveVal = (agg[c.id] || [])[i] || 0;
-              return Math.max(liveVal, sbVal);
+              return resolveInflowValue(c, p, i, sbVal);
             });
           }
 
@@ -3784,8 +4484,7 @@ PAGES.cashflow = {
               const m = p.months[0];
               const col = M_COL[m.slice(5, 7)] || 'apr_26';
               const sbVal = Number(matchFin[col] ?? 0);
-              const liveVal = (agg[c.id] || [])[i] || 0;
-              return Math.max(liveVal, sbVal);
+              return resolveInflowValue(c, p, i, sbVal);
             });
           }
 
@@ -3811,8 +4510,7 @@ PAGES.cashflow = {
               const m = p.months[0];
               const col = M_COL[m.slice(5, 7)] || 'apr_26';
               const sbVal = Number(matchInc[col] ?? 0);
-              const liveVal = (agg[c.id] || [])[i] || 0;
-              return Math.max(liveVal, sbVal);
+              return resolveInflowValue(c, p, i, sbVal);
             });
           }
 
@@ -4123,7 +4821,13 @@ PAGES.cashflow = {
           }
           return agg[c.id] || periods.map(() => 0);
         };
-        tree[type] = finishTree(categoryTree(type, type === 'inflow' ? inflowValsOf : outflowValsOf, scope), len);
+        tree[type] = finishTree(categoryTree(
+          type,
+          (category: any) => agg[category.id] || periods.map(() => 0),
+          scope,
+          {},
+          true
+        ), len);
       } else {
         const agg = aggregate(te, periods, e => (e.departmentId || '_none') + '|' + bucketOf(api.get('categories', e.categoryId)), type === 'outflow' ? cashflowPeriodOf : undefined);
         const deps = [...api.list('departments'), { id: '_none', name: 'No department' }];
@@ -4166,29 +4870,13 @@ PAGES.cashflow = {
       const numeric = Number(value);
       return Number.isFinite(numeric) ? numeric : null;
     };
-    const valuesFromStatement = (categoryName: string, computed: number[]): number[] => {
-      if (!storedSummaryEnabled) return computed;
-      const row = storedStatementByName.get(categoryName.toLowerCase());
-      if (!row) return computed;
-      return periods.map((period, index) => valueFromStoredRow(row, period) ?? computed[index]);
-    };
-    if (storedSummaryEnabled) {
-      for (const node of tree.outflow) {
-        const row = storedOutflowByName.get(String(node.label || '').trim().toLowerCase());
-        if (!row) continue;
-        node.vals = periods.map((period: any, index: number) => valueFromStoredRow(row, period) ?? node.vals[index]);
-      }
-    }
+    const valuesFromStatement = (_categoryName: string, computed: number[]): number[] => computed;
     const levels = C.by === 'category' ? [['summary', 'Summary'], ['1', 'Groups'], ['all', 'All lines']] : [['summary', 'Departments'], ['all', 'With buckets']];
     const computedTin = periods.map((_, i) => sum(tree.inflow, n => n.vals[i]));
     const computedTout = periods.map((_, i) => sum(tree.outflow, n => n.vals[i]));
     const tin = valuesFromStatement('Cash Inflow', computedTin);
     const tout = valuesFromStatement('Cash Outflow', computedTout);
-    const storedFyToDate = (categoryName: string, fallback: number): number => {
-      if (!storedSummaryEnabled) return fallback;
-      const value = storedStatementByName.get(categoryName.toLowerCase())?.fy_to_date;
-      return value !== null && value !== undefined && Number.isFinite(Number(value)) ? Number(value) : fallback;
-    };
+    const storedFyToDate = (_categoryName: string, fallback: number): number => fallback;
     const TIN = storedFyToDate('Cash Inflow', sum(tin));
     const TOUT = storedFyToDate('Cash Outflow', sum(tout));
     const computedNetCashFlow = tin.map((cashInflow, index) => r2(cashInflow - tout[index]));
@@ -4207,25 +4895,29 @@ PAGES.cashflow = {
     const opening = valuesFromStatement('Opening Balance', computedOpening);
     const closing = valuesFromStatement('Closing Balance', computedClosing);
     if (C.by === 'category' && C.period === 'monthly') {
-      const statementLabels = new Set([
+      const statementLabels = [
         'Operating costs', 'Project costs', 'Tax & statutory', 'Capex', 'Financing & owner'
-      ]);
-      (window as any).__cashflowOutflowSummaryUiRows = tree.outflow
-        .filter((node: any) => statementLabels.has(node.label))
-        .map((node: any) => {
-          const row: Record<string, any> = { category_name: node.label };
+      ];
+      const normalizeStatementLabel = (label: any) =>
+        String(label || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+      const outflowSummaryByLabel = new Map(
+        tree.outflow.map((node: any) => [normalizeStatementLabel(node.label), node])
+      );
+      (window as any).__cashflowOutflowSummaryUiRows = statementLabels.map(label => {
+          const node = outflowSummaryByLabel.get(normalizeStatementLabel(label));
+          const row: Record<string, any> = { category_name: label };
           periods.forEach((period: any, index: number) => {
             if (period.months.length !== 1) return;
             const column = M_COL_MAP[period.months[0].slice(5, 7)];
-            if (column) row[column] = Number(node.vals[index] || 0);
+            if (column) row[column] = Number(node?.vals[index] || 0);
           });
           return row;
         });
 
       const statementMonthRows = [
         { category_name: 'Opening Balance', values: opening, fy_to_date: null, shares: null },
-        { category_name: 'Cash Inflow', values: tin, fy_to_date: TIN, shares: 100 },
-        { category_name: 'Cash Outflow', values: tout, fy_to_date: TOUT, shares: 100 },
+        { category_name: 'Cash Inflow', values: tin, fy_to_date: TIN, shares: TIN > 0 ? 100 : 0 },
+        { category_name: 'Cash Outflow', values: tout, fy_to_date: TOUT, shares: TOUT > 0 ? 100 : 0 },
         { category_name: 'Net Cash Flow', values: netCashFlow, fy_to_date: NET, shares: null },
         { category_name: 'Closing Balance', values: closing, fy_to_date: null, shares: null }
       ];
@@ -4447,12 +5139,12 @@ PAGES.cashflow = {
         }
       }
 
-      const cellClass = `num ${v ? 'hit' : 'zero'} ${p.cur ? 'cur' : ''} ${opAttrs ? 'op-cell' : ''} ${finAttrs ? 'fin-cell' : ''} ${incAttrs ? 'inc-cell' : ''} ${peopleAttrs ? 'people-cell' : ''} ${taxAttrs ? 'tax-cell' : ''} ${projectCostAttrs ? 'project-cost-cell' : ''} ${profAdminAttrs ? 'prof-admin-cell' : ''} ${travelAttrs ? 'travel-cell' : ''} ${officeFixedAttrs ? 'office-fixed-cell' : ''} ${officeVariableAttrs ? 'office-var-cell' : ''}`;
-      return `<td class="${cellClass}" ${v && n.drill ? drillAttr(type, n.drill, p.from, p.to) : ''} ${opAttrs} ${finAttrs} ${incAttrs} ${peopleAttrs} ${taxAttrs} ${projectCostAttrs} ${profAdminAttrs} ${travelAttrs} ${officeFixedAttrs} ${officeVariableAttrs}>${v ? money(v) : '–'}</td>`;
+      const cellClass = `num ${v ? 'hit' : 'zero'} ${p.cur ? 'cur' : ''}`;
+      return `<td class="${cellClass}" ${v && n.drill ? drillAttr(type, n.drill, p.from, p.to) : ''}>${v ? money(v) : '–'}</td>`;
     }).join('')
       + `<td class="num tot-c" ${n.drill ? drillAttr(type, n.drill, fyF, lastTo) : ''}>${money(sum(n.vals))}</td><td class="num share"><span class="${depth ? 'faint' : 'muted'}">${fmtPct(pct(sum(n.vals), base))}</span></td>`;
     const balCells = vals => periods.map((p, i) => `<td class="num ${p.cur ? 'cur' : ''} ${vals[i] < 0 ? 'out' : ''}">${money(vals[i])}</td>`).join('') + '<td class="num tot-c"></td><td></td>';
-    const secRow = (label, vals, total, cls) => `<tr class="sec ${cls}"><td>${label}</td>${vals.map((v, i) => `<td class="num ${periods[i].cur ? 'cur' : ''}">${money(v)}</td>`).join('')}<td class="num tot-c">${money(total)}</td><td class="num share">100%</td></tr>`;
+    const secRow = (label, vals, total, cls) => `<tr class="sec ${cls}"><td>${label}</td>${vals.map((v, i) => `<td class="num ${periods[i].cur ? 'cur' : ''}">${money(v)}</td>`).join('')}<td class="num tot-c">${money(total)}</td><td class="num share">${fmtPct(total > 0 ? 100 : 0)}</td></tr>`;
     const accOpen = OPEN.has(accNode.key);
     if (!len) return `<div class="card"><div class="empty"><b>No months to show yet</b>${esc(fyLabel(fy))} hasn't started.</div></div>`;
     const revCard = revenuePerfHTML(fy, periods, fyF, lastTo);
@@ -4473,7 +5165,8 @@ PAGES.cashflow = {
         <tr class="d0 node ${accOpen ? 'is-open' : ''}"><td><button class="tw ${accOpen ? 'open' : ''}" data-act="tree" data-k="${accNode.key}">${icon('chev')}<span>By account</span><span class="tw-n">${accNode.children.length}</span></button></td>${periods.map(() => '<td></td>').join('')}<td></td><td></td></tr>
         ${accOpen ? accNode.children.map(a => `<tr class="d1 leaf"><td><span class="tw-leaf">${esc(a.label)}</span></td>${balCells(a.vals)}</tr>`).join('') : ''}
       </tbody></table></div></div>
-      <div class="muted" style="font-size:12px;margin-top:10px">Net cash after GST and TDS. Balances include bank, FD and petty cash; transfers between them are excluded. Months that haven't started are hidden. Click a row name to expand it, or any figure to see its entries.</div>`;
+      <div class="muted" style="font-size:12px;margin-top:10px">Net cash after GST and TDS. Balances include bank, FD and petty cash; transfers between them are excluded. Months that haven't started are hidden. Click a row name to expand it, or any figure to see its entries.</div>
+      ${renderByAccountCreditedDebitedHTML()}`;
   },
 };
 
@@ -4598,12 +5291,31 @@ async function viewFile(id) {
 }
 function auditLine(a) {
   const verb = { create: 'created', update: 'edited', delete: 'deleted', restore: 'restored', purge: 'permanently deleted', lock: 'locked', unlock: 'unlocked', skip: 'skipped', reset: 'reset' }[a.action] || a.action;
-  return `<div class="tl"><div class="avatar ${(Store.data.users.find(u => u.id === a.userId) || {}).role === 'accountant' ? 'acct' : ''}" style="width:24px;height:24px;font-size:10px">${esc(userName(a.userId).slice(0, 2).toUpperCase())}</div><div style="flex:1;min-width:0"><div><b>${esc(userName(a.userId))}</b> ${verb}</div><div class="when">${fmtDateTime(a.ts)}</div>${changesHTML(a)}</div></div>`;
+  const name = a.userName || userName(a.userId);
+  return `<div class="tl"><div class="avatar ${(Store.data.users.find(u => u.id === a.userId) || {}).role === 'accountant' ? 'acct' : ''}" style="width:24px;height:24px;font-size:10px">${esc(name.slice(0, 2).toUpperCase())}</div><div style="flex:1;min-width:0"><div><b>${esc(name)}</b> ${verb}</div><div class="when">${fmtDateTime(a.ts)}</div>${changesHTML(a)}</div></div>`;
 }
 const FIELD_LABEL = { taxable: 'Taxable', amount: 'Net cash', gstAmount: 'GST', gstRate: 'GST %', gstType: 'GST type', tdsAmount: 'TDS', tdsRate: 'TDS %', itc: 'ITC', categoryId: 'Category', departmentId: 'Department', partyId: 'Party', partyKind: 'Party type', projectId: 'Project', accountId: 'Account', toAccountId: 'To account', paymentMode: 'Mode', txnRef: 'Txn ref', refNo: 'Ref no.', description: 'Description', notes: 'Notes', date: 'Date', attachments: 'Attachments', type: 'Type', openingBalance: 'Opening balance', contractValue: 'Contract value', monthlySalary: 'Monthly salary', clientId: 'Client', active: 'Active', lockedMonths: 'Locked months', dayOfMonth: 'Day', frequency: 'Frequency' };
 function changesHTML(a) {
-  if (!a.changes || !a.changes.length) return '';
-  return `<div class="changes">${a.changes.slice(0, 8).map(c => `<div><span class="muted">${esc(FIELD_LABEL[c.field] || c.field)}:</span> <s>${esc(c.from)}</s> → <ins>${esc(c.to)}</ins></div>`).join('')}${a.changes.length > 8 ? `<div class="muted">+${a.changes.length - 8} more</div>` : ''}</div>`;
+  if (!a.changes) return '';
+  let changes = a.changes;
+  if (!Array.isArray(changes) && typeof changes === 'object') {
+    const before = changes.before || {};
+    const after = changes.after || {};
+    if (Array.isArray(after) && !Object.keys(before).length) {
+      changes = after;
+    } else {
+      const fields = [...new Set([...Object.keys(before), ...Object.keys(after)])];
+      changes = fields
+        .filter(field => JSON.stringify(before[field] ?? null) !== JSON.stringify(after[field] ?? null))
+        .map(field => ({
+          field,
+          from: before[field] == null ? '—' : displayValue(field, before[field]),
+          to: after[field] == null ? '—' : displayValue(field, after[field])
+        }));
+    }
+  }
+  if (!Array.isArray(changes) || !changes.length) return '';
+  return `<div class="changes">${changes.slice(0, 8).map(c => `<div><span class="muted">${esc(FIELD_LABEL[c.field] || c.field)}:</span> <s>${esc(c.from)}</s> → <ins>${esc(c.to)}</ins></div>`).join('')}${changes.length > 8 ? `<div class="muted">+${changes.length - 8} more</div>` : ''}</div>`;
 }
 
 /* ============================ modal helpers ============================ */
@@ -5158,14 +5870,21 @@ async function prepareSupabaseFormAttachments(F, saved) {
   if (!bucket) return [];
   const upload = (window as any).__supabaseUploadFormAttachments;
   if (F.newFiles.length) {
-    if (typeof upload !== 'function') throw new Error('Supabase attachment storage is not ready.');
+    if (typeof upload !== 'function') {
+      throw new Error('Supabase attachment upload is not available.');
+    }
     const pendingFiles = F.newFiles.filter(file => !F.uploadedFormAttachments.has(file));
     if (pendingFiles.length) {
       const uploaded = await upload(bucket, pendingFiles);
       if (!Array.isArray(uploaded) || uploaded.length !== pendingFiles.length) {
-        throw new Error('Supabase did not confirm every attachment upload.');
+        throw new Error(`Not all attachments were uploaded to the "${bucket}" bucket.`);
       }
-      pendingFiles.forEach((file, index) => F.uploadedFormAttachments.set(file, uploaded[index]));
+      pendingFiles.forEach((file, index) => {
+        if (!uploaded[index]?.storagePath) {
+          throw new Error(`Supabase did not confirm storage for "${file.name}".`);
+        }
+        F.uploadedFormAttachments.set(file, uploaded[index]);
+      });
     }
   }
 
@@ -5286,7 +6005,7 @@ async function saveEntryFromForm(F) {
     }
     const removedPaths = [...new Set([...F.removedAttachments
       .map((attachment: any) => attachment.storagePath || attachment.storage_path || attachment.path)
-      .filter(Boolean), ...F.removedVendorAttachmentPaths])];
+      .filter(Boolean), ...F.removedUploadedAttachmentPaths])];
     if (removedPaths.length) {
       const removeAttachments = (window as any).__supabaseDeletePayVendorAttachments;
       if (typeof removeAttachments !== 'function') throw new Error('Pay a Vendor attachment removal is not available.');
@@ -5483,14 +6202,26 @@ async function saveEntryFromForm(F) {
     delete F._pendingCloudOtherIncomeSaved;
   }
   if (tiPI && !tiPI.taxInvoiceDate) { try { await issueTaxInvoice(tiPI.id, saved.date, saved.refNo); } catch (err) { toast('Saved, but the tax invoice was not issued: ' + err.message, 'error'); } }
-  const mail = await finalizeEmail(F.email, { entity: 'entries', entityId: saved.id, docs: saved.attachments || [] }).catch(err => { toast('Saved, but the email was not queued: ' + err.message, 'error'); return null; });
+  if (F.email?.on) {
+    void finalizeEmail(F.email, { entity: 'entries', entityId: saved.id, docs: saved.attachments || [] })
+      .then(mail => {
+        if (mail) toast('Email queued to ' + mail.to.join(', '));
+      })
+      .catch(err => toast('Entry saved, but the email was not queued: ' + err.message, 'error'));
+  }
   for (const id of F.removed) await FileStore.del(id).catch(() => { });
   if (F.repeat && F.mode === 'new') {
     const r = { name: (nameOf('categories', saved.categoryId) + ' – ' + nameOf('parties', saved.partyId)).slice(0, 60), type: saved.type, categoryId: saved.categoryId, departmentId: saved.departmentId, partyId: saved.partyId, projectId: saved.projectId, description: saved.description, taxable: saved.taxable, gstType: saved.gstType, gstRate: saved.gstRate, tdsRate: saved.tdsRate, itc: saved.itc, paymentMode: saved.paymentMode, accountId: saved.accountId, frequency: F.rFreq, dayOfMonth: +saved.date.slice(8), startDate: saved.date, endDate: null, active: true, skipped: [] };
     const rr = await api.create('recurring', r);
     saved.recurringId = rr.id; saved.recurringPeriod = ymOf(saved.date); Store.persist();
   }
-  toast((F.mode === 'edit' ? 'Entry updated' : F.mode === 'confirm' ? 'Recorded ' + F.rec.name : 'Entry saved · ' + money(saved.amount)) + (mail ? ' · email queued to ' + mail.to.join(', ') : ''));
+  if (typeof window !== 'undefined' && typeof (window as any).__syncByAccountCreditedDebited === 'function') {
+    void (window as any).__syncByAccountCreditedDebited();
+  }
+  if (typeof window !== 'undefined' && typeof (window as any).__refreshSupabaseAuditLogs === 'function') {
+    void (window as any).__refreshSupabaseAuditLogs();
+  }
+  toast((F.mode === 'edit' ? 'Entry updated' : F.mode === 'confirm' ? 'Recorded ' + F.rec.name : 'Entry saved · ' + money(saved.amount)) + (F.email?.on ? ' · email is being queued' : ''));
   return saved;
 }
 async function saveTemplate(F) {
@@ -5575,6 +6306,9 @@ function afterWrite() {
   render();
   if (typeof window !== 'undefined' && typeof (window as any).__onCashflowDataChanged === 'function') {
     (window as any).__onCashflowDataChanged();
+  }
+  if (typeof window !== 'undefined' && typeof (window as any).__syncByAccountCreditedDebited === 'function') {
+    void (window as any).__syncByAccountCreditedDebited();
   }
 }
 
@@ -6095,22 +6829,40 @@ function masterForm(tab, id) {
 }
 
 /* ============================ AUDIT ============================ */
+let auditRefreshInProgress = false;
 PAGES.audit = {
   title: 'Audit log',
+  after() {
+    const refresh = typeof window !== 'undefined' && (window as any).__refreshSupabaseAuditLogs;
+    if (typeof refresh !== 'function' || auditRefreshInProgress) return;
+    auditRefreshInProgress = true;
+    void Promise.resolve(refresh()).finally(() => {
+      auditRefreshInProgress = false;
+    });
+  },
   render() {
     const A = S.audit; const q = A.q.trim().toLowerCase();
-    let rows = Store.data.audit.filter(a => (!A.userId || a.userId === A.userId) && (!A.action || a.action === A.action) && (!A.entity || a.entity === A.entity) && (!q || (a.summary + ' ' + JSON.stringify(a.changes)).toLowerCase().includes(q)));
-    rows = rows.slice().reverse();
+    let rows = Store.data.audit.filter(a => {
+      const user = a.userName || userName(a.userId);
+      const recordType = ENTITY_LABEL[a.entity] || a.entity || '';
+      const searchable = `${a.summary || ''} ${user} ${recordType} ${a.entityId || ''} ${JSON.stringify(a.changes || {})}`.toLowerCase();
+      return (!A.userId || a.userId === A.userId) &&
+        (!A.action || a.action === A.action) &&
+        (!A.entity || a.entity === A.entity) &&
+        (!q || searchable.includes(q));
+    }).slice().sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')));
     const per = 100, pages = Math.max(1, Math.ceil(rows.length / per)); if (A.page >= pages) A.page = pages - 1;
     const actions = [...new Set(Store.data.audit.map(a => a.action))];
+    const auditUsers = new Map(Store.data.users.map(u => [u.id, u.name]));
+    Store.data.audit.forEach(a => { if (a.userId && a.userName) auditUsers.set(a.userId, a.userName); });
     const actChip = a => `<span class="chip ${{ create: 'inflow', update: 'gold', delete: 'outflow', purge: 'outflow', restore: 'transfer', lock: 'navy', unlock: '' }[a] || ''}">${esc(a)}</span>`;
-    return `<div class="page-intro">Every change to entries, masters, recurring templates and settings is logged here with who made it and what changed. Nothing in this log can be edited.</div>
+    return `${Store.data.auditLoadError ? `<div class="notice" role="alert" style="margin-bottom:12px">${esc(Store.data.auditLoadError)}</div>` : ''}<div class="page-intro">Every change to entries, masters, recurring templates and settings is logged here with who made it and what changed. Nothing in this log can be edited.</div>
     <div class="toolbar"><div class="field" style="flex:2;min-width:200px"><label>Search</label><input class="input" data-inp="aq" value="${esc(A.q)}" placeholder="Summary or changed value…"></div>
-      <div class="field"><label>User</label><select class="select" data-af="userId">${opts(Store.data.users.map(u => [u.id, u.name]), A.userId, 'Everyone')}</select></div>
+      <div class="field"><label>User</label><select class="select" data-af="userId">${opts([...auditUsers].map(([id, name]) => [id, name]), A.userId, 'Everyone')}</select></div>
       <div class="field"><label>Action</label><select class="select" data-af="action">${opts(actions.map(a => [a, a]), A.action, 'All actions')}</select></div>
-      <div class="field"><label>Record type</label><select class="select" data-af="entity">${opts(Object.entries(ENTITY_LABEL), A.entity, 'All')}</select></div></div>
-    <div class="card"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>When</th><th>User</th><th>Action</th><th>Record</th><th style="width:45%">Summary & changes</th></tr></thead><tbody>
-    ${rows.slice(A.page * per, A.page * per + per).map(a => `<tr class="${a.entity === 'entries' && api.get('entries', a.entityId) ? 'click' : ''}" ${a.entity === 'entries' && api.get('entries', a.entityId) ? `data-act="open-entry" data-id="${a.entityId}"` : ''}><td class="nowrap">${fmtDateTime(a.ts)}</td><td class="nowrap">${esc(userName(a.userId))}</td><td>${actChip(a.action)}</td><td class="nowrap">${esc(ENTITY_LABEL[a.entity] || a.entity)}</td><td><div>${esc(a.summary)}</div>${changesHTML(a)}</td></tr>`).join('') || '<tr><td colspan="5"><div class="empty">No matching log entries.</div></td></tr>'}
+      <div class="field"><label>Record type</label><select class="select" data-af="entity">${opts([...new Map([...Object.entries(ENTITY_LABEL), ...Store.data.audit.map(a => [a.entity, a.entity])]).values()], A.entity, 'All')}</select></div></div>
+    <div class="card"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>When</th><th>User</th><th>Action</th><th>Record</th><th style="width:45%">Summary</th></tr></thead><tbody>
+    ${rows.slice(A.page * per, A.page * per + per).map(a => `<tr class="${a.entity === 'entries' && api.get('entries', a.entityId) ? 'click' : ''}" ${a.entity === 'entries' && api.get('entries', a.entityId) ? `data-act="open-entry" data-id="${a.entityId}"` : ''}><td class="nowrap">${fmtDateTime(a.ts)}</td><td class="nowrap">${esc(a.userName || userName(a.userId))}</td><td>${actChip(a.action)}</td><td class="nowrap">${esc(ENTITY_LABEL[a.entity] || a.entity)}</td><td><div class="row" style="justify-content:space-between;align-items:center;gap:8px"><div>${esc(a.summary)}</div><button class="btn btn-sm btn-ghost" data-act="delete-audit-log" data-id="${esc(a.id)}" aria-label="Delete audit log" title="Delete audit log">${icon('trash')}</button></div></td></tr>`).join('') || '<tr><td colspan="5"><div class="empty">No matching log entries.</div></td></tr>'}
     </tbody></table></div><div class="pager"><span>${rows.length} events</span><span class="spacer"></span><button class="btn btn-sm" data-act="apage" data-d="-1" ${A.page ? '' : 'disabled'}>Previous</button><span>Page ${A.page + 1} / ${pages}</span><button class="btn btn-sm" data-act="apage" data-d="1" ${A.page < pages - 1 ? '' : 'disabled'}>Next</button></div></div>`;
   },
 };
@@ -6122,6 +6874,7 @@ PAGES.trash = {
     const rows = Store.data.entries.filter(e => e.deleted).sort((a, b) => (b.deletedAt || '').localeCompare(a.deletedAt || ''));
     const owner = api.can('entry.restore');
     return `<div class="page-intro">Deleted entries stay here and are excluded from every balance and report. ${owner ? 'Restore puts an entry back exactly as it was. Permanent deletion also removes its attachments and cannot be undone.' : 'Only the Owner can restore or permanently delete.'}</div>
+    ${owner && rows.length ? `<div class="row" style="justify-content:flex-end;margin-bottom:12px"><button class="btn btn-danger" data-act="empty-trash">Delete all permanently</button></div>` : ''}
     <div class="card"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Entry date</th><th>Type</th><th>Category / description</th><th>Party</th><th class="num">Net cash</th><th>Deleted</th><th></th></tr></thead><tbody>
     ${rows.map(e => `<tr><td class="nowrap">${fmtDate(e.date)}</td><td>${typeChip(e.type)}</td><td><div class="cell-main">${esc(entryTitle(e))}</div><div class="cell-sub">${esc(e.description)}</div></td><td>${esc(entryParty(e))}</td><td class="num ${amtClass(e)}">${signedAmt(e)}</td><td class="nowrap">${esc(userName(e.deletedBy))}<div class="cell-sub">${fmtDateTime(e.deletedAt)}</div></td>
       <td class="nowrap"><button class="btn btn-sm" data-act="open-entry" data-id="${e.id}">View</button> ${owner ? `<button class="btn btn-sm" data-act="restore" data-id="${e.id}">${icon('restore')} Restore</button> <button class="btn btn-sm btn-danger" data-act="purge" data-id="${e.id}">Delete forever</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="7"><div class="empty"><b>Trash is empty</b>Deleted entries will appear here.</div></td></tr>'}
@@ -6175,6 +6928,86 @@ PAGES.settings = {
 
 /* ============================ actions ============================ */
 const ACT = {
+  'toggle-by-account-cd': () => {
+    S.byAccountCdOpen = S.byAccountCdOpen === undefined ? false : !S.byAccountCdOpen;
+    render({ keepScroll: true });
+  },
+  'filter-by-account-cd': (el: any, ev: any) => {
+    const val = ev?.target?.value !== undefined ? ev.target.value : (el?.value || '');
+    S.byAccountCdFilter = val;
+    render({ keepScroll: true });
+  },
+  'refresh-by-account-cd': async () => {
+    toast('Refreshing By Account data from Supabase...');
+    try {
+      const load = (window as any).__loadByAccountCreditedDebited;
+      if (typeof load === 'function') await load();
+      toast('By Account data refreshed');
+    } catch (err: any) {
+      toast('Refresh failed: ' + (err?.message || err), 'error');
+    }
+  },
+  'add-account-cd': () => {
+    const ov = openModal(`
+      <div class="modal-h"><h2>Add Account (Credited &amp; Debited)</h2></div>
+      <div class="modal-b">
+        <div class="field">
+          <label>Account Name *</label>
+          <input class="input" id="newCdAccountName" placeholder="e.g. HDFC Current Account" autocomplete="off" />
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:8px">This will insert two linked rows (Credited &amp; Debited) into Supabase table <code>fss_by_account_credited_debited</code>.</div>
+      </div>
+      <div class="modal-f">
+        <button class="btn" data-x="cancel">Cancel</button>
+        <button class="btn btn-navy" id="newCdAccountSave">Add Account</button>
+      </div>
+    `, 'sm');
+    const input = $('#newCdAccountName', ov) as HTMLInputElement;
+    const saveBtn = $('#newCdAccountSave', ov) as HTMLButtonElement;
+    ov.addEventListener('click', (ev: any) => {
+      if (ev.target?.closest?.('[data-x="cancel"]')) ov.remove();
+    });
+    const doSave = async () => {
+      const name = input?.value?.trim();
+      if (!name) { toast('Please enter an account name.', 'error'); input?.focus(); return; }
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Adding...';
+      try {
+        const ins = (window as any).__insertByAccountCreditedDebited;
+        if (typeof ins !== 'function') throw new Error('Supabase account handler not ready.');
+        await ins(name);
+        ov.remove();
+        toast(`Added account "${name}"`);
+      } catch (err: any) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Add Account';
+        toast(err?.message || 'Failed to add account.', 'error');
+      }
+    };
+    saveBtn?.addEventListener('click', doSave);
+    input?.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.key === 'Enter') { e.preventDefault(); doSave(); }
+    });
+    setTimeout(() => input?.focus(), 50);
+  },
+  'delete-account-cd': async (el: any) => {
+    const acc = el.dataset.acc;
+    if (!acc) return;
+    if (!await confirmBox({
+      title: `Delete account "${acc}"?`,
+      body: `This will permanently delete both the <b>Credited</b> and <b>Debited</b> records for <b>${esc(acc)}</b> from Supabase table <code>fss_by_account_credited_debited</code>.`,
+      ok: 'Delete Account',
+      danger: true
+    })) return;
+    try {
+      const del = (window as any).__deleteByAccountCreditedDebited;
+      if (typeof del !== 'function') throw new Error('Supabase delete handler not ready.');
+      await del(acc);
+      toast(`Deleted account "${acc}"`);
+    } catch (err: any) {
+      toast(err?.message || 'Failed to delete account.', 'error');
+    }
+  },
   'add-fss-transaction': () => {
     if (typeof window !== 'undefined' && typeof (window as any).__fssOpenTransactionModal === 'function') {
       (window as any).__fssOpenTransactionModal(null);
@@ -6183,31 +7016,87 @@ const ACT = {
     }
   },
   'refresh-fss-transactions': () => { void refreshLedgerFromSupabase(); },
+  'store-ui-to-supabase': async () => {
+    const syncFn = typeof window !== 'undefined' && ((window as any).syncUiTransactionsToSupabase || (window as any).__syncUiTransactionsToSupabase);
+    if (typeof syncFn === 'function') {
+      await syncFn({ force: true });
+      await refreshLedgerFromSupabase();
+    } else {
+      toast('Supabase sync is not ready. Please verify your connection.', 'bad');
+    }
+  },
   'edit-fss-transaction': el => {
-    const transaction = ledgerRecords.find((row: any) => String(row.id) === String(el.dataset.id));
+    const id = String(el.dataset.id);
+    const transaction = ledgerRecords.find((row: any) => String(row.id) === id) ||
+      (Store.data?.entries || []).find((e: any) => String(e.id) === id || String(e.supabase_id) === id);
     if (!transaction) return toast('Transaction is no longer available. Refresh and try again.', 'error');
     if (typeof window !== 'undefined' && typeof (window as any).__fssOpenTransactionModal === 'function') {
       (window as any).__fssOpenTransactionModal(transaction);
+    } else {
+      openEntryForm({ mode: 'edit', entry: transaction });
     }
   },
   'delete-fss-transaction': async el => {
-    const transaction = ledgerRecords.find((row: any) => String(row.id) === String(el.dataset.id));
+    const id = String(el.dataset.id);
+    const transaction = ledgerRecords.find((row: any) => String(row.id) === id) ||
+      (Store.data?.entries || []).find((e: any) => String(e.id) === id || String(e.supabase_id) === id);
     if (!transaction) return toast('Transaction is no longer available. Refresh and try again.', 'error');
-    const amount = Math.abs(Number(transaction.net_cash) || 0);
+    const amount = Math.abs(Number(transaction.net_cash ?? transaction.amount) || 0);
     if (!await confirmBox({
       title: 'Delete this transaction?',
-      body: `<b>${esc(transaction.description || transaction.category || 'Transaction')}</b> · ${money(amount)} on ${fmtDate(transaction.transaction_date)}. This will permanently delete only this Supabase record.`,
-      ok: 'Delete transaction',
+      body: `<b>${esc(transaction.description || transaction.category || 'Transaction')}</b> · ${money(amount)} on ${fmtDate(transaction.transaction_date || transaction.date)}.<br><br>It moves to Trash and can be restored later.`,
+      ok: 'Move to Trash',
       danger: true
     })) return;
-    const remove = typeof window !== 'undefined' && (window as any).__fssDeleteTransaction;
-    if (typeof remove !== 'function') return toast('Transaction database access is not ready.', 'error');
+    let localEntry: any = null;
+    let wasStored = false;
+    let previousDeletedState: any = null;
+    const transactionIds = [id, String(transaction.supabase_id || ''), String(transaction.id || '')]
+      .filter(Boolean);
     try {
-      await remove(String(transaction.id));
-      toast('Transaction deleted from Supabase');
-      await refreshLedgerFromSupabase();
+      api.guard('entry.delete');
+      localEntry = Store.data.entries.find((entry: any) =>
+        transactionIds.includes(String(entry.id || '')) ||
+        transactionIds.includes(String(entry.supabase_id || '')) ||
+        transactionIds.includes(String(entry.supabase_fss_transaction_id || ''))
+      ) || toLedgerEntry(transaction);
+      if (api.isLocked(localEntry.date)) {
+        throw new Error(monthLabel(ymOf(localEntry.date), true) + ' is locked.');
+      }
+
+      wasStored = Store.data.entries.includes(localEntry);
+      previousDeletedState = {
+        deleted: localEntry.deleted,
+        deletedBy: localEntry.deletedBy,
+        deletedAt: localEntry.deletedAt
+      };
+      if (!wasStored) Store.data.entries.push(localEntry);
+      Object.assign(localEntry, { deleted: true, deletedBy: api.me().id, deletedAt: nowISO() });
+      (window as any).__excludeLedgerTransactionFromSummary?.(transaction.supabase_id || transaction.id || id);
+      api.log('delete', 'entries', localEntry.id, describe('entries', localEntry));
+      Store.persist();
+      refreshLedger();
+
+      const cancel = typeof window !== 'undefined' && (window as any).__supabaseCancelTransaction;
+      if (typeof cancel !== 'function') throw new Error('Supabase transaction service is not ready.');
+      const cancelled = await cancel(localEntry.supabase_id || localEntry.id, localEntry);
+      if (cancelled === false) throw new Error('Could not move the transaction to Trash in Supabase.');
+      toast('Moved to Trash');
+      void Promise.resolve((window as any).__refreshSupabaseAuditLogs?.()).catch(error =>
+        console.warn('Could not refresh Supabase audit logs after deleting transaction:', error)
+      );
     } catch (error) {
-      toast(error instanceof Error ? error.message : 'Could not delete the transaction.', 'error');
+      toast(error instanceof Error ? error.message : 'Could not move the transaction to Trash.', 'error');
+      if (localEntry) {
+        Object.assign(localEntry, previousDeletedState || { deleted: false, deletedBy: null, deletedAt: null });
+        if (!wasStored) {
+          const index = Store.data.entries.indexOf(localEntry);
+          if (index >= 0) Store.data.entries.splice(index, 1);
+        }
+        (window as any).__includeLedgerTransactionInSummary?.(transaction.supabase_id || transaction.id || id);
+        Store.persist();
+      }
+      refreshLedger();
     }
   },
   'open-entry': el => openEntry(el.dataset.id),
@@ -6224,6 +7113,54 @@ const ACT = {
   purge: async el => {
     if (!await confirmBox({ title: 'Delete permanently?', body: 'The entry and its attachments will be removed for good. The audit log keeps a record that it existed.', ok: 'Delete forever', danger: true })) return;
     try { await api.purge(el.dataset.id); toast('Deleted permanently'); render(); } catch (err) { toast(err.message, 'error'); }
+  },
+  'empty-trash': async () => {
+    api.guard('entry.purge');
+    const entries = Store.data.entries.filter(entry => entry.deleted);
+    if (!entries.length) return;
+    if (!await confirmBox({
+      title: 'Delete all Trash data permanently?',
+      body: `<b>${entries.length}</b> deleted ${entries.length === 1 ? 'entry' : 'entries'} and their attachments will be removed permanently. This cannot be undone.`,
+      ok: 'Delete all permanently',
+      danger: true
+    })) return;
+    const deleteAllButton = document.querySelector('[data-act="empty-trash"]') as HTMLButtonElement | null;
+    if (deleteAllButton) deleteAllButton.disabled = true;
+    let deletedCount = 0;
+    const failures: string[] = [];
+    const batchSize = 20;
+    for (let start = 0; start < entries.length; start += batchSize) {
+      const batch = entries.slice(start, start + batchSize);
+      const results = await Promise.all(batch.map(async entry => {
+        try {
+          await api.purge(entry.id, { skipRefresh: true, deferPersist: true });
+          return null;
+        } catch (err) {
+          return err instanceof Error ? err.message : 'unknown error';
+        }
+      }));
+      for (const error of results) {
+        if (error === null) deletedCount += 1;
+        else failures.push(error);
+      }
+    }
+    Store.persist();
+    let summaryRefreshFailed = false;
+    try {
+      await (window as any).__supabaseRefreshAfterTransactionPurge?.();
+    } catch (err) {
+      console.error('Could not refresh transaction summaries after emptying Trash:', err);
+      summaryRefreshFailed = true;
+    }
+    const resultMessage = failures.length
+      ? `${deletedCount} deleted; ${failures.length} failed and remain in Trash.`
+      : `${deletedCount} ${deletedCount === 1 ? 'entry' : 'entries'} permanently deleted`;
+    const message = summaryRefreshFailed
+      ? `${resultMessage} Cashflow summaries could not be refreshed.`
+      : resultMessage;
+    if (failures.length || summaryRefreshFailed) toast(message, 'error');
+    else toast(message);
+    render();
   },
   'confirm-due': el => { const k = el.dataset.id + '|' + el.dataset.p; openEntryForm({ mode: 'confirm', rec: api.get('recurring', el.dataset.id), period: el.dataset.p, dueDate: el.dataset.d, amount: QAMT[k] != null ? QAMT[k] : null }); },
   'quick-record': async el => {
@@ -6408,6 +7345,32 @@ const ACT = {
   'rp-open': () => { S.rpOpen = !S.rpOpen; render({ keepScroll: true }); },
   'rp-deps': () => { S.rpDeps = S.rpDeps === false; render({ keepScroll: true }); },
   'cf-drill': el => go('ledger', { ...LEDGER_RESET(), type: el.dataset.type, ...JSON.parse(el.dataset.drill || '{}'), from: el.dataset.from, to: el.dataset.to }),
+  'cd-drill': (el: HTMLElement) => {
+    const accountName = el.dataset.account || '';
+    const type = el.dataset.type || '';
+    const from = el.dataset.from || '';
+    const to = el.dataset.to || '';
+
+    let accountId = '';
+    if (accountName) {
+      const accList = Store.data?.accounts || [];
+      const found = accList.find((a: any) => 
+        a.name === accountName || 
+        String(a.name || '').toLowerCase().replace(/[-–—]/g, '-').trim() === accountName.toLowerCase().replace(/[-–—]/g, '-').trim()
+      );
+      if (found) accountId = found.id;
+      else accountId = accountName;
+    }
+
+    go('ledger', {
+      ...LEDGER_RESET(),
+      open: true,
+      type,
+      accountId,
+      from,
+      to
+    });
+  },
   'ledger-drill': el => go('ledger', { ...LEDGER_RESET(), ...JSON.parse(el.dataset.drill || '{}') }),
   tree: el => { const k = el.dataset.k; OPEN.has(k) ? OPEN.delete(k) : OPEN.add(k); render({ keepScroll: true }); },
   'tree-level': el => { LEVEL_REQ[el.dataset.scope] = el.dataset.lv; render({ keepScroll: true }); },
@@ -6423,6 +7386,18 @@ const ACT = {
   sort: el => { const k = el.dataset.k; if (S.ledger.sort === k) S.ledger.dir *= -1; else { S.ledger.sort = k; S.ledger.dir = -1; } refreshLedger(); },
   lpage: el => { S.ledger.page += +el.dataset.d; refreshLedger(); $('#ledgerResults')?.scrollIntoView({ block: 'start' }); },
   apage: el => { S.audit.page += +el.dataset.d; render(); },
+  'delete-audit-log': async el => {
+    const id = el.dataset.id;
+    if (!id || !await confirmBox({ title: 'Delete this audit log?', body: 'This permanently removes the selected audit record from Supabase.', ok: 'Delete' })) return;
+    const removeAuditLog = typeof window !== 'undefined' && (window as any).__supabaseDeleteAuditLog;
+    if (typeof removeAuditLog !== 'function') return toast('Supabase audit log service is unavailable.', 'error');
+    try {
+      await removeAuditLog(id);
+      toast('Audit log deleted');
+    } catch (error) {
+      toast(error instanceof Error ? error.message : String(error), 'error');
+    }
+  },
   lock: async el => { try { await api.setLock(el.dataset.m, el.dataset.v === '1'); toast((el.dataset.v === '1' ? 'Locked ' : 'Unlocked ') + monthLabel(el.dataset.m, true)); render(); } catch (err) { toast(err.message, 'error'); } },
   'lock-fy': async () => {
     const last = addMonths(ymOf(TODAY), -1); const ms = fyMonths(S.fy).filter(m => m <= last && !Store.data.settings.lockedMonths.includes(m));
@@ -6498,10 +7473,80 @@ function getSeedOtherPartyMaster() {
 
 /* ============================ boot ============================ */
 let _globalBound = false;
+
+function initCdCellEdit(td: HTMLElement) {
+  if (!td || td.querySelector('input')) return;
+  const rowId = td.dataset.cdId;
+  const col = td.dataset.cdCol;
+  if (!rowId || !col) return;
+  const rowName = `${td.dataset.cdAccount || 'Account'} (${td.dataset.cdType || ''})`;
+  const initialVal = td.dataset.cdVal;
+  const origHTML = td.innerHTML;
+
+  td.innerHTML = `<input type="number" step="any" class="cd-inline-input" value="${initialVal !== undefined && initialVal !== null && initialVal !== '' ? Number(initialVal) : ''}" placeholder="" style="width:100%;min-width:65px;text-align:right;background:var(--surface);border:1px solid var(--accent, #1E7A4F);color:var(--ink);border-radius:4px;padding:2px 4px;font-family:inherit;font-size:inherit;font-weight:600;outline:none;box-sizing:border-box;" />`;
+  const inp = td.querySelector('input') as HTMLInputElement;
+  if (!inp) return;
+  inp.focus();
+  inp.select();
+
+  let committed = false;
+  const commit = async () => {
+    if (committed) return;
+    committed = true;
+    const raw = inp.value.trim();
+    const newVal = raw === '' ? null : Number(raw);
+    if (newVal !== null && (isNaN(newVal) || newVal < 0)) {
+      td.innerHTML = origHTML;
+      return;
+    }
+    const oldNum = (initialVal !== null && initialVal !== undefined && initialVal !== '' && !isNaN(Number(initialVal))) ? Number(initialVal) : null;
+    if (newVal === oldNum) {
+      td.innerHTML = origHTML;
+      return;
+    }
+
+    td.innerHTML = `<span style="opacity:0.6">${newVal !== null ? money(newVal) : ''}</span>`;
+    try {
+      const updateFn = (window as any).__updateByAccountCreditedDebitedCell;
+      if (typeof updateFn === 'function') {
+        await updateFn(rowId, col, newVal);
+        toast(`Updated ${rowName}`);
+      } else {
+        td.innerHTML = origHTML;
+      }
+    } catch (err: any) {
+      toast(`Failed to save: ${err?.message || err}`, 'error');
+      td.innerHTML = origHTML;
+    }
+  };
+
+  inp.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      inp.blur();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      committed = true;
+      td.innerHTML = origHTML;
+    }
+  });
+
+  inp.addEventListener('blur', () => {
+    commit();
+  });
+}
+
 function bindGlobal() {
   if (_globalBound) return;
   _globalBound = true;
   document.addEventListener('dblclick', async (ev: any) => {
+    const cdTd = ev.target?.closest?.('td.cd-cell');
+    if (cdTd) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      initCdCellEdit(cdTd);
+      return;
+    }
     const opTd = ev.target?.closest?.('td.op-cell');
     const finTd = ev.target?.closest?.('td.fin-cell');
     const incTd = ev.target?.closest?.('td.inc-cell');
@@ -6600,7 +7645,21 @@ function bindGlobal() {
       commit();
     });
   });
-  document.addEventListener('click', ev => {
+  document.addEventListener('click', (ev: any) => {
+    const cdTd = ev.target?.closest?.('td.cd-cell, td[data-act="cd-drill"]');
+    if (cdTd && !cdTd.querySelector('input')) {
+      const val = cdTd.dataset.cdVal ?? cdTd.textContent?.trim();
+      const hasVal = val !== undefined && val !== null && val !== '' && val !== '-' && val !== '–' && val !== '0' && !isNaN(Number(String(val).replace(/[,₹\s]/g, '')));
+      if (hasVal) {
+        if (cdTd.dataset.act && ACT[cdTd.dataset.act]) {
+          ACT[cdTd.dataset.act](cdTd, ev);
+          return;
+        }
+      } else if (cdTd.classList.contains('cd-cell')) {
+        initCdCellEdit(cdTd);
+        return;
+      }
+    }
     const el = ev.target.closest('[data-act]'); if (!el) return;
     const fn = ACT[el.dataset.act]; if (!fn) return;
     if (el.tagName === 'A' && el.dataset.act !== 'report-tab') ev.preventDefault();
@@ -6608,6 +7667,11 @@ function bindGlobal() {
   });
   document.addEventListener('change', ev => {
     const t = ev.target;
+    if (t.dataset.act === 'filter-by-account-cd' || t.id === 'cdAccountFilter') {
+      S.byAccountCdFilter = t.value || '';
+      render({ keepScroll: true });
+      return;
+    }
     if (t.dataset.lf) { S.ledger[t.dataset.lf] = t.value; S.ledger.page = 0; if (S.page === 'ledger') { const fresh = PAGES.ledger.render(); refreshLedgerFromSupabase(); const btn = $('[data-act=toggle-filters]'); if (btn) { const tmp = document.createElement('div'); tmp.innerHTML = fresh; const nb = $('[data-act=toggle-filters]', tmp); btn.innerHTML = nb.innerHTML; } } return; }
     if (t.dataset.af) { S.audit[t.dataset.af] = t.value; S.audit.page = 0; render(); return; }
     if (t.dataset.of) { S.ord[t.dataset.of] = t.value; render({ keepScroll: true }); return; }
@@ -6654,6 +7718,8 @@ function boot(): Promise<void> {
     if (!loaded || (Store.data.meta?.testData && Store.data.meta?.schemaVersion !== 9)) await resetToTestData();
     else if (Store.data.meta?.schemaVersion !== 9) { Object.assign(Store.data, { orders: Store.data.orders || [], pis: Store.data.pis || [], targets: Store.data.targets || {}, emails: Store.data.emails || [] }); emailSettings(); (Store.data.parties || []).forEach(normalizeParty); featureSettings(); Store.data.meta.schemaVersion = 9; Store.persist(); }
     featureSettings();
+    Store.data.audit = [];
+    Store.persist();
     $('#menuBtn').innerHTML = icon('menu'); $('#menuBtn').dataset.act = 'open-side';
     $('#addBtn').innerHTML = icon('plus') + 'Add entry'; $('#addBtn').dataset.act = 'add-entry'; $('#addBtn').title = 'Add entry (N)';
     $('#fab').innerHTML = icon('plus'); $('#fab').dataset.act = 'add-entry';

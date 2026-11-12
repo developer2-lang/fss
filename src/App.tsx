@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { boot, go, route, render, S, api, Store, FileStore, PAYMENT_MODES, getCashflowSummaryUiRows, computeCashflowInflowRows, computeCashflowPeopleRows, computeCashflowOutflowProjectCostRows, computeCashflowOutflowCapexRows, computeCashflowOutflowFinancingAndOwnerRows, computeCashflowOutflowOfficeFixedRows, computeCashflowOutflowOfficeVariableRows, computeCashflowOutflowTravelRows, computeCashflowOutflowProfessionalAdminRows, computeCashflowOutflowTaxStatutoryRows } from './lib/coreEngine';
-import { FssTransactionInput, FormAttachmentBucket, SupabaseService, isSupabaseConfigured, STATE_NAME_TO_CODE, STATE_CODE_TO_NAME } from './lib/supabase';
+import { FssTransactionInput, FormAttachmentBucket, SupabaseService, isSupabaseConfigured, STATE_NAME_TO_CODE, STATE_CODE_TO_NAME, computeByAccountCreditedDebitedRows } from './lib/supabase';
 import { AddClientModal } from './components/AddClientModal';
 import { AddVendorModal } from './components/AddVendorModal';
 import { AddEmployeeModal } from './components/AddEmployeeModal';
@@ -77,6 +77,102 @@ function formAttachmentsFromValue(value: any, bucket: string, idPrefix: string):
       ...(publicUrl ? { url: publicUrl } : {})
     };
   });
+}
+
+function recordSupabaseAudit(
+  action: string,
+  entity: string,
+  entityId: string | number,
+  summary: string,
+  before: any,
+  after: any
+): Promise<any> {
+  const user = (window as any).api?.me?.();
+  const writeAuditLog = (window as any).__writeSupabaseAuditLog;
+  if (typeof writeAuditLog !== 'function') {
+    const error = new Error('Supabase audit log service is unavailable.');
+    console.error(error);
+    (window as any).IuovaCore?.toast?.(error.message, 'error');
+    return Promise.resolve(null);
+  }
+  return writeAuditLog({
+    ts: new Date().toISOString(),
+    userId: String(user?.id || ''),
+    userName: String(user?.name || ''),
+    action,
+    entity,
+    entityId: String(entityId),
+    summary,
+    changes: { before: before ?? null, after: after ?? null }
+  }).catch((error: any) => {
+    console.error('Supabase audit log write failed:', error);
+    (window as any).IuovaCore?.toast?.(auditFailureMessage(error), 'error');
+    return null;
+  });
+}
+
+function transactionAuditSummary(transaction: any): string {
+  const data = (window as any).Store?.data || {};
+  const findName = (collection: string, id: any, field = 'name') =>
+    (data[collection] || []).find((item: any) => String(item.id) === String(id))?.[field] || '';
+  const type = String(transaction?.transaction_type || transaction?.type || 'Transaction').toLowerCase();
+  const typeLabel = type.includes('inflow') ? 'Inflow' : type.includes('transfer') ? 'Transfer' : 'Outflow';
+  const amount = Math.abs(Number(
+    transaction?.net_cash ?? transaction?.netCash ?? transaction?.amount ??
+    transaction?.taxable_amount ?? transaction?.taxable
+  ) || 0);
+  const amountLabel = new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(amount);
+  const category = transaction?.category || transaction?.categoryName ||
+    findName('categories', transaction?.categoryId);
+  const party = transaction?.party_name || transaction?.partyName ||
+    transaction?.party || findName('parties', transaction?.partyId);
+  const project = transaction?.project_name || transaction?.projectName ||
+    transaction?.project || findName('projects', transaction?.projectId);
+  const transferAccounts = [
+    transaction?.transfer_from_account_name || transaction?.transferFromAccountName ||
+      findName('accounts', transaction?.accountId),
+    transaction?.transfer_to_account_name || transaction?.transferToAccountName ||
+      findName('accounts', transaction?.toAccountId)
+  ].filter(Boolean);
+  return [
+    `${typeLabel} ₹${amountLabel}`,
+    typeLabel === 'Transfer' ? transferAccounts.join(' → ') : category,
+    typeLabel === 'Transfer' ? '' : party,
+    project
+  ].filter(Boolean).join(' · ');
+}
+
+let creditedDebitedSyncQueue: Promise<void> = Promise.resolve();
+
+function syncCreditedDebitedFromEntries(entries?: any[]): Promise<void> {
+  const sync = async () => {
+    const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
+    const getEffectiveEntries = (window as any).__getAllDeduplicatedTransactions;
+    const effectiveEntries = typeof getEffectiveEntries === 'function'
+      ? getEffectiveEntries()
+      : entries || Store.data?.entries || [];
+    const computedCD = computeByAccountCreditedDebitedRows(
+      effectiveEntries,
+      Store.data?.fss_by_account_credited_debited || [],
+      Store.data?.accounts || [],
+      currentFy
+    );
+    if (computedCD.length > 0) {
+      const syncedCD = await SupabaseService.syncByAccountCreditedDebitedToSupabase(computedCD, currentFy);
+      if (Store.data) {
+        Store.data.fss_by_account_credited_debited = syncedCD;
+        Store.persist();
+      }
+      render({ keepScroll: true });
+    }
+  };
+  const operation = creditedDebitedSyncQueue.then(sync, sync);
+  creditedDebitedSyncQueue = operation.catch(err => {
+    console.error('Credited/debited summary sync failed:', err);
+    const reportError = (window as any).__reportAccountSummarySyncError;
+    if (typeof reportError === 'function') reportError(err);
+  });
+  return operation;
 }
 
 export interface CloudStatus {
@@ -639,19 +735,33 @@ export function convertFssTransactionToLocal(
   categories: any[] = [],
   accounts: any[] = []
 ) {
-  const match = (existingEntries || []).find((e: any) =>
-    (e.supabase_id && e.supabase_id === tx.id) ||
-    (tx.reference_number && e.refNo && e.refNo.trim().toLowerCase() === tx.reference_number.trim().toLowerCase())
-  );
+  const normMatchStr = (s: any) => String(s || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+  const match = (existingEntries || []).find((e: any) => {
+    if (e.supabase_fss_transaction_id && e.supabase_fss_transaction_id === tx.id) return true;
+    if (e.supabase_id && e.supabase_id === tx.id) return true;
+    if (e.id === tx.id || e.id === `e_${tx.id}`) return true;
+    const ref = tx.reference_number || tx.reference_no;
+    if (ref && e.refNo && normMatchStr(e.refNo) === normMatchStr(ref)) return true;
+    const dateMatch = e.date === (tx.transaction_date || tx.date);
+    const typeMatch = String(e.type || '').toLowerCase() === String(tx.transaction_type || tx.type || '').toLowerCase();
+    const amtMatch = Math.abs((Number(e.taxable) || Number(e.amount) || 0) - (Number(tx.taxable_amount ?? tx.taxable) || Number(tx.net_cash ?? tx.amount) || 0)) < 1;
+    const eDesc = normMatchStr(e.description);
+    const txDesc = normMatchStr(tx.description);
+    const descMatch = Boolean(eDesc && txDesc && (eDesc === txDesc || eDesc.includes(txDesc) || txDesc.includes(eDesc)));
+    return dateMatch && typeMatch && amtMatch && descMatch;
+  });
   const localId = match ? match.id : (tx.id ? `e_${tx.id}` : `e_${Date.now()}`);
 
-  const rawType = (tx.transaction_type || '').toLowerCase();
-  const type: 'inflow' | 'outflow' = rawType === 'inflow' ? 'inflow' : 'outflow';
+  const rawType = String(tx.transaction_type || tx.type || '').toLowerCase();
+  const type: 'inflow' | 'outflow' | 'transfer' = rawType.includes('transfer')
+    ? 'transfer'
+    : rawType.includes('inflow') ? 'inflow' : 'outflow';
 
   // Resolve Party
   let partyId = match?.partyId || '';
-  if (tx.party_name) {
-    const pMatch = (parties || []).find((p: any) => p.name && p.name.trim().toLowerCase() === tx.party_name.trim().toLowerCase());
+  const partyNameStr = tx.party_name || tx.party || '';
+  if (partyNameStr) {
+    const pMatch = (parties || []).find((p: any) => p.name && p.name.trim().toLowerCase() === partyNameStr.trim().toLowerCase());
     if (pMatch) partyId = pMatch.id;
   }
 
@@ -664,10 +774,11 @@ export function convertFssTransactionToLocal(
 
   // Resolve Project
   let projectId = match?.projectId || '';
-  if (tx.project_code || tx.project_name) {
+  if (tx.project_code || tx.project_name || tx.project) {
     const prMatch = (projects || []).find((pr: any) =>
       (tx.project_code && pr.code && pr.code.trim().toLowerCase() === tx.project_code.trim().toLowerCase()) ||
-      (tx.project_name && pr.name && pr.name.trim().toLowerCase() === tx.project_name.trim().toLowerCase())
+      (tx.project_name && pr.name && pr.name.trim().toLowerCase() === tx.project_name.trim().toLowerCase()) ||
+      (tx.project && pr.name && pr.name.trim().toLowerCase() === tx.project.trim().toLowerCase())
     );
     if (prMatch) projectId = prMatch.id;
   }
@@ -683,31 +794,154 @@ export function convertFssTransactionToLocal(
   }
 
   // Resolve Category
+  const rawCat = String(tx.category || '').trim();
+  const rawParty = String(partyNameStr).trim().toLowerCase();
+  const rawDesc = String(tx.description || '').trim().toLowerCase();
+
   let categoryId = match?.categoryId || '';
-  if (tx.category) {
-    const cMatch = (categories || []).find((c: any) => c.name && c.name.trim().toLowerCase() === tx.category.trim().toLowerCase());
-    if (cMatch) categoryId = cMatch.id;
+  let categoryName = match?.categoryName || rawCat;
+
+  // 1. Direct match with categories by ID or exact name
+  if (rawCat) {
+    const cMatch = (categories || []).find((c: any) =>
+      c.id === rawCat ||
+      (c.name && c.name.trim().toLowerCase() === rawCat.toLowerCase())
+    );
+    if (cMatch) {
+      categoryId = cMatch.id;
+      categoryName = cMatch.name;
+    }
   }
-  if (!categoryId && (categories || []).length > 0) {
-    const fallbackCat = (categories || []).find((c: any) => type === 'inflow' ? c.type === 'inflow' : c.type === 'outflow');
-    categoryId = fallbackCat ? fallbackCat.id : categories[0].id;
+
+  const normalizedRawCategory = rawCat.toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
+  if (type === 'inflow' && /^project receipts?$/.test(normalizedRawCategory)) {
+    const departmentName = String(tx.department || '').trim().toLowerCase();
+    if (/engineering|engineer/.test(departmentName)) {
+      categoryId = 'cat_reng';
+      categoryName = categories.find((category: any) => category.id === categoryId)?.name || 'Project Receipts – Engineering';
+    } else if (/design/.test(departmentName)) {
+      categoryId = 'cat_rdesign';
+      categoryName = categories.find((category: any) => category.id === categoryId)?.name || 'Project Receipts – Design';
+    }
+  }
+
+  // 2. Keyword / semantic match on category, party, and description
+  if (!categoryId) {
+    const searchTarget = `${rawCat} ${rawParty} ${rawDesc}`.toLowerCase();
+
+    if (type === 'outflow') {
+      if (/clean|facility|housekeep/i.test(searchTarget)) {
+        categoryId = 'cat_house';
+        categoryName = categoryName || 'Housekeeping & Security';
+      } else if (/pantry|supplies|welfare|food|coffee|brew/i.test(searchTarget)) {
+        categoryId = 'cat_supplies';
+        categoryName = categoryName || 'Office Supplies & Pantry';
+      } else if (/internet|phone|fibernet|utility|broadband|airlink|wifi/i.test(searchTarget)) {
+        categoryId = 'cat_net';
+        categoryName = categoryName || 'Internet & Phone';
+      } else if (/software|licen|cloudsuite|cloud|saas|subscription|tool/i.test(searchTarget)) {
+        categoryId = 'cat_soft';
+        categoryName = categoryName || 'Software Subscriptions';
+      } else if (/freelanc|consult|ananya|ux|designer|developer|contractor/i.test(searchTarget)) {
+        categoryId = 'cat_free';
+        categoryName = categoryName || 'Freelancers & Consultants';
+      } else if (/travel|convey|cab|uber|ola|flight|hotel/i.test(searchTarget)) {
+        categoryId = 'cat_travel';
+        categoryName = categoryName || 'Travel & Conveyance';
+      } else if (/\bca\b|audit|accounting|chartered/i.test(searchTarget)) {
+        categoryId = 'cat_ca';
+        categoryName = categoryName || 'CA, Audit & Accounting';
+      } else if (/legal|complian|advocate|lawyer/i.test(searchTarget)) {
+        categoryId = 'cat_legal';
+        categoryName = categoryName || 'Legal & Compliance';
+      } else if (/bank\s*charge|bank\s*charges|charges/i.test(searchTarget)) {
+        categoryId = 'cat_bank';
+        categoryName = categoryName || 'Bank Charges';
+      } else if (/salar|payroll|stipend|wages/i.test(searchTarget)) {
+        categoryId = 'cat_sal';
+        categoryName = categoryName || 'Salaries';
+      } else if (/reimb/i.test(searchTarget)) {
+        categoryId = 'cat_reimb';
+        categoryName = categoryName || 'Employee Reimbursements';
+      } else if (/rent/i.test(searchTarget)) {
+        categoryId = 'cat_rent';
+        categoryName = categoryName || 'Office Rent';
+      } else if (/elec|power/i.test(searchTarget)) {
+        categoryId = 'cat_elec';
+        categoryName = categoryName || 'Electricity';
+      } else if (/gst/i.test(searchTarget)) {
+        categoryId = 'cat_gstpay';
+        categoryName = categoryName || 'GST Paid to Govt';
+      } else if (/tds/i.test(searchTarget)) {
+        categoryId = 'cat_tdsdep';
+        categoryName = categoryName || 'TDS Deposited';
+      } else if (/emi|loan/i.test(searchTarget)) {
+        categoryId = 'cat_emi';
+        categoryName = categoryName || 'Loan EMI';
+      } else {
+        // Fallback: Check if party has a default category
+        const pMatch = (parties || []).find((p: any) => p.name && p.name.trim().toLowerCase() === rawParty);
+        if (pMatch?.defaultCategoryId) {
+          categoryId = pMatch.defaultCategoryId;
+          const matched = (categories || []).find((c: any) => c.id === categoryId);
+          categoryName = categoryName || matched?.name || pMatch.name;
+        } else {
+          // Never blindly default to cat_sal! Use cat_vserv or a generic outflow category
+          categoryId = 'cat_vserv';
+          categoryName = categoryName || rawCat || 'Vendor Services (Project)';
+        }
+      }
+    } else {
+      // Inflow
+      if (/design/i.test(searchTarget)) {
+        categoryId = 'cat_rdesign';
+        categoryName = categoryName || 'Project Receipts – Design';
+      } else if (/eng/i.test(searchTarget)) {
+        categoryId = 'cat_reng';
+        categoryName = categoryName || 'Project Receipts – Engineering';
+      } else if (/consult/i.test(searchTarget)) {
+        categoryId = 'cat_consult';
+        categoryName = categoryName || 'Consulting Fees';
+      } else if (/interest|fd/i.test(searchTarget)) {
+        categoryId = 'cat_fdint';
+        categoryName = categoryName || 'FD / Bank Interest';
+      } else {
+        categoryId = 'cat_othinc';
+        categoryName = categoryName || rawCat || 'Other Income';
+      }
+    }
+  }
+
+  if (!categoryName) {
+    const cObj = (categories || []).find((c: any) => c.id === categoryId);
+    categoryName = cObj?.name || rawCat || 'General Expense';
   }
 
   // Resolve Account
   let accountId = match?.accountId || '';
-  if (tx.account_name) {
-    const aMatch = (accounts || []).find((a: any) => a.name && a.name.trim().toLowerCase() === tx.account_name.trim().toLowerCase());
+  const accountNameStr = tx.transfer_from_account_name || tx.account_name || tx.account || '';
+  const fromAccount = (accounts || []).find((a: any) =>
+    String(a.supabase_id || a.id) === String(tx.transfer_from_account_id || '') ||
+    (accountNameStr && String(a.name || '').trim().toLowerCase() === accountNameStr.trim().toLowerCase())
+  );
+  const toAccount = (accounts || []).find((a: any) =>
+    String(a.supabase_id || a.id) === String(tx.transfer_to_account_id || '') ||
+    (tx.transfer_to_account_name && String(a.name || '').trim().toLowerCase() === String(tx.transfer_to_account_name).trim().toLowerCase())
+  );
+  if (type === 'transfer' && fromAccount) accountId = fromAccount.id;
+  if (accountNameStr) {
+    const aMatch = (accounts || []).find((a: any) => a.name && a.name.trim().toLowerCase() === accountNameStr.trim().toLowerCase());
     if (aMatch) accountId = aMatch.id;
   }
-  if (!accountId && (accounts || []).length > 0) {
+  if (!accountId && type !== 'transfer' && (accounts || []).length > 0) {
     accountId = accounts[0].id;
   }
 
-  const taxable = Number(tx.taxable_amount) || 0;
+  const taxable = Number(tx.taxable_amount ?? tx.taxable) || 0;
   const gstRate = Number(tx.gst_rate) || 0;
-  const gstAmount = Number(tx.gst_amount) || 0;
-  const tdsAmount = Number(tx.tds_amount) || 0;
-  const netAmount = Math.abs(Number(tx.net_cash)) || Math.abs(taxable + gstAmount - tdsAmount);
+  const gstAmount = Number(tx.gst_amount ?? tx.gst) || 0;
+  const tdsAmount = Number(tx.tds_amount ?? tx.tds) || 0;
+  const netAmount = Math.abs(Number(tx.net_cash != null && tx.net_cash !== '' ? tx.net_cash : tx.amount)) || Math.abs(taxable + gstAmount - tdsAmount);
   const taxPeriodMatch = String(tx.description || '').match(/for (January|February|March|April|May|June|July|August|September|October|November|December) (\d{4})/i);
   const taxPeriod = taxPeriodMatch
     ? `${taxPeriodMatch[2]}-${String(['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'].indexOf(taxPeriodMatch[1].toLowerCase()) + 1).padStart(2, '0')}`
@@ -716,16 +950,20 @@ export function convertFssTransactionToLocal(
   return {
     id: localId,
     supabase_id: tx.id,
+    supabase_fss_transaction_id: tx.id,
     type,
-    date: tx.transaction_date || new Date().toISOString().split('T')[0],
+    date: tx.transaction_date || tx.date || new Date().toISOString().split('T')[0],
     categoryId,
+    category: categoryName,
+    categoryName,
     departmentId,
     partyKind,
     partyId: partyId || undefined,
+    partyName: tx.party_name || tx.party || undefined,
     projectId: projectId || undefined,
     description: tx.description || '',
     taxPeriod: taxPeriod || match?.taxPeriod,
-    refNo: tx.reference_number || '',
+    refNo: tx.reference_number || tx.reference_no || '',
     taxable,
     gstType: (gstAmount > 0 ? 'intra' : 'none') as 'intra' | 'none',
     gstRate,
@@ -734,29 +972,107 @@ export function convertFssTransactionToLocal(
     tdsRate: taxable > 0 && tdsAmount > 0 ? Math.round((tdsAmount / taxable) * 100) : 0,
     tdsAmount,
     amount: netAmount,
-    paymentMode: tx.payment_mode || 'NEFT',
+    paymentMode: tx.payment_mode || tx.mode || 'NEFT',
     accountId,
+    accountName: type === 'transfer' ? (tx.transfer_from_account_name || tx.account_name || tx.account || undefined) : (tx.account_name || tx.account || undefined),
+    toAccountId: type === 'transfer' ? (toAccount?.id || '') : undefined,
+    transferFromAccountName: type === 'transfer' ? (tx.transfer_from_account_name || tx.account_name || undefined) : undefined,
+    transferToAccountName: type === 'transfer' ? (tx.transfer_to_account_name || undefined) : undefined,
     notes: tx.notes || '',
     status: tx.status || 'Active',
-    deleted: tx.status === 'Cancelled',
+    deleted: String(tx.status || '').toLowerCase().includes('cancel'),
+    deletedAt: tx.transfer_deleted_at || (String(tx.status || '').toLowerCase().includes('cancel') ? tx.updated_at : null),
+    deletedBy: tx.transfer_deleted_by || null,
     createdAt: tx.created_at || new Date().toISOString(),
     updatedAt: tx.updated_at || new Date().toISOString()
   };
 }
 
+export function deduplicateEntries(entries: any[]): any[] {
+  const seenSupabaseIds = new Set<string>();
+  const seenSignatures = new Set<string>();
+  const norm = (s: any) => String(s || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+
+  // If there are Supabase-backed entries, discard any unbacked seed entries (like pi_*, rc_*, e_*)
+  const hasSupabaseEntries = (entries || []).some((e: any) => Boolean(
+    e.supabase_id || e.supabase_tax_statutory_id || e.supabase_other_expense_id ||
+    e.supabase_client_payment_id || e.supabase_other_income_id || e.supabase_vendor_id ||
+    e.supabase_employee_id
+  ));
+
+  const validEntries = hasSupabaseEntries
+    ? (entries || []).filter((e: any) => Boolean(
+        e.supabase_id || e.supabase_tax_statutory_id || e.supabase_other_expense_id ||
+        e.supabase_client_payment_id || e.supabase_other_income_id || e.supabase_vendor_id ||
+        e.supabase_employee_id || e.isUserCreated || e.deleted
+      ))
+    : (entries || []);
+
+  // Sort so real Supabase entries (with supabase_id) come first, then latest by date
+  const sorted = [...validEntries].sort((a, b) => {
+    const aSb = a.supabase_id ? 1 : 0;
+    const bSb = b.supabase_id ? 1 : 0;
+    if (aSb !== bSb) return bSb - aSb;
+    return (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || '');
+  });
+
+  const result: any[] = [];
+  for (const e of sorted) {
+    if (e.deleted || String(e.status || '').toLowerCase().includes('cancel')) {
+      const sbId = e.supabase_id ? String(e.supabase_id) : '';
+      const localId = String(e.id || '');
+      if ((sbId && seenSupabaseIds.has(sbId)) || (localId && seenSupabaseIds.has(localId))) continue;
+      if (sbId) seenSupabaseIds.add(sbId);
+      if (localId) seenSupabaseIds.add(localId);
+      result.push(e);
+      continue;
+    }
+    const sbId = e.supabase_id ? String(e.supabase_id) : '';
+    if (sbId) {
+      if (seenSupabaseIds.has(sbId)) continue;
+      seenSupabaseIds.add(sbId);
+    }
+    const localId = String(e.id || '');
+    if (localId && seenSupabaseIds.has(localId)) continue;
+
+    const amt = Math.round((Number(e.taxable) || Number(e.amount) || 0) * 100);
+    const netAmt = Math.round(Math.abs(Number(e.amount != null ? e.amount : e.netCash != null ? e.netCash : e.taxable || 0)) * 100);
+    const date = String(e.date || '').slice(0, 10);
+    const type = String(e.type || '').toLowerCase();
+    const category = norm(e.categoryId || e.categoryName || e.category);
+    const party = norm(e.partyId || e.partyName || e.party || e.party_name);
+    const project = norm(e.projectId || e.projectCode || e.projectName || e.project);
+    const account = norm(e.accountId || e.accountName || e.account_name || e.account);
+    const toAccount = norm(e.toAccountId || e.transferToAccountName || e.toAccountName);
+    const reference = norm(e.txnRef || e.refNo || e.reference_no || e.reference_number);
+    const description = norm(e.description);
+    const signature = `${date}|${type}|${amt}|${netAmt}|${category}|${party}|${project}|${account}|${toAccount}|${reference}|${description}`;
+    if (seenSignatures.has(signature)) {
+      continue;
+    }
+    seenSignatures.add(signature);
+    result.push(e);
+  }
+  return result;
+}
+
 function refreshCashflowEntriesFromStore() {
   if (!Store.data) return;
-  const transactionIds = new Set((Store.data.supabaseTransactionIds || []).map((id: any) => String(id)));
-  const auxiliaryIdFields = [
-    'supabase_tax_statutory_id',
-    'supabase_other_expense_id',
-    'supabase_client_payment_id',
-    'supabase_other_income_id'
-  ];
-  Store.data.cashflowEntries = (Store.data.entries || []).filter((entry: any) =>
-    (entry.supabase_id != null && transactionIds.has(String(entry.supabase_id))) ||
-    auxiliaryIdFields.some(field => entry[field] !== null && entry[field] !== undefined)
+  Store.data.entries = deduplicateEntries(Store.data.entries || []);
+  Store.data.cashflowEntries = Store.data.entries.filter((entry: any) =>
+    !entry.deleted && !String(entry.status || '').toLowerCase().includes('cancel')
   );
+}
+
+function auditFailureMessage(error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  if (/row-level security policy/i.test(detail)) {
+    return 'Supabase denied the audit write. Apply the fss_audit_insert_rpc migration in your Supabase project.';
+  }
+  if (/fss_insert_audit_log|could not find the function/i.test(detail)) {
+    return 'The audit writer is not installed in Supabase yet. Apply the fss_audit_insert_rpc migration.';
+  }
+  return `The action was completed, but its audit log could not be saved: ${detail}`;
 }
 
 export const App: React.FC = () => {
@@ -777,7 +1093,6 @@ export const App: React.FC = () => {
     orderCount: 0,
     transactionCount: 0
   });
-
   const [showCloudModal, setShowCloudModal] = useState<boolean>(false);
   const [showAddClientModal, setShowAddClientModal] = useState<boolean>(false);
   const [showAddVendorModal, setShowAddVendorModal] = useState<boolean>(false);
@@ -840,11 +1155,13 @@ export const App: React.FC = () => {
     if (Store.data && Store.data.parties) {
       const partyRec = convertFssClientToParty(newClient, newClient.people || []);
       const existingIdx = Store.data.parties.findIndex((p: any) => p.id === newClient.id);
+      const previous = existingIdx >= 0 ? { ...Store.data.parties[existingIdx] } : null;
       if (existingIdx >= 0) {
         Store.data.parties[existingIdx] = partyRec;
       } else {
         Store.data.parties.unshift(partyRec);
       }
+      void recordSupabaseAudit(previous ? 'update' : 'create', 'parties', newClient.id, `${previous ? 'Updated' : 'Created'} client · ${partyRec.name}`, previous, partyRec);
       Store.persist();
       render({ keepScroll: true });
       setCloudStatus(prev => ({
@@ -860,11 +1177,13 @@ export const App: React.FC = () => {
     if (Store.data && Store.data.parties) {
       const partyRec = convertFssVendorToParty(newVendor, newVendor.people || []);
       const existingIdx = Store.data.parties.findIndex((p: any) => p.id === newVendor.id);
+      const previous = existingIdx >= 0 ? { ...Store.data.parties[existingIdx] } : null;
       if (existingIdx >= 0) {
         Store.data.parties[existingIdx] = partyRec;
       } else {
         Store.data.parties.unshift(partyRec);
       }
+      void recordSupabaseAudit(previous ? 'update' : 'create', 'parties', newVendor.id, `${previous ? 'Updated' : 'Created'} vendor · ${partyRec.name}`, previous, partyRec);
       Store.persist();
       render({ keepScroll: true });
       setCloudStatus(prev => ({
@@ -882,11 +1201,13 @@ export const App: React.FC = () => {
       const existingIdx = Store.data.parties.findIndex(
         (p: any) => p.supabase_id === newEmp.id || (p.kind === 'employee' && p.name.trim().toLowerCase() === newEmp.name.trim().toLowerCase())
       );
+      const previous = existingIdx >= 0 ? { ...Store.data.parties[existingIdx] } : null;
       if (existingIdx >= 0) {
         Store.data.parties[existingIdx] = { ...Store.data.parties[existingIdx], ...partyRec };
       } else {
         Store.data.parties.unshift(partyRec);
       }
+      void recordSupabaseAudit(previous ? 'update' : 'create', 'parties', newEmp.id, `${previous ? 'Updated' : 'Created'} employee · ${partyRec.name}`, previous, partyRec);
       Store.persist();
       render({ keepScroll: true });
       setCloudStatus(prev => ({
@@ -904,6 +1225,7 @@ export const App: React.FC = () => {
       const existingIdx = Store.data.parties.findIndex(
         (p: any) => p.supabase_id === newOtherParty.id || (p.kind === 'other' && p.name.trim().toLowerCase() === newOtherParty.name.trim().toLowerCase())
       );
+      const previous = existingIdx >= 0 ? { ...Store.data.parties[existingIdx] } : null;
       if (existingIdx >= 0) {
         Store.data.parties[existingIdx] = {
           ...Store.data.parties[existingIdx],
@@ -913,6 +1235,7 @@ export const App: React.FC = () => {
       } else {
         Store.data.parties.unshift(partyRec);
       }
+      void recordSupabaseAudit(previous ? 'update' : 'create', 'parties', newOtherParty.id, `${previous ? 'Updated' : 'Created'} other party · ${partyRec.name}`, previous, partyRec);
       Store.persist();
       render({ keepScroll: true });
       setCloudStatus(prev => ({
@@ -930,6 +1253,7 @@ export const App: React.FC = () => {
       const existingIdx = Store.data.projects.findIndex(
         (p: any) => p.supabase_id === newProject.id || (p.code && p.code.trim().toLowerCase() === newProject.project_code.trim().toLowerCase())
       );
+      const previous = existingIdx >= 0 ? { ...Store.data.projects[existingIdx] } : null;
       if (existingIdx >= 0) {
         Store.data.projects[existingIdx] = {
           ...Store.data.projects[existingIdx],
@@ -939,6 +1263,7 @@ export const App: React.FC = () => {
       } else {
         Store.data.projects.unshift(projRec);
       }
+      void recordSupabaseAudit(previous ? 'update' : 'create', 'projects', newProject.id, `${previous ? 'Updated' : 'Created'} project · ${projRec.name}`, previous, projRec);
       Store.persist();
       render({ keepScroll: true });
       setCloudStatus(prev => ({
@@ -956,6 +1281,7 @@ export const App: React.FC = () => {
       const existingIdx = Store.data.departments.findIndex(
         (d: any) => d.supabase_id === newDept.id || (d.name && d.name.trim().toLowerCase() === newDept.department_name.trim().toLowerCase())
       );
+      const previous = existingIdx >= 0 ? { ...Store.data.departments[existingIdx] } : null;
       if (existingIdx >= 0) {
         Store.data.departments[existingIdx] = {
           ...Store.data.departments[existingIdx],
@@ -965,6 +1291,7 @@ export const App: React.FC = () => {
       } else {
         Store.data.departments.push(deptRec);
       }
+      void recordSupabaseAudit(previous ? 'update' : 'create', 'departments', newDept.id, `${previous ? 'Updated' : 'Created'} department · ${deptRec.name}`, previous, deptRec);
       Store.persist();
       render({ keepScroll: true });
       setCloudStatus(prev => ({
@@ -983,6 +1310,7 @@ export const App: React.FC = () => {
         (a: any) => (a.supabase_id && a.supabase_id === newAcc.id) ||
                     (a.name && a.name.trim().toLowerCase() === newAcc.account_name.trim().toLowerCase())
       );
+      const previous = existingIdx >= 0 ? { ...Store.data.accounts[existingIdx] } : null;
       if (existingIdx >= 0) {
         Store.data.accounts[existingIdx] = {
           ...Store.data.accounts[existingIdx],
@@ -992,6 +1320,7 @@ export const App: React.FC = () => {
       } else {
         Store.data.accounts.push(accRec);
       }
+      void recordSupabaseAudit(previous ? 'update' : 'create', 'accounts', newAcc.id, `${previous ? 'Updated' : 'Created'} bank account · ${accRec.name}`, previous, accRec);
       Store.persist();
       render({ keepScroll: true });
       setCloudStatus(prev => ({
@@ -1010,6 +1339,7 @@ export const App: React.FC = () => {
         (c: any) => (c.supabase_id && c.supabase_id === newCat.id) ||
                     (c.name && c.name.trim().toLowerCase() === (newCat.category_name || '').trim().toLowerCase())
       );
+      const previous = existingIdx >= 0 ? { ...Store.data.categories[existingIdx] } : null;
       if (existingIdx >= 0) {
         Store.data.categories[existingIdx] = {
           ...Store.data.categories[existingIdx],
@@ -1019,6 +1349,7 @@ export const App: React.FC = () => {
       } else {
         Store.data.categories.push(catRec);
       }
+      void recordSupabaseAudit(previous ? 'update' : 'create', 'categories', newCat.id, `${previous ? 'Updated' : 'Created'} category · ${catRec.name}`, previous, catRec);
       Store.persist();
       render({ keepScroll: true });
       setCloudStatus(prev => ({
@@ -1283,6 +1614,7 @@ export const App: React.FC = () => {
         );
         Store.persist();
         render({ keepScroll: true });
+        void syncCreditedDebitedFromEntries(Store.data?.entries || []);
       }
 
       setCloudStatus(prev => ({
@@ -1413,12 +1745,37 @@ export const App: React.FC = () => {
   // Hydrate transactions from Supabase fss_table_transactions
   const loadSupabaseTransactions = useCallback(async () => {
     if (!isSupabaseConfigured) return;
+    let payVendorAttachmentLoadError: string | null = null;
+    const deletedEntrySnapshots = (Store.data?.entries || [])
+      .filter((entry: any) => entry.deleted)
+      .map((entry: any) => ({ ...entry }));
     try {
       setCloudStatus(prev => ({ ...prev, syncing: true, error: null }));
-      const supabaseTransactions = await SupabaseService.loadTransactionsFromSupabase();
+      const [supabaseTransactions, cancelledTransactions] = await Promise.all([
+        SupabaseService.loadTransactionsFromSupabase(),
+        SupabaseService.loadCancelledTransactionsFromSupabase()
+      ]);
 
       if (supabaseTransactions && Store.data?.entries) {
-        Store.data.supabaseTransactionIds = supabaseTransactions.map((transaction: any) => String(transaction.id));
+        const transactionIds = new Set(supabaseTransactions.map((transaction: any) => String(transaction.id)));
+        Store.data.supabaseTransactionIds = [...transactionIds];
+        Store.data.entries = Store.data.entries.filter((entry: any) => {
+          const entryId = String(entry.id || '');
+          const transactionId = String(entry.supabase_id || entryId.replace(/^e_/, ''));
+          const hasTransactionId = Boolean(entry.supabase_id || entryId.startsWith('e_') || transactionIds.has(entryId));
+          const isFormBacked = Boolean(
+            entry.supabase_tax_statutory_id ||
+            entry.supabase_other_expense_id ||
+            entry.supabase_client_payment_id ||
+            entry.supabase_other_income_id ||
+            entry.supabase_vendor_id ||
+            entry.supabase_employee_id ||
+            entry.supabase_pay_vendor_id ||
+            entry.supabase_pay_employee_id
+          );
+          if (hasTransactionId) return transactionIds.has(transactionId) || isFormBacked;
+          return isFormBacked || entry.isUserCreated;
+        });
         supabaseTransactions.forEach((st: any) => {
           const entryRecord = convertFssTransactionToLocal(
             st,
@@ -1429,20 +1786,62 @@ export const App: React.FC = () => {
             Store.data.categories || [],
             Store.data.accounts || []
           );
+          const normStr = (s: any) => String(s || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
           const existingIdx = Store.data.entries.findIndex(
             (e: any) => (e.supabase_id && e.supabase_id === st.id) ||
-                        (st.reference_number && e.refNo && e.refNo.trim().toLowerCase() === st.reference_number.trim().toLowerCase())
+                        (e.id === st.id || e.id === `e_${st.id}`) ||
+                        (st.reference_number && e.refNo && normStr(e.refNo) === normStr(st.reference_number)) ||
+                        (e.date === st.transaction_date &&
+                         String(e.type || '').toLowerCase() === String(st.transaction_type || '').toLowerCase() &&
+                         Math.abs((Number(e.taxable) || Number(e.amount) || 0) - (Number(st.taxable_amount) || Number(st.net_cash) || 0)) < 1 &&
+                         Boolean(normStr(e.description) && normStr(st.description) &&
+                         (normStr(e.description) === normStr(st.description) || normStr(e.description).includes(normStr(st.description)) || normStr(st.description).includes(normStr(e.description)))))
           );
           if (existingIdx >= 0) {
             Store.data.entries[existingIdx] = {
               ...Store.data.entries[existingIdx],
               ...entryRecord,
-              id: Store.data.entries[existingIdx].id // preserve local id
+              id: Store.data.entries[existingIdx].id,
+              supabase_id: st.id
             };
           } else {
             Store.data.entries.unshift(entryRecord);
           }
         });
+
+        // Cancelled transactions are the cloud-backed source for Trash. If the
+        // local tombstone is missing (for example after clearing browser data),
+        // rebuild it from the cancelled Supabase row instead of dropping it.
+        for (const cancelledTransaction of cancelledTransactions || []) {
+          const transactionId = String(cancelledTransaction.id || '');
+          const existingDeletedEntry = Store.data.entries.find((entry: any) =>
+            String(entry.supabase_id || '') === transactionId ||
+            String(entry.id || '') === transactionId ||
+            String(entry.id || '') === `e_${transactionId}`
+          );
+          if (existingDeletedEntry) {
+            existingDeletedEntry.deleted = true;
+            existingDeletedEntry.deletedAt = existingDeletedEntry.deletedAt || cancelledTransaction.updated_at || new Date().toISOString();
+            existingDeletedEntry.deletedBy = existingDeletedEntry.deletedBy || cancelledTransaction.deleted_by || null;
+            continue;
+          }
+          const deletedEntry = convertFssTransactionToLocal(
+            cancelledTransaction,
+            Store.data.entries,
+            Store.data.parties || [],
+            Store.data.projects || [],
+            Store.data.departments || [],
+            Store.data.categories || [],
+            Store.data.accounts || []
+          );
+          Store.data.entries.push({
+            ...deletedEntry,
+            supabase_id: cancelledTransaction.id,
+            deleted: true,
+            deletedAt: cancelledTransaction.updated_at || new Date().toISOString(),
+            deletedBy: cancelledTransaction.deleted_by || null
+          });
+        }
 
         // The dedicated Tax & Statutory table is the source for tax-payment form rows.
         // Hydrate those rows into the existing entry model so the current UI remains unchanged.
@@ -1503,6 +1902,38 @@ export const App: React.FC = () => {
             } else {
               Store.data.entries.unshift(entryRecord);
             }
+          }
+        }
+        if (typeof (window as any).__supabaseLoadPayEmployeeEntries === 'function') {
+          const employeeRows = await (window as any).__supabaseLoadPayEmployeeEntries();
+          const employeeIds = new Set((employeeRows || []).map((row: any) => String(row.id)));
+          Store.data.entries = Store.data.entries.filter((entry: any) =>
+            !entry.supabase_pay_employee_id || employeeIds.has(String(entry.supabase_pay_employee_id))
+          );
+          const normalize = (value: any) => String(value || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+          for (const row of employeeRows || []) {
+            const employeeName = normalize(row.employee_name);
+            const accountName = normalize(row.paid_from);
+            const reference = normalize(row.reference_no || row.utr_cheque_ref);
+            const amount = Math.abs(Number(row.amount) || 0);
+            const matchingEntries = Store.data.entries.filter((entry: any) => {
+              if (entry.type !== 'outflow' || String(entry.date || '').slice(0, 10) !== String(row.payment_date || '').slice(0, 10)) return false;
+              const entryParty = normalize(entry.partyName || api.get('parties', entry.partyId)?.name);
+              const entryAccount = normalize(entry.accountName || api.get('accounts', entry.accountId)?.name);
+              if (entryParty !== employeeName || (accountName && entryAccount !== accountName)) return false;
+              if (reference && normalize(entry.refNo || entry.txnRef) !== reference) return false;
+              return Math.abs(Math.abs(Number(entry.amount) || 0) - amount) < 0.01;
+            });
+            const entry = Store.data.entries.find((candidate: any) =>
+              String(candidate.supabase_pay_employee_id || '') === String(row.id)
+            ) || (matchingEntries.length === 1 ? matchingEntries[0] : null);
+            if (!entry) continue;
+            entry.supabase_pay_employee_id = row.id;
+            entry.attachments = formAttachmentsFromValue(
+              row.attachment_url,
+              'pay an employee attachment',
+              `employee_attachment_${row.id}`
+            );
           }
         }
         if (typeof (window as any).__supabaseLoadOtherExpenseEntries === 'function') {
@@ -1585,6 +2016,85 @@ export const App: React.FC = () => {
             else Store.data.entries.unshift(entryRecord);
           }
         }
+        if (typeof (window as any).__supabaseLoadPayVendorEntries === 'function') {
+          try {
+            const rows = await (window as any).__supabaseLoadPayVendorEntries();
+            const normalize = (value: any) => String(value || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+            for (const row of rows || []) {
+              const vendorName = normalize(row.vendor_name);
+              const accountName = normalize(row.paid_from);
+              const reference = normalize(row.bill_number || row.utr_cheque_reference);
+              const amount = Math.abs(Number(row.amount_paid ?? row.net_cash_paid) || 0);
+              const matches = Store.data.entries.filter((entry: any) => {
+                if (entry.type !== 'outflow' || String(entry.date || '').slice(0, 10) !== String(row.payment_date || '').slice(0, 10)) return false;
+                const entryVendor = normalize(entry.partyName || api.get('parties', entry.partyId)?.name);
+                const entryAccount = normalize(entry.accountName || api.get('accounts', entry.accountId)?.name);
+                if (entryVendor !== vendorName || (accountName && entryAccount !== accountName)) return false;
+                if (reference && normalize(entry.refNo || entry.txnRef) !== reference) return false;
+                return Math.abs(Math.abs(Number(entry.amount) || 0) - amount) < 0.01;
+              });
+              const entry = Store.data.entries.find((candidate: any) => String(candidate.supabase_pay_vendor_id || '') === String(row.id))
+                || (matches.length === 1 ? matches[0] : null);
+              if (!entry) continue;
+              entry.supabase_pay_vendor_id = row.id;
+              entry.attachments = formAttachmentsFromValue(
+                row.attachments,
+                'pay a vendor attachment',
+                `vendor_attachment_${row.id}`
+              );
+            }
+          } catch (attachmentLoadError: any) {
+            console.warn('Could not load Pay a Vendor attachment metadata:', attachmentLoadError);
+            payVendorAttachmentLoadError = attachmentLoadError?.message || 'Could not load Pay a Vendor attachments from Supabase.';
+          }
+        }
+        for (const deletedEntry of deletedEntrySnapshots) {
+          const currentEntry = Store.data.entries.find((entry: any) =>
+            String(entry.id) === String(deletedEntry.id) ||
+            (deletedEntry.supabase_id && String(entry.supabase_id || '') === String(deletedEntry.supabase_id)) ||
+            Object.keys(deletedEntry).some(key =>
+              key.startsWith('supabase_') &&
+              deletedEntry[key] &&
+              String(entry[key] || '') === String(deletedEntry[key])
+            )
+          );
+          if (currentEntry) {
+            Object.assign(currentEntry, {
+              deleted: true,
+              deletedBy: deletedEntry.deletedBy,
+              deletedAt: deletedEntry.deletedAt
+            });
+          } else {
+            Store.data.entries.push(deletedEntry);
+          }
+        }
+        const cancelledIds = new Set(cancelledTransactions.map((transaction: any) => String(transaction.id)));
+        const activeIds = new Set(supabaseTransactions.map((transaction: any) => String(transaction.id)));
+        const normalize = (value: any) => String(value || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+        Store.data.entries = Store.data.entries.filter((entry: any) => {
+          const entryId = String(entry.supabase_id || String(entry.id || '').replace(/^e_/, ''));
+          if (cancelledIds.has(entryId) || activeIds.has(entryId)) {
+            return cancelledIds.has(entryId) ? Boolean(entry.deleted) : true;
+          }
+          const entryDate = String(entry.date || '').slice(0, 10);
+          const entryType = String(entry.type || '').toLowerCase();
+          const entryCategory = normalize(api.get('categories', entry.categoryId)?.name || entry.categoryName || entry.category);
+          const entryParty = normalize(entry.partyName || api.get('parties', entry.partyId)?.name);
+          const entryAccount = normalize(entry.accountName || api.get('accounts', entry.accountId)?.name);
+          const entryProject = api.get('projects', entry.projectId);
+          const entryProjectCode = normalize(entry.projectCode || entryProject?.code);
+          const entryTaxable = Number(entry.taxable ?? entry.amount);
+          return !cancelledTransactions.some((transaction: any) => {
+            if (String(transaction.transaction_date || '').slice(0, 10) !== entryDate) return false;
+            if (String(transaction.transaction_type || '').toLowerCase() !== entryType) return false;
+            if (normalize(transaction.party_name) !== entryParty || !entryParty) return false;
+            if (normalize(transaction.account_name) !== entryAccount || !entryAccount) return false;
+            if (!Number.isFinite(entryTaxable) || Math.abs(Number(transaction.taxable_amount) - entryTaxable) >= 0.01) return false;
+            if (entryCategory && normalize(transaction.category) !== entryCategory) return false;
+            if (entryProjectCode && normalize(transaction.project_code) !== entryProjectCode) return false;
+            return Boolean(entryCategory || entryProjectCode);
+          }) || Boolean(entry.deleted);
+        });
         refreshCashflowEntriesFromStore();
         const wasHydratingSupabase = isHydratingSupabase.current;
         isHydratingSupabase.current = true;
@@ -1594,6 +2104,7 @@ export const App: React.FC = () => {
           isHydratingSupabase.current = wasHydratingSupabase;
         }
         render({ keepScroll: true });
+        void syncCreditedDebitedFromEntries(Store.data?.entries || []);
       }
 
       setCloudStatus(prev => ({
@@ -1602,7 +2113,7 @@ export const App: React.FC = () => {
         syncing: false,
         transactionCount: supabaseTransactions.length,
         lastSynced: new Date().toLocaleTimeString(),
-        error: null
+        error: payVendorAttachmentLoadError
       }));
     } catch (err: any) {
       console.error('Error syncing Supabase transactions:', err);
@@ -1626,7 +2137,8 @@ export const App: React.FC = () => {
         console.warn(cashflowLoadWarning);
         return [];
       });
-      let [result, peopleRows, peopleReport, projectCostRows, capexRows, financingAndOwnerRows, officeFixedRows, officeVariableRows, travelRows, professionalAdminRows, taxStatutoryRows, cashOutflowSummaryRows, cashflowStatementRows] = await Promise.all([
+      const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
+      let [result, peopleRows, peopleReport, projectCostRows, capexRows, financingAndOwnerRows, officeFixedRows, officeVariableRows, travelRows, professionalAdminRows, taxStatutoryRows, cashOutflowSummaryRows, cashflowStatementRows, byAccountCreditedDebitedRows] = await Promise.all([
         SupabaseService.loadAllCashflowInflowFromSupabase(),
         SupabaseService.loadPeopleFromSupabase(),
         SupabaseService.loadPeopleReportFromSupabase(),
@@ -1639,11 +2151,11 @@ export const App: React.FC = () => {
         SupabaseService.loadProfessionalAdminFromSupabase(),
         SupabaseService.loadTaxStatutoryFromSupabase(),
         SupabaseService.loadCashOutflowSummaryFromSupabase(),
-        SupabaseService.loadCashflowStatementFromSupabase()
+        SupabaseService.loadCashflowStatementFromSupabase(),
+        SupabaseService.loadByAccountCreditedDebitedFromSupabase(currentFy)
       ]);
 
       // If tables are empty in Supabase, auto-seed with computed local UI cashflow
-      const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
       if (
         !opts.skipAutoSeed &&
         result.operationReceipts.length === 0 &&
@@ -1971,6 +2483,8 @@ export const App: React.FC = () => {
         Store.data.fss_outflow_tax_statutory = finalTaxStatutoryRows;
         Store.data.fss_cash_outflow = cashOutflowSummaryRows;
         Store.data.fss_cash_flow_statement = cashflowStatementRows;
+        // Use By Account – Credited & Debited loaded directly from Supabase
+        Store.data.fss_by_account_credited_debited = byAccountCreditedDebitedRows;
 
         // Auto-heal if Supabase ever differs from UI (e.g. outdated fy_to_date, share, or jan_26 > 0)
         const computed = Store.data?.entries
@@ -2036,6 +2550,7 @@ export const App: React.FC = () => {
         }
 
         render({ keepScroll: true });
+        void syncCreditedDebitedFromEntries(Store.data?.entries || []);
       }
 
       setCloudStatus(prev => ({
@@ -2092,6 +2607,14 @@ export const App: React.FC = () => {
   useEffect(() => {
     let mounted = true;
     let cashflowDebounceTimer: any = null;
+    let auditRealtimeChannel: any = null;
+    (window as any).__reportAccountSummarySyncError = (error: any) => {
+      if (!mounted) return;
+      setCloudStatus(prev => ({
+        ...prev,
+        error: error?.message || String(error) || 'Account totals could not be synchronized.'
+      }));
+    };
     // Set when a Supabase-backed Cashflow write (e.g. Project Costs cell update) has just been applied,
     // so the auto re-sync from local entries does not overwrite the freshly saved Supabase value.
     let cashflowSyncSuppress = false;
@@ -2113,6 +2636,56 @@ export const App: React.FC = () => {
         }));
         return;
       }
+
+      (window as any).__writeSupabaseAuditLog = async (event: any) => {
+        const identity = await SupabaseService.getAuditIdentity();
+        const row = await SupabaseService.insertAuditLog({
+          ...identity,
+          action: String(event.action),
+          record_type: String(event.entity),
+          record_id: String(event.entityId || ''),
+          summary: String(event.summary || ''),
+          changes: event.changes || {},
+          created_at: String(event.ts || new Date().toISOString())
+        });
+        if (Store.data) {
+          Store.data.audit = [row, ...(Store.data.audit || []).filter((item: any) => item.id !== row.id)]
+            .sort((a: any, b: any) => String(b.ts || '').localeCompare(String(a.ts || '')));
+          render({ keepScroll: true });
+        }
+        return row;
+      };
+      const refreshSupabaseAuditLogs = async () => {
+        try {
+          const auditRows = await SupabaseService.loadAuditLogs();
+          if (Store.data) {
+            Store.data.audit = auditRows;
+            Store.data.auditLoadError = '';
+            Store.persist();
+            render({ keepScroll: true });
+          }
+          return auditRows;
+        } catch (error) {
+          console.error('Could not refresh Supabase audit logs:', error);
+          if (Store.data) {
+            Store.data.auditLoadError = error instanceof Error ? error.message : String(error);
+            render({ keepScroll: true });
+          }
+          setCloudStatus(prev => ({
+            ...prev,
+            error: error instanceof Error ? error.message : String(error)
+          }));
+          return null;
+        }
+      };
+      (window as any).__refreshSupabaseAuditLogs = refreshSupabaseAuditLogs;
+      (window as any).__supabaseDeleteAuditLog = async (id: string) => {
+        await SupabaseService.deleteAuditLog(id);
+        if (Store.data) {
+          Store.data.audit = (Store.data.audit || []).filter((item: any) => String(item.id) !== String(id));
+          render({ keepScroll: true });
+        }
+      };
 
       // 2. Register global Supabase client saver for the core UI form
       (window as any).__supabaseSaveClient = async (companyData: any, peopleArray: any[], taxData: any) => {
@@ -2164,15 +2737,71 @@ export const App: React.FC = () => {
       (window as any).__supabaseSavePayVendorEntry = async (entry: any, rowId?: string, idempotencyKey?: string) => {
         if (!isSupabaseConfigured) throw new Error('Supabase is not configured; vendor payment was not saved to the cloud.');
         const row = await SupabaseService.savePayVendorEntry(entry, rowId, idempotencyKey);
-        setCloudStatus(prev => ({ ...prev, lastSynced: new Date().toLocaleTimeString(), error: null }));
+        if (row?.id && Store.data?.supabaseTransactionIds) {
+          Store.data.supabaseTransactionIds = Array.from(new Set([...Store.data.supabaseTransactionIds, String(row.id)]));
+        }
+        refreshCashflowEntriesFromStore();
+        void syncCreditedDebitedFromEntries(Store.data?.entries || []);
+        setCloudStatus(prev => ({
+          ...prev,
+          transactionCount: (prev.transactionCount || 0) + (rowId ? 0 : 1),
+          lastSynced: new Date().toLocaleTimeString(),
+          error: null
+        }));
+        await refreshSupabaseAuditLogs();
         return row;
       };
       (window as any).__fssQueryTransactions = (filters: any) => SupabaseService.queryFssTransactions(filters);
-      (window as any).__fssDeleteTransaction = (id: string) => SupabaseService.deleteFssTransaction(id);
+      (window as any).__fssDeleteTransaction = async (id: string) => {
+        await SupabaseService.deleteFssTransaction(id);
+        (window as any).__excludeLedgerTransactionFromSummary?.(id);
+        if (Store.data?.entries) {
+          Store.data.entries = Store.data.entries.filter((e: any) =>
+            String(e.supabase_id || '') !== String(id) && String(e.id || '') !== String(id)
+          );
+          Store.persist();
+        }
+        await syncCreditedDebitedFromEntries(Store.data?.entries || []);
+        await refreshSupabaseAuditLogs();
+        render({ keepScroll: true });
+      };
       (window as any).__fssOpenTransactionModal = (transaction: any | null) => {
         setFssTransactionToEdit(transaction);
         setIsFssTransactionModalOpen(true);
       };
+      (window as any).__computeByAccountCreditedDebitedRows = computeByAccountCreditedDebitedRows;
+
+      const syncUiTransactionsToSupabase = async (opts?: { force?: boolean }) => {
+        if (!isSupabaseConfigured) {
+          (window as any).IuovaCore?.toast?.('Supabase is not configured', 'bad');
+          return { success: false, total: 0, inserted: 0 };
+        }
+        const entries = Store.data?.entries || [];
+        const valid = entries.filter((e: any) => e.date && !e.deleted && e.type !== 'transfer');
+        (window as any).IuovaCore?.toast?.(`Storing ${valid.length} transactions into Supabase fss_transactions...`);
+
+        const res = await SupabaseService.syncUiTransactionsToFssTransactions(entries, {
+          force: opts?.force ?? true,
+          onProgress: (msg) => {
+            console.log(msg);
+          }
+        });
+
+        if (res.success) {
+          (window as any).IuovaCore?.toast?.(`✓ Successfully stored ${res.inserted || valid.length} transactions in Supabase table fss_transactions!`, 'good');
+          setCloudStatus(prev => ({
+            ...prev,
+            connected: true,
+            transactionCount: Math.max(prev.transactionCount || 0, res.inserted || valid.length),
+            lastSynced: new Date().toLocaleTimeString()
+          }));
+        } else {
+          (window as any).IuovaCore?.toast?.(`Failed to store transactions: ${res.error || 'Unknown error'}`, 'bad');
+        }
+        return res;
+      };
+      (window as any).syncUiTransactionsToSupabase = syncUiTransactionsToSupabase;
+      (window as any).__syncUiTransactionsToSupabase = syncUiTransactionsToSupabase;
       if (S.page === 'ledger') {
         void (window as any).IuovaCore?.refreshLedgerFromSupabase?.();
       }
@@ -2181,19 +2810,40 @@ export const App: React.FC = () => {
       (window as any).__supabaseDeletePayVendorEntry = (id: string) => SupabaseService.deletePayVendorEntry(id);
       (window as any).__supabaseUploadPayVendorAttachments = (files: File[]) => SupabaseService.uploadPayVendorAttachments(files);
       (window as any).__supabaseDeletePayVendorAttachments = (paths: string[]) => SupabaseService.deletePayVendorAttachments(paths);
-      (window as any).__supabaseUploadFormAttachments = (bucket: string, files: File[]) => SupabaseService.uploadFormAttachments(bucket, files);
-      (window as any).__supabaseDeleteFormAttachments = (bucket: string, paths: string[]) => SupabaseService.deleteFormAttachments(bucket, paths);
+      (window as any).__supabaseUploadFormAttachments = (bucket: any, files: File[]) => SupabaseService.uploadFormAttachments(bucket, files);
+      (window as any).__supabaseDeleteFormAttachments = (bucket: any, paths: string[]) => SupabaseService.deleteFormAttachments(bucket, paths);
 
       (window as any).__supabaseSavePayEmployeeEntry = async (entry: any, rowId?: string) => {
         if (!isSupabaseConfigured) throw new Error('Supabase is not configured; employee payment was not saved to the cloud.');
         const row = await SupabaseService.savePayEmployeeEntry(entry, rowId);
-        setCloudStatus(prev => ({ ...prev, lastSynced: new Date().toLocaleTimeString(), error: null }));
+        if (row?.id && Store.data?.supabaseTransactionIds) {
+          Store.data.supabaseTransactionIds = Array.from(new Set([...Store.data.supabaseTransactionIds, String(row.id)]));
+        }
+        refreshCashflowEntriesFromStore();
+        void syncCreditedDebitedFromEntries(Store.data?.entries || []);
+        setCloudStatus(prev => ({
+          ...prev,
+          transactionCount: (prev.transactionCount || 0) + (rowId ? 0 : 1),
+          lastSynced: new Date().toLocaleTimeString(),
+          error: null
+        }));
         return row;
       };
+      (window as any).__supabaseLoadPayEmployeeEntries = () => SupabaseService.loadPayEmployeeEntries();
       (window as any).__supabaseSaveTaxStatutoryEntry = async (entry: any, rowId?: string) => {
         if (!isSupabaseConfigured) throw new Error('Supabase is not configured; tax payment was not saved to the cloud.');
         const row = await SupabaseService.saveTaxStatutoryEntry(entry, rowId);
-        setCloudStatus(prev => ({ ...prev, lastSynced: new Date().toLocaleTimeString(), error: null }));
+        if (row?.id && Store.data?.supabaseTransactionIds) {
+          Store.data.supabaseTransactionIds = Array.from(new Set([...Store.data.supabaseTransactionIds, String(row.id)]));
+        }
+        refreshCashflowEntriesFromStore();
+        void syncCreditedDebitedFromEntries(Store.data?.entries || []);
+        setCloudStatus(prev => ({
+          ...prev,
+          transactionCount: (prev.transactionCount || 0) + (rowId ? 0 : 1),
+          lastSynced: new Date().toLocaleTimeString(),
+          error: null
+        }));
         return row;
       };
       (window as any).__supabaseLoadTaxStatutoryEntries = () => SupabaseService.loadTaxStatutoryEntries();
@@ -2201,7 +2851,17 @@ export const App: React.FC = () => {
       (window as any).__supabaseSaveOtherExpenseEntry = async (entry: any, rowId?: string) => {
         if (!isSupabaseConfigured) throw new Error('Supabase is not configured; other expense was not saved to the cloud.');
         const row = await SupabaseService.saveOtherExpenseEntry(entry, rowId);
-        setCloudStatus(prev => ({ ...prev, lastSynced: new Date().toLocaleTimeString(), error: null }));
+        if (row?.id && Store.data?.supabaseTransactionIds) {
+          Store.data.supabaseTransactionIds = Array.from(new Set([...Store.data.supabaseTransactionIds, String(row.id)]));
+        }
+        refreshCashflowEntriesFromStore();
+        void syncCreditedDebitedFromEntries(Store.data?.entries || []);
+        setCloudStatus(prev => ({
+          ...prev,
+          transactionCount: (prev.transactionCount || 0) + (rowId ? 0 : 1),
+          lastSynced: new Date().toLocaleTimeString(),
+          error: null
+        }));
         return row;
       };
       (window as any).__supabaseLoadOtherExpenseEntries = () => SupabaseService.loadOtherExpenseEntries();
@@ -2209,7 +2869,17 @@ export const App: React.FC = () => {
       (window as any).__supabaseSaveClientPaymentEntry = async (entry: any, rowId?: string) => {
         if (!isSupabaseConfigured) throw new Error('Supabase is not configured; client payment was not saved to the cloud.');
         const row = await SupabaseService.saveClientPaymentEntry(entry, rowId);
-        setCloudStatus(prev => ({ ...prev, lastSynced: new Date().toLocaleTimeString(), error: null }));
+        if (row?.id && Store.data?.supabaseTransactionIds) {
+          Store.data.supabaseTransactionIds = Array.from(new Set([...Store.data.supabaseTransactionIds, String(row.id)]));
+        }
+        refreshCashflowEntriesFromStore();
+        void syncCreditedDebitedFromEntries(Store.data?.entries || []);
+        setCloudStatus(prev => ({
+          ...prev,
+          transactionCount: (prev.transactionCount || 0) + (rowId ? 0 : 1),
+          lastSynced: new Date().toLocaleTimeString(),
+          error: null
+        }));
         return row;
       };
       (window as any).__supabaseLoadClientPaymentEntries = () => SupabaseService.loadClientPaymentEntries();
@@ -2219,7 +2889,17 @@ export const App: React.FC = () => {
       (window as any).__supabaseSaveOtherIncomeEntry = async (entry: any, rowId?: string) => {
         if (!isSupabaseConfigured) throw new Error('Supabase is not configured; other income was not saved to the cloud.');
         const row = await SupabaseService.saveOtherIncomeEntry(entry, rowId);
-        setCloudStatus(prev => ({ ...prev, lastSynced: new Date().toLocaleTimeString(), error: null }));
+        if (row?.id && Store.data?.supabaseTransactionIds) {
+          Store.data.supabaseTransactionIds = Array.from(new Set([...Store.data.supabaseTransactionIds, String(row.id)]));
+        }
+        refreshCashflowEntriesFromStore();
+        void syncCreditedDebitedFromEntries(Store.data?.entries || []);
+        setCloudStatus(prev => ({
+          ...prev,
+          transactionCount: (prev.transactionCount || 0) + (rowId ? 0 : 1),
+          lastSynced: new Date().toLocaleTimeString(),
+          error: null
+        }));
         return row;
       };
       (window as any).__supabaseLoadOtherIncomeEntries = () => SupabaseService.loadOtherIncomeEntries();
@@ -2568,6 +3248,11 @@ export const App: React.FC = () => {
             if (taxStatutorySynced) {
               Store.data.fss_outflow_tax_statutory = taxStatutorySynced.taxStatutory;
             }
+            try {
+              await syncCreditedDebitedFromEntries(entriesList);
+            } catch (cdErr) {
+              console.warn('By Account Credited & Debited sync failed in doSyncCashflowInflow:', cdErr);
+            }
             // Suppress sync loop when updating local store with synced data
             isSyncingCashflow = true;
             try {
@@ -2650,8 +3335,63 @@ export const App: React.FC = () => {
         }, 200);
       };
 
+      (window as any).__supabaseSaveAccountTransfer = async (
+        entry: any,
+        transferId: string | number | null,
+        auditAction: string = transferId ? 'update' : 'create',
+        auditBefore: any = null
+      ) => {
+        if (!isSupabaseConfigured) throw new Error('Supabase is not configured; account transfers cannot be saved offline.');
+        const row = await SupabaseService.saveAccountTransfer(
+          entry,
+          transferId,
+          Store.data?.accounts || []
+        );
+        setCloudStatus(prev => ({
+          ...prev,
+          connected: true,
+          transactionCount: (prev.transactionCount || 0) + (transferId ? 0 : 1),
+          lastSynced: new Date().toLocaleTimeString(),
+          error: null
+        }));
+        await recordSupabaseAudit(
+          auditAction,
+          'entries',
+          row.id,
+          transactionAuditSummary(row),
+          auditBefore,
+          row
+        );
+        return row;
+      };
+      (window as any).__supabaseSetAccountTransferDeleted = async (id: string | number, deleted: boolean) => {
+        if (!isSupabaseConfigured) throw new Error('Supabase is not configured.');
+        const deletedBy = deleted ? String(Store.data?.settings?.currentUserId || '') || null : null;
+        const entry = Store.data?.entries?.find((candidate: any) =>
+          String(candidate.supabase_id || candidate.id) === String(id)
+        );
+        const before = entry ? { ...entry, deleted: !deleted, status: deleted ? 'Active' : 'Cancelled' } : null;
+        const result = await SupabaseService.setAccountTransferDeleted(id, deleted, deletedBy);
+        if (result) {
+          const after = entry ? { ...entry, deleted, status: deleted ? 'Cancelled' : 'Active' } : null;
+          await recordSupabaseAudit(
+            deleted ? 'delete' : 'restore',
+            'entries',
+            id,
+            transactionAuditSummary(entry || {}),
+            before,
+            after
+          );
+        }
+        return result;
+      };
+
       // 12. Register global Supabase transaction saver for the core UI form
-      (window as any).__supabaseSaveTransaction = async (entryData: any) => {
+      (window as any).__supabaseSaveTransaction = async (
+        entryData: any,
+        auditAction?: string,
+        auditBefore: any = null
+      ) => {
         if (!isSupabaseConfigured) {
           console.warn('Supabase is not configured yet in .env; saving in local offline mode.');
           return null;
@@ -2667,6 +3407,16 @@ export const App: React.FC = () => {
             Store.data?.accounts || []
           );
           if (res) {
+            const action = auditAction || (entryData.supabase_id || entryData.supabase_fss_transaction_id ? 'update' : 'create');
+            await recordSupabaseAudit(
+              action,
+              'entries',
+              res.id,
+              transactionAuditSummary(res),
+              auditBefore,
+              res
+            );
+            (window as any).__includeLedgerTransactionInSummary?.(res.id || entryData.supabase_id || entryData.id);
             const localEntry = Store.data?.entries?.find((entry: any) => entry.id === entryData.id);
             if (localEntry) {
               localEntry.supabase_id = res.id;
@@ -2683,46 +3433,52 @@ export const App: React.FC = () => {
           }
         } catch (e) {
           console.warn('saveTransaction error in fss_table_transactions:', e);
+          const message = e instanceof Error ? e.message : 'Unknown Supabase error';
+          (window as any).IuovaCore?.toast(`Transaction saved locally, but Supabase sync failed: ${message}`, 'error');
+          throw e;
         }
 
-        // Persist Capex immediately from the same live entries used by the UI.
-        // The broader cashflow sync still runs in the background, but Capex must
-        // not wait behind unrelated tables or leave November stale.
-        try {
+        // The canonical transaction is saved. Derived summaries can sync after
+        // the form closes instead of making the user wait for several extra writes.
+        void (async () => {
           const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
-          const capexComputed = computeCashflowOutflowCapexRows(Store.data?.cashflowEntries || Store.data?.entries || [], currentFy);
+          const liveEntries = Store.data?.cashflowEntries || Store.data?.entries || [];
+          const [capexComputed, projectCostComputed] = await Promise.all([
+            Promise.resolve(computeCashflowOutflowCapexRows(liveEntries, currentFy)),
+            Promise.resolve(computeCashflowOutflowProjectCostRows(liveEntries, currentFy))
+          ]);
           if (capexComputed) {
-            await SupabaseService.syncCapex2ToSupabase(capexComputed.rows);
-            const capexSynced = await SupabaseService.syncCapexToSupabase(capexComputed.rows);
-            if (Store.data) {
-              Store.data.fss_outflow_capex = capexSynced.capex;
-              Store.persist();
+            try {
+              await SupabaseService.syncCapex2ToSupabase(capexComputed.rows);
+              const capexSynced = await SupabaseService.syncCapexToSupabase(capexComputed.rows);
+              if (Store.data) {
+                Store.data.fss_outflow_capex = capexSynced.capex;
+                Store.persist();
+              }
+            } catch (error) {
+              console.warn('Capex sync failed:', error);
             }
           }
-        } catch (capexErr) {
-          console.warn('Capex sync failed:', capexErr);
-        }
-        // Persist Project Costs immediately from the same live entries used by the UI.
-        try {
-          const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
-          const projectCostComputed = computeCashflowOutflowProjectCostRows(Store.data?.cashflowEntries || Store.data?.entries || [], currentFy);
           if (projectCostComputed) {
-            await SupabaseService.syncProjectCost2ToSupabase(projectCostComputed.rows);
-            const projectCostSynced = await SupabaseService.syncProjectCostToSupabase(projectCostComputed.rows);
-            if (Store.data) {
-              Store.data.fss_outflow_project_cost = projectCostSynced.projectCost;
-              Store.persist();
+            try {
+              await SupabaseService.syncProjectCost2ToSupabase(projectCostComputed.rows);
+              const projectCostSynced = await SupabaseService.syncProjectCostToSupabase(projectCostComputed.rows);
+              if (Store.data) {
+                Store.data.fss_outflow_project_cost = projectCostSynced.projectCost;
+                Store.persist();
+              }
+            } catch (error) {
+              console.warn('Project Costs sync failed:', error);
             }
           }
-        } catch (projectCostErr) {
-          console.warn('Project Costs sync failed:', projectCostErr);
-        }
-
-        // Do not block the entry form on the full cashflow sync. The entry is already
-        // saved locally and the UI can render it immediately; Supabase tables catch up
-        // in the background, including Travel and Employee Reimbursements.
-        void triggerCashflowSync().catch((e: any) => {
-          console.warn('Cashflow sync failed:', e);
+          try {
+            await syncCreditedDebitedFromEntries(Store.data?.entries || []);
+          } catch (error) {
+            console.warn('By Account Credited & Debited sync failed in saveTransaction:', error);
+          }
+          await triggerCashflowSync();
+        })().catch((error: any) => {
+          console.warn('Background transaction summary sync failed:', error);
         });
 
         return res;
@@ -2731,17 +3487,34 @@ export const App: React.FC = () => {
       (window as any).__supabaseCancelTransaction = async (idOrSupabaseId: string | number, entry?: any) => {
         if (!isSupabaseConfigured) return false;
         const res = await SupabaseService.cancelTransaction(idOrSupabaseId, entry);
-        try {
-          await triggerCashflowSync();
-        } catch (e) {
-          console.warn('Cashflow sync failed:', e);
-        }
+        if (!res) throw new Error('Failed to cancel transaction in Supabase.');
+        const before = entry ? { ...entry, deleted: false, status: 'Active' } : null;
+        const after = entry ? { ...entry, deleted: true, status: 'Cancelled' } : null;
+        await recordSupabaseAudit(
+          'delete',
+          'entries',
+          entry?.supabase_id || idOrSupabaseId,
+          transactionAuditSummary(entry || {}),
+          before,
+          after
+        );
+        (window as any).__excludeLedgerTransactionFromSummary?.(idOrSupabaseId);
+        void syncCreditedDebitedFromEntries(Store.data?.entries || []).catch(error => {
+          console.warn('By Account Credited & Debited sync failed after transaction cancellation:', error);
+        });
+        void triggerCashflowSync().catch(error => {
+          console.warn('Cashflow sync failed after transaction cancellation:', error);
+        });
         return res;
       };
 
-      (window as any).__supabaseDeleteTransaction = async (idOrSupabaseId: string | number, entry?: any) => {
-        if (!isSupabaseConfigured) return false;
-        if (entry?.type === 'outflow' && entry?.date) {
+      (window as any).__supabaseDeleteTransaction = async (
+        idOrSupabaseId: string | number,
+        entry?: any,
+        options: { skipRefresh?: boolean } = {}
+      ) => {
+        if (!isSupabaseConfigured) return true;
+        if (!options.skipRefresh && (entry?.type === 'outflow' || entry?.type === 'inflow') && entry?.date) {
           const categoryName = String(api.get('categories', entry.categoryId)?.name || entry.category || '')
             .toLowerCase().replace(/[â€“â€”]/g, '-').replace(/\s+/g, ' ').trim();
           const month = String(entry.date).slice(0, 7);
@@ -2756,7 +3529,7 @@ export const App: React.FC = () => {
         // Purging removes the entry from the local list, so no deleted tombstone remains
         // to invalidate the cached People aggregate. Recompute that category/month from
         // the remaining local transactions immediately to avoid showing a stale value.
-        if (entry?.type === 'outflow' && entry?.date && Store.data?.fss_outflow_oc_people) {
+        if (!options.skipRefresh && entry?.type === 'outflow' && entry?.date && Store.data?.fss_outflow_oc_people) {
           const monthNumber = String(entry.date).slice(5, 7);
           const monthCol = ({
             '01': 'jan_26', '02': 'feb_26', '03': 'mar_26', '04': 'apr_26',
@@ -2796,19 +3569,38 @@ export const App: React.FC = () => {
           }
         }
         const ok = await SupabaseService.deleteTransaction(idOrSupabaseId, entry);
+        if (!ok) throw new Error('Failed to delete transaction from Supabase.');
         if (ok) {
-          setCloudStatus(prev => ({
-            ...prev,
-            transactionCount: Math.max(0, (prev.transactionCount || 1) - 1),
-            lastSynced: new Date().toLocaleTimeString()
-          }));
+          await recordSupabaseAudit(
+            'purge',
+            'entries',
+            entry?.supabase_id || idOrSupabaseId,
+            `Permanently deleted · ${transactionAuditSummary(entry || {})}`,
+            entry,
+            null
+          );
+          (window as any).__excludeLedgerTransactionFromSummary?.(idOrSupabaseId);
+          if (!options.skipRefresh) {
+            setCloudStatus(prev => ({
+              ...prev,
+              transactionCount: Math.max(0, (prev.transactionCount || 1) - 1),
+              lastSynced: new Date().toLocaleTimeString()
+            }));
+          }
         }
-        try {
-          await triggerCashflowSync();
-        } catch (e) {
-          console.warn('Cashflow sync failed:', e);
+        if (!options.skipRefresh) {
+          await syncCreditedDebitedFromEntries(Store.data?.entries || []);
+          try {
+            await triggerCashflowSync();
+          } catch (e) {
+            console.warn('Cashflow sync failed:', e);
+          }
         }
         return ok;
+      };
+      (window as any).__supabaseRefreshAfterTransactionPurge = async () => {
+        await syncCreditedDebitedFromEntries(Store.data?.entries || []);
+        await triggerCashflowSync();
       };
 
       (window as any).__supabaseFetchCashflowInflow = async () => {
@@ -3240,6 +4032,114 @@ export const App: React.FC = () => {
         }
       };
 
+      // By Account – Credited & Debited handlers
+      (window as any).__loadByAccountCreditedDebited = async () => {
+        if (!isSupabaseConfigured) return [];
+        try {
+          const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
+          const rows = await SupabaseService.loadByAccountCreditedDebitedFromSupabase(currentFy);
+          if (Store.data) {
+            Store.data.fss_by_account_credited_debited = rows;
+            Store.persist();
+          }
+          render({ keepScroll: true });
+          return rows;
+        } catch (err: any) {
+          console.error('Error in __loadByAccountCreditedDebited:', err);
+          throw err;
+        }
+      };
+
+      (window as any).__updateByAccountCreditedDebitedCell = async (id: number | string, monthCol: string, newValue: number | string | null) => {
+        if (!isSupabaseConfigured) return null;
+        setCloudStatus(prev => ({ ...prev, syncing: true, error: null }));
+        try {
+          const numVal = (newValue === '' || newValue === null || newValue === undefined || isNaN(Number(newValue))) ? null : Number(newValue);
+          const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
+          const allRows = await SupabaseService.updateByAccountCreditedDebitedCell(id, monthCol, numVal, currentFy);
+          if (Store.data) {
+            Store.data.fss_by_account_credited_debited = allRows;
+            Store.persist();
+          }
+          setCloudStatus(prev => ({
+            ...prev,
+            syncing: false,
+            lastSynced: new Date().toLocaleTimeString(),
+            error: null
+          }));
+          render({ keepScroll: true });
+          return allRows;
+        } catch (err: any) {
+          console.error('Error in __updateByAccountCreditedDebitedCell:', err);
+          setCloudStatus(prev => ({ ...prev, syncing: false, error: err.message }));
+          throw err;
+        }
+      };
+
+      (window as any).__insertByAccountCreditedDebited = async (accountName: string) => {
+        if (!isSupabaseConfigured) return null;
+        setCloudStatus(prev => ({ ...prev, syncing: true, error: null }));
+        try {
+          const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
+          const allRows = await SupabaseService.insertByAccountCreditedDebited(accountName, currentFy);
+          if (Store.data) {
+            Store.data.fss_by_account_credited_debited = allRows;
+            Store.persist();
+          }
+          setCloudStatus(prev => ({
+            ...prev,
+            syncing: false,
+            lastSynced: new Date().toLocaleTimeString(),
+            error: null
+          }));
+          render({ keepScroll: true });
+          return allRows;
+        } catch (err: any) {
+          console.error('Error in __insertByAccountCreditedDebited:', err);
+          setCloudStatus(prev => ({ ...prev, syncing: false, error: err.message }));
+          throw err;
+        }
+      };
+
+      (window as any).__deleteByAccountCreditedDebited = async (accountName: string) => {
+        if (!isSupabaseConfigured) return null;
+        setCloudStatus(prev => ({ ...prev, syncing: true, error: null }));
+        try {
+          const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
+          const allRows = await SupabaseService.deleteByAccountCreditedDebited(accountName, currentFy);
+          if (Store.data) {
+            Store.data.fss_by_account_credited_debited = allRows;
+            Store.persist();
+          }
+          setCloudStatus(prev => ({
+            ...prev,
+            syncing: false,
+            lastSynced: new Date().toLocaleTimeString(),
+            error: null
+          }));
+          render({ keepScroll: true });
+          return allRows;
+        } catch (err: any) {
+          console.error('Error in __deleteByAccountCreditedDebited:', err);
+          setCloudStatus(prev => ({ ...prev, syncing: false, error: err.message }));
+          throw err;
+        }
+      };
+
+      (window as any).__syncByAccountCreditedDebited = async () => {
+        if (!isSupabaseConfigured) return null;
+        try {
+          await syncCreditedDebitedFromEntries(Store.data?.entries || []);
+          const rows = Store.data?.fss_by_account_credited_debited || [];
+          render({ keepScroll: true });
+          return rows;
+        } catch (err: any) {
+          console.warn('Error in __syncByAccountCreditedDebited:', err);
+          setCloudStatus(prev => ({ ...prev, error: err?.message || 'Account totals could not be synchronized.' }));
+        }
+        return null;
+      };
+
       // Delete handlers for Cash Outflow (fss_outflow_*) tables
       const registerOutflowDelete = (globalName: string, serviceMethod: string, opts?: { skipAutoSeed?: boolean; markProfessionalAdminConfigured?: boolean }) => {
         (window as any)[globalName] = async (idOrKey: any, monthCol?: string) => {
@@ -3344,6 +4244,36 @@ export const App: React.FC = () => {
         }
 
         if (isConn) {
+          try {
+            await refreshSupabaseAuditLogs();
+            auditRealtimeChannel = SupabaseService.subscribeToAuditLogs(
+              (event: any) => {
+                if (!Store.data) return;
+                if (event.eventType === 'DELETE') {
+                  const deletedId = String(event.old?.id || '');
+                  Store.data.audit = Store.data.audit.filter((row: any) => String(row.id) !== deletedId);
+                } else if (event.new) {
+                  const row = SupabaseService.mapAuditLogRow(event.new);
+                  Store.data.audit = [row, ...Store.data.audit.filter((item: any) => item.id !== row.id)]
+                    .sort((a: any, b: any) => String(b.ts || '').localeCompare(String(a.ts || '')));
+                }
+                render({ keepScroll: true });
+              },
+              (status: string) => {
+                if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+                  const message = `Supabase audit log realtime subscription failed (${status}).`;
+                  console.error(message);
+                  setCloudStatus(prev => ({ ...prev, error: message }));
+                }
+              }
+            );
+          } catch (auditError: any) {
+            console.error('Could not initialize Supabase audit log:', auditError);
+            setCloudStatus(prev => ({
+              ...prev,
+              error: auditError?.message || 'Could not load the Supabase audit log.'
+            }));
+          }
           isHydratingSupabase.current = true;
           try {
             await Promise.all([
@@ -3372,8 +4302,13 @@ export const App: React.FC = () => {
 
     return () => {
       mounted = false;
+      SupabaseService.removeAuditLogSubscription(auditRealtimeChannel);
       if (cashflowDebounceTimer) clearTimeout(cashflowDebounceTimer);
+      delete (window as any).__writeSupabaseAuditLog;
+      delete (window as any).__refreshSupabaseAuditLogs;
+      delete (window as any).__supabaseDeleteAuditLog;
       delete (window as any).__onCashflowDataChanged;
+      delete (window as any).__reportAccountSummarySyncError;
       delete (window as any).__supabaseSaveClient;
       delete (window as any).__supabaseDeleteClient;
       delete (window as any).__supabaseSaveVendor;
@@ -3382,6 +4317,7 @@ export const App: React.FC = () => {
       delete (window as any).__fssQueryTransactions;
       delete (window as any).__fssDeleteTransaction;
       delete (window as any).__fssOpenTransactionModal;
+      delete (window as any).__computeByAccountCreditedDebitedRows;
       delete (window as any).__supabaseLoadPayVendorEntries;
       delete (window as any).__supabaseUpdatePayVendorEntry;
       delete (window as any).__supabaseDeletePayVendorEntry;
@@ -3390,6 +4326,7 @@ export const App: React.FC = () => {
       delete (window as any).__supabaseUploadFormAttachments;
       delete (window as any).__supabaseDeleteFormAttachments;
       delete (window as any).__supabaseSavePayEmployeeEntry;
+      delete (window as any).__supabaseLoadPayEmployeeEntries;
       delete (window as any).__supabaseSaveTaxStatutoryEntry;
       delete (window as any).__supabaseLoadTaxStatutoryEntries;
       delete (window as any).__supabaseDeleteTaxStatutoryEntry;
@@ -3421,6 +4358,9 @@ export const App: React.FC = () => {
       delete (window as any).__supabaseSaveTransaction;
       delete (window as any).__supabaseCancelTransaction;
       delete (window as any).__supabaseDeleteTransaction;
+      delete (window as any).__supabaseRefreshAfterTransactionPurge;
+      delete (window as any).__supabaseSaveAccountTransfer;
+      delete (window as any).__supabaseSetAccountTransferDeleted;
       delete (window as any).__supabaseSyncCashflowInflow;
       delete (window as any).__supabaseFetchCashflowInflow;
       delete (window as any).__updateOperationReceiptCell;
@@ -3443,6 +4383,11 @@ export const App: React.FC = () => {
       delete (window as any).__addOfficeFixedExpense;
       delete (window as any).__updateOfficeVariableCell;
       delete (window as any).__addOfficeVariableExpense;
+      delete (window as any).__loadByAccountCreditedDebited;
+      delete (window as any).__updateByAccountCreditedDebitedCell;
+      delete (window as any).__insertByAccountCreditedDebited;
+      delete (window as any).__deleteByAccountCreditedDebited;
+      delete (window as any).__syncByAccountCreditedDebited;
 
       // Clean up outflow delete handlers
       const outflowDeleteNames = [
@@ -3685,12 +4630,46 @@ export const App: React.FC = () => {
             setFssTransactionToEdit(null);
           }}
           onSave={async (id: string | null, input: FssTransactionInput) => {
-            if (id) await SupabaseService.updateFssTransaction(id, input);
-            else await SupabaseService.createFssTransaction(input);
+            let savedRow: any = null;
+            if (id) {
+              savedRow = await SupabaseService.updateFssTransaction(id, input);
+            } else {
+              savedRow = await SupabaseService.createFssTransaction(input);
+            }
+            if (savedRow && Store.data?.entries) {
+              const localEntry = convertFssTransactionToLocal(
+                savedRow,
+                Store.data.entries,
+                Store.data.parties || [],
+                Store.data.projects || [],
+                Store.data.departments || [],
+                Store.data.categories || [],
+                Store.data.accounts || []
+              );
+              const priorId = fssTransactionToEdit?.id;
+              const exIdx = Store.data.entries.findIndex((e: any) =>
+                (e.supabase_id && e.supabase_id === savedRow.id) ||
+                e.id === savedRow.id ||
+                (priorId && (e.id === priorId || e.supabase_id === priorId || e.supabase_fss_transaction_id === priorId))
+              );
+              if (exIdx >= 0) {
+                Store.data.entries[exIdx] = { ...Store.data.entries[exIdx], ...localEntry, id: Store.data.entries[exIdx].id };
+              } else {
+                Store.data.entries.unshift(localEntry);
+              }
+              Store.persist();
+              void syncCreditedDebitedFromEntries(Store.data.entries);
+            }
             setIsFssTransactionModalOpen(false);
             setFssTransactionToEdit(null);
-            setCloudStatus(prev => ({ ...prev, lastSynced: new Date().toLocaleTimeString(), error: null }));
+            setCloudStatus(prev => ({
+              ...prev,
+              transactionCount: (prev.transactionCount || 0) + (id ? 0 : 1),
+              lastSynced: new Date().toLocaleTimeString(),
+              error: null
+            }));
             (window as any).IuovaCore?.toast(id ? 'Transaction updated in Supabase' : 'Transaction saved to Supabase');
+            await (window as any).__refreshSupabaseAuditLogs?.();
             await (window as any).IuovaCore?.refreshLedgerFromSupabase?.();
           }}
         />

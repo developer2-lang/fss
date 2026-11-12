@@ -30,6 +30,7 @@ export interface FssTransactionFilters {
   department?: string;
   account?: string;
   mode?: string;
+  status?: string;
 }
 
 export interface FssTransactionInput {
@@ -63,6 +64,239 @@ const FSS_TRANSACTION_COLUMNS = [
   'net_cash', 'account', 'mode', 'notes', 'created_at', 'updated_at'
 ].join(',');
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+let _cachedFssTransactionColumns: string[] | null = null;
+let _fssTransactionsAvailable: boolean | null = null;
+
+async function isFssTransactionsAvailable(): Promise<boolean> {
+  if (_fssTransactionsAvailable !== null) return _fssTransactionsAvailable;
+  if (!isSupabaseConfigured || !supabaseUrl || !supabaseAnonKey) {
+    _fssTransactionsAvailable = false;
+    return false;
+  }
+  try {
+    const response = await fetch(`${supabaseUrl}/rest/v1/`, {
+      headers: { apikey: supabaseAnonKey, Authorization: `Bearer ${supabaseAnonKey}` }
+    });
+    const spec = response.ok ? await response.json() : null;
+    _fssTransactionsAvailable = Boolean(spec?.definitions?.fss_transactions);
+  } catch {
+    _fssTransactionsAvailable = false;
+  }
+  return _fssTransactionsAvailable;
+}
+
+function transactionMatchScore(row: any, entry: any): number {
+  const normalize = (value: any) => String(value || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+  const normalizeType = (value: any) => {
+    const type = normalize(value);
+    if (type.includes('transfer')) return 'transfer';
+    if (type.includes('inflow') || type.includes('income') || type.includes('credit')) return 'inflow';
+    if (type.includes('outflow') || type.includes('expense') || type.includes('debit')) return 'outflow';
+    return type;
+  };
+  const date = String(entry?.date || entry?.transaction_date || '').slice(0, 10);
+  const type = normalizeType(entry?.type || entry?.transaction_type);
+  if (!date || String(row.transaction_date || '').slice(0, 10) !== date) return 0;
+  if (!type || normalizeType(row.transaction_type || row.type) !== type) return 0;
+  const toAmounts = (values: any[]) => values
+    .filter(value => value !== null && value !== undefined && value !== '')
+    .map(value => Number(value))
+    .filter(Number.isFinite)
+    .map(Math.abs);
+  const entryAmounts = toAmounts([entry?.taxable, entry?.taxable_amount, entry?.amount, entry?.net_cash]);
+  const rowAmounts = toAmounts([row?.taxable_amount, row?.taxable, row?.net_cash, row?.amount]);
+  if (!entryAmounts.length || !rowAmounts.length ||
+    !entryAmounts.some(expected => rowAmounts.some(actual => Math.abs(actual - expected) < 0.01))) return 0;
+
+  const fields: Array<[any, any]> = [
+    [entry.categoryName || entry.category, row.category],
+    [entry.refNo || entry.reference_number || entry.reference_no, row.reference_number || row.reference_no],
+    [entry.partyName || entry.party_name || entry.party, row.party_name || row.party],
+    [entry.accountName || entry.account_name || entry.account, row.account_name || row.account],
+    [entry.description, row.description]
+  ];
+  return 1 + fields.reduce((score, [expected, actual]) =>
+    expected && normalize(expected) === normalize(actual) ? score + 1 : score, 0);
+}
+
+function findBestTransactionMatch(rows: any[], entry: any): { row: any | null; ambiguous: boolean } {
+  const scored = rows
+    .map(row => ({ row, score: transactionMatchScore(row, entry) }))
+    .filter(match => match.score > 0)
+    .sort((a, b) => b.score - a.score);
+  if (!scored.length) return { row: null, ambiguous: false };
+  if (scored.length > 1 && scored[0].score === scored[1].score) return { row: null, ambiguous: true };
+  return { row: scored[0].row, ambiguous: false };
+}
+
+export async function getFssTransactionColumns(): Promise<string[]> {
+  if (_cachedFssTransactionColumns && _cachedFssTransactionColumns.length > 0) {
+    return _cachedFssTransactionColumns;
+  }
+  if (isSupabaseConfigured && supabaseUrl && supabaseAnonKey) {
+    try {
+      const res = await fetch(`${supabaseUrl}/rest/v1/`, {
+        headers: {
+          apikey: supabaseAnonKey,
+          Authorization: `Bearer ${supabaseAnonKey}`
+        }
+      });
+      if (res.ok) {
+        const spec = await res.json();
+        const props = spec?.definitions?.fss_transactions?.properties;
+        if (props) {
+          _fssTransactionsAvailable = true;
+          _cachedFssTransactionColumns = Object.keys(props);
+          console.log('[Supabase] Discovered fss_transactions columns from OpenAPI:', _cachedFssTransactionColumns);
+          return _cachedFssTransactionColumns;
+        }
+        _fssTransactionsAvailable = false;
+      }
+    } catch (e) {
+      console.warn('[Supabase] Could not inspect OpenAPI definitions for fss_transactions:', e);
+    }
+  }
+  _cachedFssTransactionColumns = [
+    'id', 'transaction_date', 'type', 'category', 'description', 'reference_no',
+    'party', 'project', 'department', 'taxable_amount', 'gst_amount', 'tds_amount',
+    'net_cash', 'account', 'mode', 'notes', 'created_at', 'updated_at'
+  ];
+  return _cachedFssTransactionColumns;
+}
+
+export function formatFssTransactionRow(
+  entry: any,
+  allowedCols: string[],
+  parties: any[] = [],
+  projects: any[] = [],
+  departments: any[] = [],
+  categories: any[] = [],
+  accounts: any[] = []
+): Record<string, any> {
+  const isOutflow = entry.type === 'outflow' || String(entry.transaction_type || '').toLowerCase().includes('outflow');
+  const txnType = isOutflow ? 'Outflow' : 'Inflow';
+  const txnDate = entry.date || entry.transaction_date || new Date().toISOString().split('T')[0];
+
+  // Prefer the selected category record so a stale display label cannot
+  // replace a specific category (for example Project Receipts - Design).
+  let categoryName = '';
+  if (entry.categoryId) {
+    const matchCat = categories.find((c: any) => c.id === entry.categoryId || c.supabase_id === entry.categoryId);
+    if (matchCat) categoryName = matchCat.name;
+  }
+  if (!categoryName) categoryName = entry.category || entry.categoryName || '';
+  if (!categoryName) {
+    categoryName = isOutflow ? 'Office – Fixed' : 'Operating Receipts';
+  }
+
+  // Resolve Description
+  const rawDesc = (entry.description || '').trim();
+  let description = rawDesc || categoryName || entry.refNo || 'Transaction';
+
+  // Resolve Reference number
+  const referenceNumber = entry.refNo || entry.reference_no || entry.txnRef || entry.reference_number || null;
+
+  // Resolve Party name
+  let partyName = entry.party || entry.party_name || entry.partyName || '';
+  if (!partyName && entry.partyId) {
+    const matchParty = parties.find((p: any) => p.id === entry.partyId || p.supabase_id === entry.partyId);
+    if (matchParty) partyName = matchParty.name;
+  }
+
+  // Resolve Project
+  let projectName = entry.project || entry.project_name || entry.projectName || '';
+  let projectCode = entry.project_code || entry.projectCode || '';
+  if ((!projectName || !projectCode) && entry.projectId) {
+    const matchProj = projects.find((p: any) => p.id === entry.projectId || p.supabase_id === entry.projectId);
+    if (matchProj) {
+      if (!projectName) projectName = matchProj.name;
+      if (!projectCode) projectCode = matchProj.code;
+    }
+  }
+
+  // Resolve Department
+  let departmentName = entry.department || entry.departmentName || '';
+  if (!departmentName && entry.departmentId) {
+    const matchDept = departments.find((d: any) => d.id === entry.departmentId || d.supabase_id === entry.departmentId);
+    if (matchDept) departmentName = matchDept.name;
+  }
+
+  // Resolve Account name
+  let accountName = entry.account || entry.account_name || entry.accountName || '';
+  if (!accountName && entry.accountId) {
+    const matchAcc = accounts.find((a: any) => a.id === entry.accountId || a.supabase_id === entry.accountId);
+    if (matchAcc) accountName = matchAcc.name;
+  }
+
+  // Amounts
+  const taxableAmount = Math.max(0, Number(entry.taxable ?? entry.taxable_amount) || 0);
+  const gstRate = Math.max(0, Math.min(100, Number(entry.gstRate ?? entry.gst_rate) || 0));
+  const gstAmount = Math.max(0, Number(entry.gstAmount ?? entry.gst_amount) || 0);
+  const tdsAmount = Math.max(0, Number(entry.tdsAmount ?? entry.tds_amount) || 0);
+
+  let netAmount = Math.abs(Number(entry.amount) || (taxableAmount + gstAmount - tdsAmount));
+  if (netAmount === 0 && Number(entry.net_cash)) {
+    netAmount = Math.abs(Number(entry.net_cash));
+  }
+  const netCash = isOutflow ? -netAmount : netAmount;
+
+  const mode = entry.paymentMode || entry.mode || entry.payment_mode || 'NEFT';
+
+  let rowId: string | undefined = undefined;
+  if (entry.supabase_fss_transaction_id && UUID_PATTERN.test(String(entry.supabase_fss_transaction_id))) {
+    rowId = String(entry.supabase_fss_transaction_id);
+  } else if (entry.supabase_id && UUID_PATTERN.test(String(entry.supabase_id))) {
+    rowId = String(entry.supabase_id);
+  } else if (entry.id && UUID_PATTERN.test(String(entry.id))) {
+    rowId = String(entry.id);
+  } else {
+    rowId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : undefined;
+  }
+
+  const fullMap: Record<string, any> = {
+    id: rowId,
+    transaction_date: txnDate,
+    type: txnType,
+    transaction_type: txnType,
+    category: categoryName,
+    description,
+    reference_no: referenceNumber,
+    reference_number: referenceNumber,
+    party: partyName || null,
+    party_name: partyName || null,
+    project: projectName || projectCode || null,
+    project_name: projectName || null,
+    project_code: projectCode || null,
+    department: departmentName || null,
+    taxable_amount: taxableAmount,
+    taxable: taxableAmount,
+    gst_rate: gstRate,
+    gst_amount: gstAmount,
+    gst: gstAmount,
+    tds_amount: tdsAmount,
+    tds: tdsAmount,
+    net_cash: netCash,
+    amount: Math.abs(netCash),
+    account: accountName || null,
+    account_name: accountName || null,
+    mode,
+    payment_mode: mode,
+    financial_year: entry.financial_year || getFinancialYear(txnDate),
+    notes: entry.notes || null,
+    status: entry.deleted ? 'Cancelled' : 'Active',
+    created_at: entry.createdAt || entry.created_at || new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  const filtered: Record<string, any> = {};
+  for (const col of allowedCols) {
+    if (fullMap[col] !== undefined) {
+      filtered[col] = fullMap[col];
+    }
+  }
+  return filtered;
+}
 
 export const STATE_CODE_TO_NAME: Record<string, string> = {
   '01': 'Jammu & Kashmir', '02': 'Himachal Pradesh', '03': 'Punjab', '04': 'Chandigarh',
@@ -474,37 +708,517 @@ function recomputeProfessionalAdminFyAndShares(rows: any[]): any[] {
   return [updatedGroup, ...updatedChildren];
 }
 
+export const BY_ACCOUNT_CD_MONTH_COLS = [
+  'jan', 'feb', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december'
+] as const;
+
+export const BY_ACCOUNT_CD_MONTH_MAP: Record<string, typeof BY_ACCOUNT_CD_MONTH_COLS[number]> = {
+  '01': 'jan',
+  '02': 'feb',
+  '03': 'march',
+  '04': 'april',
+  '05': 'may',
+  '06': 'june',
+  '07': 'july',
+  '08': 'august',
+  '09': 'september',
+  '10': 'october',
+  '11': 'november',
+  '12': 'december',
+};
+
+const BY_ACCOUNT_CD_DB_MONTH_COL: Record<typeof BY_ACCOUNT_CD_MONTH_COLS[number], string> = {
+  jan: 'jan',
+  feb: 'feb',
+  march: 'mar',
+  april: 'apr',
+  may: 'may',
+  june: 'jun',
+  july: 'jul',
+  august: 'aug',
+  september: 'sep',
+  october: 'oct',
+  november: 'nov',
+  december: 'dec'
+};
+
+function formatAccountSummaryFinancialYear(startYear: number): string {
+  return `${startYear}-${String((startYear + 1) % 100).padStart(2, '0')}`;
+}
+
+function mapAccountSummaryRowFromSupabase(row: any): any {
+  const mapped: Record<string, any> = {
+    ...row,
+    id: `${row.account_name}::${String(row.transaction_type || '').toLowerCase()}`,
+    transaction_type: String(row.transaction_type || '').toLowerCase()
+  };
+  for (const [uiColumn, dbColumn] of Object.entries(BY_ACCOUNT_CD_DB_MONTH_COL)) {
+    mapped[uiColumn] = row[dbColumn] ?? null;
+  }
+  return mapped;
+}
+
+export function normalizeAccountName(str: any): string {
+  return String(str || '')
+    .replace(/[–—]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+/** Recompute fy_to_date and shares for By Account – Credited & Debited rows. */
+export function recomputeByAccountCreditedDebitedFyAndShares(rows: any[]): any[] {
+  const rowsWithFy = (rows || []).map((row: any) => {
+    let hasAnyValue = false;
+    let sum = 0;
+    for (const m of BY_ACCOUNT_CD_MONTH_COLS) {
+      const v = row[m];
+      if (v !== null && v !== undefined && v !== '' && !isNaN(Number(v))) {
+        hasAnyValue = true;
+        sum += Number(v);
+      }
+    }
+    return {
+      ...row,
+      fy_to_date: hasAnyValue ? Math.round(sum * 100) / 100 : null
+    };
+  });
+
+  const creditedRows = rowsWithFy.filter((r: any) => String(r.transaction_type || '').toLowerCase() === 'credited');
+  const debitedRows = rowsWithFy.filter((r: any) => String(r.transaction_type || '').toLowerCase() === 'debited');
+
+  const totalCredited = creditedRows.reduce((acc: number, r: any) => acc + (Number(r.fy_to_date) || 0), 0);
+  const totalDebited = debitedRows.reduce((acc: number, r: any) => acc + (Number(r.fy_to_date) || 0), 0);
+
+  return rowsWithFy.map((row: any) => {
+    const isCredited = String(row.transaction_type || '').toLowerCase() === 'credited';
+    const total = isCredited ? totalCredited : totalDebited;
+    let shares = null;
+    if (row.fy_to_date != null && total > 0) {
+      shares = Math.round(((Number(row.fy_to_date) || 0) / total) * 1000) / 10;
+    }
+    return {
+      ...row,
+      shares
+    };
+  });
+}
+
+/** Compute By Account – Credited & Debited rows dynamically from live entries and accounts. */
+export function computeByAccountCreditedDebitedRows(
+  entries: any[] = [],
+  existingRows: any[] = [],
+  accounts: any[] = [],
+  currentFy: number = 2026
+): any[] {
+  // Deduplicate entries first so no transaction is ever counted more than once
+  const seenEntries = new Set<string>();
+  const dedupedEntries: any[] = [];
+  for (const e of (entries || [])) {
+    if (!e || e.deleted || String(e.status || '').toLowerCase().includes('cancel')) continue;
+
+    const sbId = e.supabase_id ? String(e.supabase_id) : (e.id && String(e.id).includes('-') ? String(e.id) : '');
+    if (sbId && seenEntries.has(`id:${sbId}`)) continue;
+    if (sbId) seenEntries.add(`id:${sbId}`);
+
+    const date = String(e.date || e.transaction_date || '').slice(0, 10);
+    const type = String(e.type || e.transaction_type || '').toLowerCase();
+    const netAmt = Math.round(Math.abs(Number(
+      e.net_cash != null && e.net_cash !== ''
+        ? e.net_cash
+        : e.amount != null && e.amount !== '' && e.amount !== 0
+          ? e.amount
+          : e.netAmount != null && e.netAmount !== ''
+            ? e.netAmount
+            : (+e.taxable || 0) + (+e.gstAmount || 0) - (+e.tdsAmount || 0)
+    )) * 100);
+    const taxableAmt = Math.round(Math.abs(Number(e.taxable != null ? e.taxable : e.amount || 0)) * 100);
+    const cat = String(e.category || e.categoryName || '').trim().toLowerCase();
+    const party = String(e.party_name || e.partyName || e.party || '').trim().toLowerCase();
+    const project = String(e.projectId || e.projectCode || e.projectName || e.project || '').trim().toLowerCase();
+    const reference = String(e.txnRef || e.refNo || e.ref_no || e.reference_no || e.reference_number || '').trim().toLowerCase();
+    const desc = String(e.description || '').trim().toLowerCase();
+    const acc = normalizeAccountName(e.account_name || e.accountName || e.paid_from || e.received_into || e.account || e.accountId || '');
+
+    const sig = `sig:${date}|${type}|${taxableAmt}|${netAmt}|${cat}|${party}|${project}|${acc}|${reference}|${desc}`;
+    if (seenEntries.has(sig)) continue;
+    seenEntries.add(sig);
+    dedupedEntries.push(e);
+  }
+
+  const accountNames = new Set<string>();
+  (existingRows || []).forEach(r => {
+    if (r.account_name && String(r.account_name).trim()) {
+      accountNames.add(String(r.account_name).trim());
+    }
+  });
+  (accounts || []).forEach(a => {
+    if (a.name && String(a.name).trim()) {
+      const existing = Array.from(accountNames).find(name => normalizeAccountName(name) === normalizeAccountName(a.name));
+      if (!existing) accountNames.add(String(a.name).trim());
+    }
+  });
+
+  const monthEntries = BY_ACCOUNT_CD_MONTH_COLS.map(col => {
+    const monthNum = Object.keys(BY_ACCOUNT_CD_MONTH_MAP).find(k => BY_ACCOUNT_CD_MONTH_MAP[k] === col) || '01';
+    return { col, monthNum };
+  });
+
+  const rows: any[] = [];
+
+  for (const accName of accountNames) {
+    const normTarget = normalizeAccountName(accName);
+    const targetAcc = (accounts || []).find((a: any) => normalizeAccountName(a.name) === normTarget);
+    const targetId = targetAcc?.id;
+    const targetSbId = targetAcc?.supabase_id;
+
+    const isTargetFixed = normTarget.includes('fixed') || normTarget.includes('fd');
+    const isTargetPetty = normTarget.includes('petty') || normTarget.includes('cash');
+    const isTargetCurrent = normTarget.includes('current');
+    const isTargetSavings = normTarget.includes('saving');
+
+    const matchesAccount = (entry: any, isCredit: boolean) => {
+      let entryAccName = '';
+      let entryAccId = '';
+
+      if (!isCredit) {
+        // Debited / Outflow
+        entryAccName = entry.paid_from || entry.account_name || entry.accountName || entry.account || '';
+        entryAccId = entry.accountId;
+      } else {
+        // Credited / Inflow
+        const accId = (entry.type === 'transfer' && entry.toAccountId) ? entry.toAccountId : entry.accountId;
+        entryAccName = entry.received_into || entry.account_name || entry.accountName || entry.account || '';
+        entryAccId = accId;
+      }
+
+      if (!entryAccName && entryAccId) {
+        const found = (accounts || []).find((a: any) => a.id === entryAccId || (a.supabase_id && String(a.supabase_id) === String(entryAccId)));
+        if (found) entryAccName = found.name || '';
+      }
+
+      if (entryAccId && targetId && (entryAccId === targetId || (targetSbId && String(entryAccId) === String(targetSbId)))) {
+        return true;
+      }
+
+      const normEntry = normalizeAccountName(entryAccName);
+      if (!normEntry) return false;
+
+      const isEntryFixed = normEntry.includes('fixed') || normEntry.includes('fd');
+      if (isTargetFixed !== isEntryFixed) return false;
+
+      const isEntryPetty = normEntry.includes('petty') || normEntry.includes('cash');
+      if (isTargetPetty !== isEntryPetty) return false;
+
+      const isEntryCurrent = normEntry.includes('current');
+      const isEntrySavings = normEntry.includes('saving');
+      if (isTargetCurrent && isEntrySavings) return false;
+      if (isTargetSavings && isEntryCurrent) return false;
+
+      if (normTarget.includes('hdfc') && !normEntry.includes('hdfc')) return false;
+      if (normTarget.includes('icici') && !normEntry.includes('icici')) return false;
+      if (normEntry.includes('hdfc') && !normTarget.includes('hdfc')) return false;
+      if (normEntry.includes('icici') && !normTarget.includes('icici')) return false;
+
+      if (normEntry === normTarget) return true;
+      if (normEntry.includes(normTarget) || normTarget.includes(normEntry)) return true;
+
+      const cClean = normEntry.replace(/[-–\s]/g, '');
+      const tClean = normTarget.replace(/[-–\s]/g, '');
+      return cClean === tClean || cClean.includes(tClean) || tClean.includes(cClean);
+    };
+
+    const existingCredited = (existingRows || []).find(r => normalizeAccountName(r.account_name) === normTarget && String(r.transaction_type || '').toLowerCase() === 'credited');
+    const existingDebited = (existingRows || []).find(r => normalizeAccountName(r.account_name) === normTarget && String(r.transaction_type || '').toLowerCase() === 'debited');
+
+    const creditedRow: any = {
+      ...(existingCredited || {}),
+      account_name: existingCredited?.account_name || accName,
+      transaction_type: 'Credited'
+    };
+    const debitedRow: any = {
+      ...(existingDebited || {}),
+      account_name: existingDebited?.account_name || accName,
+      transaction_type: 'Debited'
+    };
+
+    for (const { col, monthNum } of monthEntries) {
+      const matching = dedupedEntries.filter(e => {
+        const d = String(e.date || e.transaction_date || '').slice(0, 7);
+        if (!d) return false;
+        const [yStr, mStr] = d.split('-');
+        if (mStr !== monthNum) return false;
+        const y = Number(yStr);
+        // Financial Year 2026-27: Apr (04) to Dec (12) are in 2026; Jan (01) to Mar (03) are in 2027
+        if (Number(monthNum) >= 4) {
+          if (y !== currentFy) return false;
+        } else {
+          if (y !== currentFy + 1) return false;
+        }
+        return true;
+      });
+
+      // 1. Debited (Outflows & Transfers out)
+      const debitedEntries = matching.filter(e => {
+        if (e.type === 'outflow' || String(e.transaction_type || '').toLowerCase() === 'outflow') return matchesAccount(e, false);
+        if (e.type === 'transfer') return matchesAccount(e, false);
+        return false;
+      });
+      const debitedSum = debitedEntries.reduce((sum, e) => {
+        const val = Math.abs(Number(
+          e.net_cash != null && e.net_cash !== ''
+            ? e.net_cash
+            : e.amount != null && e.amount !== '' && e.amount !== 0
+              ? e.amount
+              : e.netAmount != null && e.netAmount !== ''
+                ? e.netAmount
+                : (+e.taxable || 0) + (+e.gstAmount || 0) - (+e.tdsAmount || 0)
+        ));
+        return sum + val;
+      }, 0);
+      debitedRow[col] = debitedEntries.length > 0
+        ? Math.round(debitedSum * 100) / 100
+        : null;
+
+      // 2. Credited (Inflows & Transfers in)
+      const creditedEntries = matching.filter(e => {
+        if (e.type === 'inflow' || String(e.transaction_type || '').toLowerCase() === 'inflow') return matchesAccount(e, true);
+        if (e.type === 'transfer') return matchesAccount(e, true);
+        return false;
+      });
+      const creditedSum = creditedEntries.reduce((sum, e) => {
+        const val = Math.abs(Number(
+          e.net_cash != null && e.net_cash !== ''
+            ? e.net_cash
+            : e.amount != null && e.amount !== '' && e.amount !== 0
+              ? e.amount
+              : e.netAmount != null && e.netAmount !== ''
+                ? e.netAmount
+                : (+e.taxable || 0) + (+e.gstAmount || 0) - (+e.tdsAmount || 0)
+        ));
+        return sum + val;
+      }, 0);
+      creditedRow[col] = creditedEntries.length > 0
+        ? Math.round(creditedSum * 100) / 100
+        : null;
+    }
+
+    rows.push(creditedRow, debitedRow);
+  }
+
+  return recomputeByAccountCreditedDebitedFyAndShares(rows);
+}
+
+if (typeof window !== 'undefined') {
+  (window as any).__computeByAccountCreditedDebitedRows = computeByAccountCreditedDebitedRows;
+}
+
 export const SupabaseService = {
-  async queryFssTransactions(filters: FssTransactionFilters = {}): Promise<any[]> {
-    if (!supabase) throw new Error('Supabase is not configured. Check the existing Supabase URL and anon key.');
+  async getAuditIdentity(): Promise<{ user_id: string | null; user_name: string }> {
+    const appUser = typeof window !== 'undefined' ? (window as any).api?.me?.() : null;
+    return {
+      user_id: null,
+      user_name: String(appUser?.name || 'App user')
+    };
+  },
+  async loadAuditLogs(): Promise<any[]> {
+    if (!supabase) throw new Error('Supabase is not configured; audit logs cannot be loaded.');
+
+    const records: any[] = [];
+    const batchSize = 1000;
+    let offset = 0;
+    while (true) {
+      const { data, error } = await supabase
+        .from('fss_audit_log')
+        .select('id,created_at,user_id,user_name,action,record_type,record_id,summary,changes')
+        .order('created_at', { ascending: false })
+        .range(offset, offset + batchSize - 1);
+      if (error) throw new Error(`Could not load audit logs: ${error.message}`);
+      if (!data?.length) break;
+      records.push(...data);
+      if (data.length < batchSize) break;
+      offset += batchSize;
+    }
+
+    return records.map(row => this.mapAuditLogRow(row));
+  },
+  mapAuditLogRow(row: any): any {
+    return {
+      id: String(row.id),
+      ts: row.created_at,
+      userId: String(row.user_id || ''),
+      userName: row.user_name || '',
+      action: row.action,
+      entity: row.record_type,
+      entityId: String(row.record_id || ''),
+      summary: row.summary || '',
+      changes: row.changes || {}
+    };
+  },
+  async insertAuditLog(input: {
+    user_id: string | null;
+    user_name: string;
+    action: string;
+    record_type: string;
+    record_id: string;
+    summary: string;
+    changes: Record<string, any>;
+    created_at: string;
+  }): Promise<any> {
+    if (!supabase) throw new Error('Supabase is not configured; audit logs cannot be saved.');
+    const { data, error } = await supabase.rpc('fss_insert_audit_log', {
+      p_user_name: input.user_name,
+      p_action: input.action,
+      p_record_type: input.record_type,
+      p_record_id: input.record_id,
+      p_summary: input.summary,
+      p_changes: input.changes,
+      p_created_at: input.created_at
+    });
+    if (error) throw new Error(`Could not save audit log: ${error.message}`);
+    return this.mapAuditLogRow(data);
+  },
+  async deleteAuditLog(id: string): Promise<void> {
+    if (!supabase) throw new Error('Supabase is not configured; audit logs cannot be deleted.');
+    const { data, error } = await supabase
+      .from('fss_audit_log')
+      .delete()
+      .eq('id', id)
+      .select('id')
+      .single();
+    if (error) throw new Error(`Could not delete audit log: ${error.message}`);
+    if (!data) throw new Error('The audit log was not found or could not be deleted.');
+  },
+  subscribeToAuditLogs(onChange: (event: any) => void, onStatus?: (status: string) => void) {
+    if (!supabase) throw new Error('Supabase is not configured; audit log realtime is unavailable.');
+    return supabase
+      .channel('fss-audit-log-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'fss_audit_log' }, onChange)
+      .subscribe(status => onStatus?.(status));
+  },
+  removeAuditLogSubscription(channel: any): void {
+    if (supabase && channel) void supabase.removeChannel(channel);
+  },
+  async loadAccountTransferRows(filters: FssTransactionFilters = {}): Promise<any[]> {
+    if (!supabase) return [];
+    if (filters.type && !String(filters.type).toLowerCase().includes('transfer')) return [];
+    if (filters.category && String(filters.category).toLowerCase() !== 'account transfer') return [];
+    if (filters.categories?.length && !filters.categories.some(category => String(category).toLowerCase() === 'account transfer')) return [];
+    if (filters.party || filters.project || filters.department) return [];
 
     const records: any[] = [];
     const batchSize = 1000;
     let offset = 0;
     while (true) {
       let query = supabase
-        .from('fss_transactions')
-        .select(FSS_TRANSACTION_COLUMNS)
+        .from('fss_table_transactions')
+        .select('*')
+        .eq('transaction_type', 'Transfer')
+        .order('transaction_date', { ascending: false })
+        .range(offset, offset + batchSize - 1);
+      if (filters.status) query = query.eq('status', filters.status);
+      else query = query.or('status.is.null,status.not.ilike.%cancel%');
+      if (filters.from) query = query.gte('transaction_date', filters.from);
+      if (filters.to) query = query.lte('transaction_date', filters.to);
+      if (filters.mode) query = query.eq('payment_mode', filters.mode);
+
+      const { data, error } = await query;
+      if (error) {
+        throw new Error(`Could not load Supabase account transfers. Apply the account-transfer migration if needed: ${error.message}`);
+      }
+      if (!data?.length) break;
+      records.push(...data);
+      if (data.length < batchSize) break;
+      offset += batchSize;
+    }
+
+    const normalize = (value: any) => String(value || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+    const accountFilter = normalize(filters.account);
+    const search = normalize(filters.q);
+    return records.filter(row => {
+      if (accountFilter && ![row.transfer_from_account_name, row.transfer_to_account_name]
+        .some(name => normalize(name) && (normalize(name).includes(accountFilter) || accountFilter.includes(normalize(name))))) return false;
+      if (!search) return true;
+      const amount = Number(search.replace(/[,₹\s]/g, ''));
+      return [
+        row.description,
+        row.reference_number,
+        row.transfer_from_account_name,
+        row.transfer_to_account_name,
+        row.payment_mode
+      ].some(value => normalize(value).includes(search)) ||
+        (Number.isFinite(amount) && Math.abs(Number(row.net_cash) || Number(row.taxable_amount) || 0) === amount);
+    });
+  },
+
+  async mergeAccountTransferRows(
+    records: any[],
+    filters: FssTransactionFilters = {},
+    includeDeleted = false
+  ): Promise<any[]> {
+    const transfers = await this.loadAccountTransferRows(filters);
+    if (includeDeleted) {
+      transfers.push(...await this.loadAccountTransferRows({ status: 'Cancelled' }));
+    }
+    const seenIds = new Set((records || []).map((row: any) => String(row.id)));
+    return [...(records || []), ...transfers.filter((row: any) => !seenIds.has(String(row.id)))];
+  },
+
+  async queryFssTransactions(filters: FssTransactionFilters = {}): Promise<any[]> {
+    if (!supabase) throw new Error('Supabase is not configured. Check the existing Supabase URL and anon key.');
+    if (filters.type && String(filters.type).toLowerCase().includes('transfer')) {
+      return this.loadAccountTransferRows(filters);
+    }
+
+    // fss_table_transactions is authoritative; the optional legacy mirror can
+    // contain stale rows that would otherwise make permanently deleted entries reappear.
+    const records: any[] = [];
+    const batchSize = 1000;
+    let offset = 0;
+    while (true) {
+      let query = supabase
+        .from('fss_table_transactions')
+        .select('*')
         .order('transaction_date', { ascending: false })
         .order('created_at', { ascending: false })
         .range(offset, offset + batchSize - 1);
 
+      if (filters.status) {
+        query = query.eq('status', filters.status);
+      } else {
+        query = query.or('status.is.null,status.not.ilike.%cancel%');
+      }
+
       if (filters.from) query = query.gte('transaction_date', filters.from);
       if (filters.to) query = query.lte('transaction_date', filters.to);
-      if (filters.type) query = query.ilike('type', filters.type);
+      if (filters.type) {
+        const typeNorm = String(filters.type).toLowerCase();
+        query = query.ilike('transaction_type', typeNorm === 'inflow' ? '%inflow%' : '%outflow%');
+      }
       if (filters.category) query = query.eq('category', filters.category);
       else if (filters.categories?.length) query = query.in('category', filters.categories);
-      if (filters.party) query = query.eq('party', filters.party);
-      if (filters.project) query = query.eq('project', filters.project);
+      if (filters.party) query = query.eq('party_name', filters.party);
+      if (filters.project) query = query.or(`project_name.eq.${filters.project},project_code.eq.${filters.project}`);
       if (filters.department) query = query.eq('department', filters.department);
-      if (filters.account) query = query.eq('account', filters.account);
-      if (filters.mode) query = query.eq('mode', filters.mode);
+      if (filters.account) {
+        const cleanAcc = String(filters.account).replace(/[–—]/g, '-').trim();
+        const baseName = cleanAcc.split(/[-–]/)[0].trim();
+        const variants = [
+          cleanAcc,
+          cleanAcc.replace(/-/g, '–'),
+          baseName
+        ].filter(Boolean);
+        const uniqueVariants = [...new Set(variants)];
+        query = query.or(uniqueVariants.map(v => `account_name.ilike.%${v}%`).join(','));
+      }
+      if (filters.mode) query = query.eq('payment_mode', filters.mode);
 
       const search = String(filters.q || '').trim();
       if (search) {
         const safeSearch = search.replace(/[^A-Za-z0-9\s@.-]/g, ' ').replace(/\s+/g, ' ').trim();
         const searchTerms = safeSearch
-          ? ['description', 'reference_no', 'party'].map(column => `${column}.ilike.%${safeSearch}%`)
+          ? ['description', 'reference_number', 'party_name', 'category', 'department', 'account_name'].map(column => `${column}.ilike.%${safeSearch}%`)
           : [];
         const amount = Number(search.replace(/[,₹\s]/g, ''));
         if (Number.isFinite(amount)) {
@@ -515,89 +1229,205 @@ export const SupabaseService = {
       }
 
       const { data, error } = await query;
-      if (error) throw new Error(`Could not load transactions from Supabase: ${error.message}`);
+      if (error) throw new Error(`Could not load transactions from fss_table_transactions: ${error.message}`);
       if (!data?.length) break;
       records.push(...data);
       if (data.length < batchSize) break;
       offset += batchSize;
     }
 
-    return records;
+    return this.mergeAccountTransferRows(records, filters);
   },
 
   async createFssTransaction(input: FssTransactionInput): Promise<any> {
     if (!supabase) throw new Error('Supabase is not configured. Check the existing Supabase URL and anon key.');
-    const payload = {
-      transaction_date: input.transaction_date,
-      type: input.type,
-      category: input.category,
-      description: input.description,
-      reference_no: input.reference_no,
-      party: input.party,
-      project: input.project,
-      department: input.department,
-      taxable_amount: input.taxable_amount,
-      gst_amount: input.gst_amount,
-      tds_amount: input.tds_amount,
-      account: input.account,
-      mode: input.mode,
-      notes: input.notes
+    const isOutflow = String(input.type || '').toLowerCase() === 'outflow';
+    const taxable = Math.max(0, Number(input.taxable_amount) || 0);
+    const gst = Math.max(0, Number(input.gst_amount) || 0);
+    const tds = Math.max(0, Number(input.tds_amount) || 0);
+    const net = Math.abs(taxable + gst - tds);
+    const netCash = isOutflow ? -net : net;
+    const txnDate = input.transaction_date || new Date().toISOString().split('T')[0];
+    const generatedId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : undefined;
+    const now = new Date().toISOString();
+    const canonicalPayload = {
+      ...(generatedId ? { id: generatedId } : {}),
+      transaction_date: txnDate,
+      transaction_type: isOutflow ? 'Outflow' : 'Inflow',
+      category: input.category || (isOutflow ? 'Office – Fixed' : 'Operating Receipts'),
+      description: input.description || input.category || 'Transaction',
+      reference_number: input.reference_no || null,
+      party_name: input.party || null,
+      project_name: input.project || null,
+      department: input.department || null,
+      taxable_amount: taxable,
+      gst_rate: taxable > 0 ? Math.round((gst / taxable) * 100) : 0,
+      gst_amount: gst,
+      tds_amount: tds,
+      net_cash: netCash,
+      account_name: input.account || null,
+      payment_mode: input.mode || 'NEFT',
+      financial_year: getFinancialYear(txnDate),
+      notes: input.notes || null,
+      status: 'Active',
+      updated_at: now
     };
-    const { data, error } = await supabase
-      .from('fss_transactions')
-      .insert(payload)
-      .select(FSS_TRANSACTION_COLUMNS)
+    const { data: savedData, error } = await supabase
+      .from('fss_table_transactions')
+      .insert(canonicalPayload)
+      .select('*')
       .single();
-    if (error) throw new Error(`Could not save transaction to Supabase: ${error.message}`);
-    return data;
+    if (error) throw new Error(`Could not save transaction to fss_table_transactions: ${error.message}`);
+
+    if (await isFssTransactionsAvailable()) {
+      try {
+        const allowedCols = await getFssTransactionColumns();
+        const mirrorPayload: Record<string, any> = {
+          id: savedData.id,
+          transaction_date: txnDate,
+          type: isOutflow ? 'Outflow' : 'Inflow',
+          category: canonicalPayload.category,
+          description: canonicalPayload.description,
+          reference_no: canonicalPayload.reference_number,
+          party: canonicalPayload.party_name,
+          project: canonicalPayload.project_name,
+          department: canonicalPayload.department,
+          taxable_amount: taxable,
+          gst_amount: gst,
+          tds_amount: tds,
+          net_cash: netCash,
+          account: canonicalPayload.account_name,
+          mode: canonicalPayload.payment_mode,
+          notes: canonicalPayload.notes,
+          created_at: savedData.created_at || now,
+          updated_at: now
+        };
+        const filtered = Object.fromEntries(
+          Object.entries(mirrorPayload).filter(([column, value]) => allowedCols.includes(column) && value !== undefined)
+        );
+        const { error: mirrorError } = await supabase.from('fss_transactions').upsert(filtered);
+        if (mirrorError) console.warn('Could not update optional fss_transactions mirror:', mirrorError);
+      } catch (mirrorError) {
+        console.warn('Could not update optional fss_transactions mirror:', mirrorError);
+      }
+    }
+
+    return savedData;
   },
 
   async updateFssTransaction(id: string, input: FssTransactionInput): Promise<any> {
     if (!supabase) throw new Error('Supabase is not configured. Check the existing Supabase URL and anon key.');
-    if (!UUID_PATTERN.test(id)) throw new Error('Transaction ID is invalid.');
-    const payload = {
-      transaction_date: input.transaction_date,
-      type: input.type,
-      category: input.category,
-      description: input.description,
-      reference_no: input.reference_no,
-      party: input.party,
-      project: input.project,
-      department: input.department,
-      taxable_amount: input.taxable_amount,
-      gst_amount: input.gst_amount,
-      tds_amount: input.tds_amount,
-      account: input.account,
-      mode: input.mode,
-      notes: input.notes,
-      updated_at: new Date().toISOString()
+    const isOutflow = String(input.type || '').toLowerCase() === 'outflow';
+    const taxable = Math.max(0, Number(input.taxable_amount) || 0);
+    const gst = Math.max(0, Number(input.gst_amount) || 0);
+    const tds = Math.max(0, Number(input.tds_amount) || 0);
+    const net = Math.abs(taxable + gst - tds);
+    const netCash = isOutflow ? -net : net;
+    const txnDate = input.transaction_date || new Date().toISOString().split('T')[0];
+    const now = new Date().toISOString();
+    const canonicalPayload = {
+      transaction_date: txnDate,
+      transaction_type: isOutflow ? 'Outflow' : 'Inflow',
+      category: input.category || (isOutflow ? 'Office – Fixed' : 'Operating Receipts'),
+      description: input.description || input.category || 'Transaction',
+      reference_number: input.reference_no || null,
+      party_name: input.party || null,
+      project_name: input.project || null,
+      department: input.department || null,
+      taxable_amount: taxable,
+      gst_rate: taxable > 0 ? Math.round((gst / taxable) * 100) : 0,
+      gst_amount: gst,
+      tds_amount: tds,
+      net_cash: netCash,
+      account_name: input.account || null,
+      payment_mode: input.mode || 'NEFT',
+      financial_year: getFinancialYear(txnDate),
+      notes: input.notes || null,
+      status: 'Active',
+      updated_at: now
     };
-    const { data, error } = await supabase
-      .from('fss_transactions')
-      .update(payload)
+
+    const { data: updated, error: updateError } = await supabase
+      .from('fss_table_transactions')
+      .update(canonicalPayload)
       .eq('id', id)
-      .select(FSS_TRANSACTION_COLUMNS)
+      .select('*')
       .maybeSingle();
-    if (error) throw new Error(`Could not update transaction in Supabase: ${error.message}`);
-    if (!data) throw new Error('Transaction was not found in Supabase.');
-    return data;
+    if (updateError) throw new Error(`Could not update fss_table_transactions: ${updateError.message}`);
+
+    let savedData = updated;
+    if (!savedData) {
+      const idIsUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+      const { data, error } = await supabase
+        .from('fss_table_transactions')
+        .insert({ ...(idIsUuid ? { id } : {}), ...canonicalPayload })
+        .select('*')
+        .single();
+      if (error) throw new Error(`Could not save edited transaction to fss_table_transactions: ${error.message}`);
+      savedData = data;
+    }
+
+    if (await isFssTransactionsAvailable()) {
+      try {
+        const allowedCols = await getFssTransactionColumns();
+        const mirrorPayload: Record<string, any> = {
+          id: savedData.id,
+          transaction_date: txnDate,
+          type: canonicalPayload.transaction_type,
+          category: canonicalPayload.category,
+          description: canonicalPayload.description,
+          reference_no: canonicalPayload.reference_number,
+          party: canonicalPayload.party_name,
+          project: canonicalPayload.project_name,
+          department: canonicalPayload.department,
+          taxable_amount: taxable,
+          gst_amount: gst,
+          tds_amount: tds,
+          net_cash: netCash,
+          account: canonicalPayload.account_name,
+          mode: canonicalPayload.payment_mode,
+          notes: canonicalPayload.notes,
+          updated_at: now
+        };
+        const filtered = Object.fromEntries(
+          Object.entries(mirrorPayload).filter(([column, value]) => allowedCols.includes(column) && value !== undefined)
+        );
+        const { error } = await supabase.from('fss_transactions').upsert(filtered);
+        if (error) console.warn('Could not update optional fss_transactions mirror:', error);
+      } catch (mirrorError) {
+        console.warn('Could not update optional fss_transactions mirror:', mirrorError);
+      }
+    }
+
+    return savedData;
   },
 
   async deleteFssTransaction(id: string): Promise<void> {
     if (!supabase) throw new Error('Supabase is not configured. Check the existing Supabase URL and anon key.');
-    if (!UUID_PATTERN.test(id)) throw new Error('Transaction ID is invalid.');
-    const { data, error } = await supabase
+
+    const { error: transactionError } = await supabase
       .from('fss_transactions')
       .delete()
-      .eq('id', id)
-      .select('id')
-      .maybeSingle();
-    if (error) throw new Error(`Could not delete transaction from Supabase: ${error.message}`);
-    if (!data) throw new Error('Transaction was not found in Supabase.');
+      .eq('id', id);
+    if (transactionError) {
+      console.warn('Could not delete from optional fss_transactions table:', transactionError.message);
+    }
+
+    const { error: tableTransactionError } = await supabase
+      .from('fss_table_transactions')
+      .delete()
+      .eq('id', id);
+    if (tableTransactionError) {
+      throw new Error(`Could not delete from fss_table_transactions: ${tableTransactionError.message}`);
+    }
   },
 
   async callPayVendorEdgeFunction(body: Record<string, any>): Promise<any> {
     if (!isSupabaseConfigured) throw new Error('Supabase is not configured. Check the VITE_SUPABASE_URL and anon key.');
+    const op = String(body?.operation || '').toLowerCase();
+    if (!['select', 'insert', 'update', 'delete', 'create_form_attachment_upload', 'delete_form_attachment'].includes(op)) {
+      throw new Error(`Unsupported Supabase form operation: "${body?.operation}".`);
+    }
     let response: Response;
     try {
       response = await fetch('/api/fss-pay-vendor', {
@@ -606,13 +1436,68 @@ export const SupabaseService = {
         body: JSON.stringify(body)
       });
     } catch {
-      throw new Error('Could not reach the protected Supabase form service. Check your connection and access to this app.');
+      throw new Error('Could not reach the local Supabase form proxy. Start or restart the app with `npm run dev` in this project, then refresh and try again.');
     }
     const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(result.error || `Supabase form request failed (${response.status}).`);
+    if (!response.ok) {
+      const error = String(result.error || '');
+      if (/operation must be select, insert, update or delete/i.test(error)) {
+        throw new Error(
+          'The deployed fss-pay-vendor Supabase Edge Function is outdated and does not support attachment storage operations. Deploy the updated function, then restart the app and try again.'
+        );
+      }
+      throw new Error(error || `Supabase form request failed (${response.status}).`);
+    }
     return result.data;
   },
   async savePayVendorEntry(payload: Record<string, any>, rowId?: string, idempotencyKey?: string): Promise<any> {
+    if (!supabase) throw new Error('Supabase is not configured. Check your connection and access to this app.');
+
+    // 1. Always save/update directly in fss_table_transactions so it appears in ledger, cashflow, and accounts
+    try {
+      const taxable = Math.max(0, Number(payload.bill_amount_before_gst) || 0);
+      const gst = Math.max(0, Number(payload.gst_amount) || 0);
+      const tds = Math.max(0, Number(payload.tds_amount) || 0);
+      const net = Math.abs(Number(payload.amount_paid != null ? payload.amount_paid : payload.net_cash_paid) || (taxable + gst - tds));
+      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
+
+      const txnPayload = {
+        transaction_date: txnDate,
+        transaction_type: 'Outflow',
+        category: payload.category || 'Office – Fixed',
+        description: payload.description || payload.category || (payload.vendor_name ? `Payment to ${payload.vendor_name}` : 'Vendor payment'),
+        reference_number: payload.bill_number || payload.utr_cheque_reference || null,
+        party_name: payload.vendor_name || null,
+        project_name: payload.project || null,
+        department: payload.department || null,
+        taxable_amount: taxable,
+        gst_rate: Number(payload.gst_rate) || (taxable > 0 ? Math.round((gst / taxable) * 100) : 0),
+        gst_amount: gst,
+        tds_amount: tds,
+        net_cash: -net,
+        account_name: payload.paid_from || null,
+        payment_mode: payload.payment_mode || 'NEFT',
+        financial_year: getFinancialYear(txnDate),
+        notes: payload.notes || null,
+        status: 'Active',
+        updated_at: new Date().toISOString()
+      };
+
+      const { error: txnErr } = await supabase
+        .from('fss_table_transactions')
+        .insert(txnPayload)
+        .select('*')
+        .single();
+
+      if (txnErr) {
+        console.warn('Direct fss_table_transactions save notice:', txnErr.message);
+      }
+    } catch (txErr) {
+      console.warn('Could not insert vendor payment into fss_table_transactions:', txErr);
+    }
+
+    // The protected Edge Function is authoritative for the payment form row and
+    // its Storage attachment metadata; a ledger mirror must not mask its failure.
     return this.callPayVendorEdgeFunction({
       operation: rowId ? 'update' : 'insert',
       id: rowId,
@@ -638,44 +1523,59 @@ export const SupabaseService = {
     const uploaded: Array<{ name: string; type: string; size: number; storagePath: string; url: string }> = [];
     try {
       for (const file of files || []) {
-        const signed = await this.callPayVendorEdgeFunction({
+        const extension = file.name.split('.').pop()?.toLowerCase() || '';
+        const inferredTypes: Record<string, string> = {
+          pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+          gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', tif: 'image/tiff',
+          tiff: 'image/tiff', heic: 'image/heic', heif: 'image/heif'
+        };
+        const contentType = file.type || inferredTypes[extension];
+        if (!contentType) throw new Error(`Could not determine the file type for "${file.name}". Attach an image or PDF.`);
+        const signedUpload = await this.callPayVendorEdgeFunction({
           operation: 'create_form_attachment_upload',
           bucket,
           name: file.name,
-          content_type: file.type || 'application/octet-stream'
+          content_type: contentType
         });
-        if (!signed?.path || !signed?.token || !signed?.url) {
-          throw new Error('The Supabase attachment upload link was incomplete.');
-        }
-        const { error } = await supabase.storage
-          .from(bucket)
-          .uploadToSignedUrl(signed.path, signed.token, file, {
-            contentType: file.type || 'application/octet-stream'
-          });
-        if (error) throw new Error(`Could not upload "${file.name}" to Supabase Storage: ${error.message}`);
-        uploaded.push({
-          name: file.name,
-          type: file.type,
-          size: file.size,
-          storagePath: signed.path,
-          url: signed.url
-        });
-      }
-      return uploaded;
-    } catch (error) {
-      if (uploaded.length) {
+        const path = String(signedUpload?.path || '');
+        const token = String(signedUpload?.token || '');
+        if (!path || !token) throw new Error(`Supabase did not provide an upload link for "${file.name}".`);
         try {
-          await this.deleteFormAttachments(bucket, uploaded.map(file => file.storagePath));
-        } catch (cleanupError) {
-          const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : 'Storage cleanup failed.';
-          throw new Error(`${error instanceof Error ? error.message : 'Attachment upload failed.'} ${cleanupMessage}`);
+          const { error } = await supabase.storage.from(bucket).uploadToSignedUrl(path, token, file, {
+            contentType
+          });
+          if (error) throw new Error(`Could not upload "${file.name}" to the "${bucket}" bucket: ${error.message}`);
+          uploaded.push({
+            name: file.name,
+            type: contentType,
+            size: file.size,
+            storagePath: path,
+            url: signedUpload.url || supabase.storage.from(bucket).getPublicUrl(path).data?.publicUrl || ''
+          });
+        } catch (error) {
+          await this.callPayVendorEdgeFunction({ operation: 'delete_form_attachment', bucket, path }).catch(cleanupError => {
+            console.warn(`Could not remove incomplete upload "${path}":`, cleanupError);
+          });
+          throw error;
         }
       }
+    } catch (error) {
+      await Promise.all(uploaded.map(attachment =>
+        this.callPayVendorEdgeFunction({
+          operation: 'delete_form_attachment',
+          bucket,
+          path: attachment.storagePath
+        }).catch(cleanupError => {
+          console.warn(`Could not remove incomplete upload "${attachment.storagePath}":`, cleanupError);
+        })
+      ));
       throw error;
     }
+    return uploaded;
   },
   async deleteFormAttachments(bucket: FormAttachmentBucket, paths: string[]): Promise<void> {
-    for (const path of paths || []) {
+    if (!paths?.length) return;
+    for (const path of [...new Set(paths.filter(Boolean))]) {
       await this.callPayVendorEdgeFunction({ operation: 'delete_form_attachment', bucket, path });
     }
   },
@@ -707,7 +1607,45 @@ export const SupabaseService = {
         .single();
 
     if (result.error) throw result.error;
+
+    try {
+      const net = Math.abs(Number(payload.amount) || 0);
+      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
+      await supabase.from('fss_table_transactions').insert({
+        transaction_date: txnDate,
+        transaction_type: 'Outflow',
+        category: 'Salaries',
+        description: payload.description || payload.payment_for || (payload.employee_name ? `Salary – ${payload.employee_name}` : 'Employee payment'),
+        reference_number: payload.reference_no || payload.utr_cheque_ref || null,
+        party_name: payload.employee_name || null,
+        project_name: payload.project || null,
+        department: payload.department || null,
+        taxable_amount: net,
+        gst_rate: 0,
+        gst_amount: 0,
+        tds_amount: 0,
+        net_cash: -net,
+        account_name: payload.paid_from || null,
+        payment_mode: payload.payment_mode || 'NEFT',
+        financial_year: getFinancialYear(txnDate),
+        notes: payload.notes || null,
+        status: 'Active',
+        updated_at: new Date().toISOString()
+      });
+    } catch (txMirrorErr) {
+      console.warn('Could not mirror employee payment to fss_table_transactions:', txMirrorErr);
+    }
+
     return result.data;
+  },
+  async loadPayEmployeeEntries(): Promise<any[]> {
+    if (!supabase) return [];
+    const { data, error } = await supabase
+      .from('fss_form_pay_an_employee')
+      .select('*')
+      .order('payment_date', { ascending: false });
+    if (error) throw error;
+    return data || [];
   },
 
   async saveTaxStatutoryEntry(payload: Record<string, any>, rowId?: string): Promise<any> {
@@ -718,6 +1656,34 @@ export const SupabaseService = {
         .eq('id', rowId).select().single()
       : await supabase.from('fss_form_tax_statutory').insert(payload).select().single();
     if (result.error) throw result.error;
+
+    try {
+      const net = Math.abs(Number(payload.amount_paid) || 0);
+      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
+      await supabase.from('fss_table_transactions').insert({
+        transaction_date: txnDate,
+        transaction_type: 'Outflow',
+        category: payload.category || payload.paying_type || 'Statutory & Tax',
+        description: payload.description || payload.paying_type || 'Tax payment',
+        reference_number: payload.challan_no || payload.utr_cheque_ref || null,
+        party_name: payload.party || null,
+        department: payload.department || null,
+        taxable_amount: net,
+        gst_rate: 0,
+        gst_amount: 0,
+        tds_amount: 0,
+        net_cash: -net,
+        account_name: payload.paid_from || null,
+        payment_mode: payload.payment_mode || 'NEFT',
+        financial_year: getFinancialYear(txnDate),
+        notes: payload.notes || null,
+        status: 'Active',
+        updated_at: new Date().toISOString()
+      });
+    } catch (txMirrorErr) {
+      console.warn('Could not mirror tax payment to fss_table_transactions:', txMirrorErr);
+    }
+
     return result.data;
   },
 
@@ -742,6 +1708,38 @@ export const SupabaseService = {
         .eq('id', rowId).select().single()
       : await supabase.from('fss_form_other_expense').insert(payload).select().single();
     if (result.error) throw result.error;
+
+    try {
+      const taxable = Math.max(0, Number(payload.amount_before_gst) || 0);
+      const gst = Math.max(0, Number(payload.gst_amount) || 0);
+      const tds = Math.max(0, Number(payload.tds_amount) || 0);
+      const net = Math.abs(Number(payload.net_cash_paid) || (taxable + gst - tds));
+      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
+      await supabase.from('fss_table_transactions').insert({
+        transaction_date: txnDate,
+        transaction_type: 'Outflow',
+        category: payload.expense_category || 'Office – Variable',
+        description: payload.description || payload.expense_category || (payload.paid_to ? `Expense – ${payload.paid_to}` : 'Expense'),
+        reference_number: payload.reference_no || payload.utr_cheque_ref || null,
+        party_name: payload.paid_to || null,
+        project_name: payload.project || null,
+        department: payload.department || null,
+        taxable_amount: taxable,
+        gst_rate: Number(payload.gst_rate) || 0,
+        gst_amount: gst,
+        tds_amount: tds,
+        net_cash: -net,
+        account_name: payload.paid_from || null,
+        payment_mode: payload.payment_mode || 'NEFT',
+        financial_year: getFinancialYear(txnDate),
+        notes: payload.notes || null,
+        status: 'Active',
+        updated_at: new Date().toISOString()
+      });
+    } catch (txMirrorErr) {
+      console.warn('Could not mirror other expense to fss_table_transactions:', txMirrorErr);
+    }
+
     return result.data;
   },
 
@@ -766,6 +1764,38 @@ export const SupabaseService = {
         .eq('id', rowId).select().single()
       : await supabase.from('fss_form_client_payment').insert(payload).select().single();
     if (result.error) throw result.error;
+
+    try {
+      const taxable = Math.max(0, Number(payload.amount_before_gst) || 0);
+      const gst = Math.max(0, Number(payload.gst_amount) || 0);
+      const tds = Math.max(0, Number(payload.tds_amount) || 0);
+      const net = Math.abs(Number(payload.net_cash_received) || (taxable + gst - tds));
+      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
+      await supabase.from('fss_table_transactions').insert({
+        transaction_date: txnDate,
+        transaction_type: 'Inflow',
+        category: payload.category || 'Operating Receipts',
+        description: payload.description || (payload.client_name ? `Receipt from ${payload.client_name}` : 'Client payment'),
+        reference_number: payload.utr_cheque_ref || null,
+        party_name: payload.client_name || null,
+        project_name: payload.project || null,
+        department: payload.department || null,
+        taxable_amount: taxable,
+        gst_rate: Number(payload.gst_rate) || 0,
+        gst_amount: gst,
+        tds_amount: tds,
+        net_cash: net,
+        account_name: payload.received_into || null,
+        payment_mode: payload.payment_mode || 'NEFT',
+        financial_year: getFinancialYear(txnDate),
+        notes: payload.notes || null,
+        status: 'Active',
+        updated_at: new Date().toISOString()
+      });
+    } catch (txMirrorErr) {
+      console.warn('Could not mirror client payment to fss_table_transactions:', txMirrorErr);
+    }
+
     return result.data;
   },
 
@@ -799,6 +1829,36 @@ export const SupabaseService = {
         .eq('id', rowId).select().single()
       : await supabase.from('fss_form_other_income').insert(payload).select().single();
     if (result.error) throw result.error;
+
+    try {
+      const taxable = Math.max(0, Number(payload.amount) || 0);
+      const tds = Math.max(0, Number(payload.tds_amount) || 0);
+      const net = Math.abs(Number(payload.net_cash_received) || (taxable - tds));
+      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
+      await supabase.from('fss_table_transactions').insert({
+        transaction_date: txnDate,
+        transaction_type: 'Inflow',
+        category: payload.category || 'Other Income',
+        description: payload.description || payload.category || 'Other income',
+        reference_number: payload.utr_reference || null,
+        party_name: payload.received_from || null,
+        department: payload.department || null,
+        taxable_amount: taxable,
+        gst_rate: 0,
+        gst_amount: 0,
+        tds_amount: tds,
+        net_cash: net,
+        account_name: payload.received_into || null,
+        payment_mode: payload.payment_mode || 'NEFT',
+        financial_year: getFinancialYear(txnDate),
+        notes: payload.notes || null,
+        status: 'Active',
+        updated_at: new Date().toISOString()
+      });
+    } catch (txMirrorErr) {
+      console.warn('Could not mirror other income to fss_table_transactions:', txMirrorErr);
+    }
+
     return result.data;
   },
 
@@ -3315,8 +4375,85 @@ export const SupabaseService = {
     };
   },
 
+  async saveAccountTransfer(entry: any, transferId: string | number | null, accounts: any[] = []): Promise<any> {
+    if (!supabase) throw new Error('Supabase is not configured. Account transfers must be saved online.');
+    const amount = Number(entry.amount);
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('Transfer amount must be greater than zero.');
+    if (!entry.date) throw new Error('Transaction date is required.');
+    if (!String(entry.paymentMode || '').trim()) throw new Error('Payment mode is required.');
+
+    const { data: remoteAccounts, error: accountError } = await supabase
+      .from('fss_bank_accounts')
+      .select('id, account_name');
+    if (accountError) throw new Error(`Could not validate transfer accounts: ${accountError.message}`);
+
+    const normalizeName = (value: any) => String(value || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+    const resolveRemoteAccount = (reference: any) => {
+      const local = (accounts || []).find((account: any) =>
+        String(account.id) === String(reference) || String(account.supabase_id || '') === String(reference)
+      );
+      const remoteId = local?.supabase_id || (Number.isSafeInteger(Number(reference)) ? Number(reference) : null);
+      let matches = remoteId != null
+        ? (remoteAccounts || []).filter((account: any) => String(account.id) === String(remoteId))
+        : [];
+      if (!matches.length) {
+        const accountName = local?.name || String(reference || '');
+        matches = (remoteAccounts || []).filter((account: any) =>
+          normalizeName(account.account_name) === normalizeName(accountName)
+        );
+      }
+      if (matches.length !== 1) {
+        throw new Error(matches.length
+          ? 'A transfer account name matches more than one Supabase account.'
+          : `Transfer account "${local?.name || reference}" does not exist in Supabase.`);
+      }
+      return matches[0];
+    };
+
+    const from = resolveRemoteAccount(entry.accountId);
+    const to = resolveRemoteAccount(entry.toAccountId);
+    if (String(from.id) === String(to.id)) throw new Error('From and To accounts must differ.');
+
+    const { data, error } = await supabase.rpc('fss_account_transfer_upsert', {
+      p_transfer_id: transferId == null ? null : String(transferId),
+      p_from_account_id: Number(from.id),
+      p_to_account_id: Number(to.id),
+      p_amount: Math.round(amount * 100) / 100,
+      p_transaction_date: entry.date,
+      p_payment_mode: String(entry.paymentMode).trim(),
+      p_reference: entry.txnRef || entry.refNo || null,
+      p_description: entry.description || null,
+      p_notes: entry.notes || null
+    });
+    if (error) {
+      throw new Error(`Could not save account transfer. Apply the account-transfer Supabase migration if it has not been run: ${error.message}`);
+    }
+    if (!data?.id) throw new Error('Supabase did not return the saved account transfer.');
+    return data;
+  },
+
+  async setAccountTransferDeleted(id: string | number, deleted: boolean, deletedBy: string | null = null): Promise<boolean> {
+    if (!supabase) throw new Error('Supabase is not configured.');
+    const { error } = await supabase.rpc('fss_account_transfer_set_deleted', {
+      p_transfer_id: String(id),
+      p_deleted: deleted,
+      p_deleted_by: deletedBy
+    });
+    if (error) throw new Error(`Could not ${deleted ? 'move the transfer to Trash' : 'restore the transfer'}: ${error.message}`);
+    return true;
+  },
+
+  async deleteAccountTransfer(id: string | number): Promise<boolean> {
+    if (!supabase) throw new Error('Supabase is not configured.');
+    const { error } = await supabase.rpc('fss_account_transfer_delete', {
+      p_transfer_id: String(id)
+    });
+    if (error) throw new Error(`Could not permanently delete the account transfer: ${error.message}`);
+    return true;
+  },
+
   /**
-   * Saves or updates a transaction in public.fss_table_transactions
+   * Saves or updates a transaction in public.fss_table_transactions and public.fss_transactions
    */
   async saveTransaction(
     entry: any,
@@ -3326,77 +4463,200 @@ export const SupabaseService = {
     categories: any[] = [],
     accounts: any[] = []
   ): Promise<any> {
-    if (!supabase) return null;
+    if (!supabase) throw new Error('Supabase is not configured; the transaction could not be saved online.');
+    if (entry?.type === 'transfer') {
+      return this.saveAccountTransfer(entry, entry.supabase_id || null, accounts);
+    }
     try {
       const payload = this.formatTransactionPayload(entry, parties, projects, departments, categories, accounts);
+      const targetId = String(
+        entry.supabase_id ||
+        entry.supabase_fss_transaction_id ||
+        (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(entry.id)) ? entry.id : '')
+      );
+      const transactionId = targetId || (typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : '');
+      if (transactionId) payload.id = transactionId;
 
-      const targetId = entry.supabase_id || (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(entry.id)) ? entry.id : null);
-
+      let savedRecord: any = null;
       if (targetId) {
-        const { data: updated, error: updErr } = await supabase
+        const { data, error } = await supabase
           .from('fss_table_transactions')
           .update(payload)
           .eq('id', targetId)
-          .select()
+          .select('*')
           .maybeSingle();
+        if (error) throw new Error(`Could not update fss_table_transactions: ${error.message}`);
+        savedRecord = data;
+      }
 
-        if (!updErr && updated) {
-          return updated;
+      if (!savedRecord) {
+        const { data, error } = await supabase
+          .from('fss_table_transactions')
+          .insert(payload)
+          .select('*')
+          .single();
+        if (error) throw new Error(`Could not save transaction to fss_table_transactions: ${error.message}`);
+        savedRecord = data;
+      }
+
+      void (async () => {
+        if (await isFssTransactionsAvailable()) {
+          const allowedCols = await getFssTransactionColumns();
+          const mirrorEntry = {
+            ...entry,
+            supabase_id: savedRecord.id,
+            supabase_fss_transaction_id: savedRecord.id
+          };
+          const fssRow = formatFssTransactionRow(
+            mirrorEntry,
+            allowedCols,
+            parties,
+            projects,
+            departments,
+            categories,
+            accounts
+          );
+          fssRow.id = savedRecord.id;
+          const { error } = await supabase.from('fss_transactions').upsert(fssRow);
+          if (error) throw error;
         }
-      }
+      })().catch(fssErr => {
+        console.warn('Could not mirror transaction to fss_transactions:', fssErr);
+      });
 
-      // If no target ID or update didn't match, insert
-      const { data: inserted, error: insErr } = await supabase
-        .from('fss_table_transactions')
-        .insert(payload)
-        .select()
-        .single();
-
-      if (insErr) {
-        console.error('Error inserting transaction into fss_table_transactions:', insErr);
-        return null;
-      }
-
-      return inserted;
+      return savedRecord;
     } catch (err) {
       console.error('Exception saving transaction to Supabase:', err);
-      return null;
+      throw err;
     }
   },
 
   /**
-   * Cancels (soft deletes) a transaction in fss_table_transactions
+   * Cancels (soft deletes) a transaction in fss_table_transactions and fss_transactions
    */
   async cancelTransaction(idOrSupabaseId: string | number, entry?: any): Promise<boolean> {
     if (!supabase) return false;
+    const targetId = String(idOrSupabaseId || '');
+    const transferEntry = entry || ((window as any).Store?.data?.entries || []).find((candidate: any) =>
+      candidate.type === 'transfer' &&
+      (String(candidate.supabase_id || '') === targetId || String(candidate.id || '') === targetId)
+    );
+    if (transferEntry?.type === 'transfer') {
+      try {
+        return await this.setAccountTransferDeleted(idOrSupabaseId, true);
+      } catch (error) {
+        console.error('Could not cancel Supabase account transfer:', error);
+        return false;
+      }
+    }
     try {
-      const targetId = String(idOrSupabaseId || '');
-      const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(targetId);
+      const wantedDate = String(entry?.date || entry?.transaction_date || '').slice(0, 10);
 
-      let query = supabase.from('fss_table_transactions').update({
-        status: 'Cancelled',
-        updated_at: new Date().toISOString()
-      });
-
-      if (isUUID) {
-        query = query.eq('id', targetId);
-      } else if (entry && entry.supabase_id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(entry.supabase_id))) {
-        query = query.eq('id', String(entry.supabase_id));
-      } else if (entry && entry.refNo) {
-        query = query.eq('reference_number', entry.refNo);
-      } else if (targetId && !targetId.startsWith('e_') && !targetId.startsWith('e2')) {
-        query = query.eq('reference_number', targetId);
-      } else if (entry && entry.date) {
-        query = query.eq('transaction_date', entry.date);
-        if (entry.taxable != null) query = query.eq('taxable_amount', entry.taxable);
-      } else {
-        query = query.eq('reference_number', targetId);
+      let canonicalId: string | null = null;
+      const canonicalIdCandidates = [
+        entry?.supabase_fss_transaction_id,
+        entry?.supabase_id,
+        targetId
+      ].map(value => String(value || '')).filter((value, index, values) =>
+        (UUID_PATTERN.test(value) || /^\d+$/.test(value)) && values.indexOf(value) === index
+      );
+      for (const canonicalIdCandidate of canonicalIdCandidates) {
+        const { data, error } = await supabase
+          .from('fss_table_transactions')
+          .update({ status: 'Cancelled', updated_at: new Date().toISOString() })
+          .eq('id', canonicalIdCandidate)
+          .select('id')
+          .maybeSingle();
+        if (error) throw error;
+        if (data?.id) canonicalId = String(data.id);
+        if (canonicalId) break;
       }
 
-      const { error } = await query;
-      if (error) {
-        console.error('Error cancelling transaction in Supabase:', error);
-        return false;
+      if (!canonicalId && wantedDate) {
+        const { data, error } = await supabase
+          .from('fss_table_transactions')
+          .select('*')
+          .eq('transaction_date', wantedDate)
+          .limit(1000);
+        if (error) throw error;
+        const match = findBestTransactionMatch(data || [], entry);
+        if (match.ambiguous) {
+          throw new Error('More than one Supabase transaction matches this entry. No transaction was deleted.');
+        }
+        if (match.row) {
+          const { data: updated, error: updateError } = await supabase
+            .from('fss_table_transactions')
+            .update({ status: 'Cancelled', updated_at: new Date().toISOString() })
+            .eq('id', match.row.id)
+            .select('id')
+            .maybeSingle();
+          if (updateError) throw updateError;
+          if (!updated?.id) throw new Error('Supabase did not confirm cancellation of the matching transaction.');
+          canonicalId = String(updated.id);
+        }
+      }
+
+      let legacyMatch: any = null;
+      if (!canonicalId && await isFssTransactionsAvailable() && wantedDate) {
+        const { data, error } = await supabase
+          .from('fss_transactions')
+          .select('*')
+          .eq('transaction_date', wantedDate)
+          .limit(1000);
+        if (error) throw error;
+        const match = findBestTransactionMatch(data || [], entry);
+        if (match.ambiguous) {
+          throw new Error('More than one legacy transaction matches this entry. No transaction was moved to Trash.');
+        }
+        legacyMatch = match.row;
+      }
+
+      if (!canonicalId && legacyMatch) {
+        const { data, error } = await supabase
+          .from('fss_table_transactions')
+          .insert({
+            transaction_date: legacyMatch.transaction_date,
+            transaction_type: legacyMatch.type,
+            category: legacyMatch.category,
+            description: legacyMatch.description,
+            reference_number: legacyMatch.reference_no || null,
+            party_name: legacyMatch.party || null,
+            project_name: legacyMatch.project || null,
+            department: legacyMatch.department || null,
+            taxable_amount: Number(legacyMatch.taxable_amount) || 0,
+            gst_rate: Number(legacyMatch.gst_rate) || 0,
+            gst_amount: Number(legacyMatch.gst_amount) || 0,
+            tds_amount: Number(legacyMatch.tds_amount) || 0,
+            net_cash: Number(legacyMatch.net_cash) || 0,
+            account_name: legacyMatch.account || null,
+            payment_mode: legacyMatch.mode || 'NEFT',
+            financial_year: getFinancialYear(String(legacyMatch.transaction_date || wantedDate)),
+            notes: legacyMatch.notes || null,
+            status: 'Cancelled',
+            updated_at: new Date().toISOString()
+          })
+          .select('id')
+          .single();
+        if (error) throw error;
+        canonicalId = data?.id ? String(data.id) : null;
+      }
+
+      if (canonicalId && legacyMatch) {
+          const { error: deleteError } = await supabase
+            .from('fss_transactions')
+            .delete()
+            .eq('id', legacyMatch.id);
+          if (deleteError) throw deleteError;
+      }
+
+      if (!canonicalId) {
+        throw new Error('The transaction was not found in Supabase, so it was not moved to Trash.');
+      }
+      if (entry && typeof entry === 'object') {
+        entry.supabase_id = canonicalId;
+        entry.supabase_fss_transaction_id = canonicalId;
       }
       return true;
     } catch (err) {
@@ -3406,48 +4666,131 @@ export const SupabaseService = {
   },
 
   /**
-   * Permanently deletes a transaction from fss_table_transactions
+   * Permanently deletes a transaction from fss_table_transactions and fss_transactions
    */
   async deleteTransaction(idOrSupabaseId: string | number, entry?: any): Promise<boolean> {
     if (!supabase) return false;
+    const targetId = String(idOrSupabaseId || '');
+    const transferEntry = entry || ((window as any).Store?.data?.entries || []).find((candidate: any) =>
+      candidate.type === 'transfer' &&
+      (String(candidate.supabase_id || '') === targetId || String(candidate.id || '') === targetId)
+    );
+    if (transferEntry?.type === 'transfer') {
+      return this.deleteAccountTransfer(idOrSupabaseId);
+    }
     try {
-      const targetId = String(idOrSupabaseId || '');
-      const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(targetId);
-
-      let query = supabase.from('fss_table_transactions').delete();
-      if (isUUID) {
-        query = query.eq('id', targetId);
-      } else if (entry && entry.supabase_id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(entry.supabase_id))) {
-        query = query.eq('id', String(entry.supabase_id));
-      } else if (entry && entry.refNo) {
-        query = query.eq('reference_number', entry.refNo);
-      } else if (targetId && !targetId.startsWith('e_') && !targetId.startsWith('e2')) {
-        query = query.eq('reference_number', targetId);
-      } else if (entry && entry.date) {
-        query = query.eq('transaction_date', entry.date);
-        if (entry.taxable != null) query = query.eq('taxable_amount', entry.taxable);
-      } else {
-        query = query.eq('reference_number', targetId);
+      const date = String(entry?.date || entry?.transaction_date || '').slice(0, 10);
+      let canonicalMatch: any = null;
+      const isDatabaseId = (value: string) =>
+        /^\d+$/.test(value) || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+      const canonicalIdCandidates = [
+        entry?.supabase_fss_transaction_id,
+        entry?.supabase_id,
+        targetId
+      ].map(value => String(value || '')).filter((value, index, values) =>
+        isDatabaseId(value) && values.indexOf(value) === index
+      );
+      for (const canonicalIdCandidate of canonicalIdCandidates) {
+        const { data, error } = await supabase
+          .from('fss_table_transactions')
+          .select('*')
+          .eq('id', canonicalIdCandidate)
+          .maybeSingle();
+        if (error) throw error;
+        // A primary-key hit is definitive. Text/category fields can differ
+        // between the ledger row and the stored transaction representation.
+        if (data) canonicalMatch = data;
+        if (canonicalMatch) break;
       }
 
-      const { error } = await query;
-      if (error) {
-        console.error('Error deleting transaction from Supabase:', error);
-        return false;
+      if (!canonicalMatch && date) {
+        const { data, error } = await supabase
+          .from('fss_table_transactions')
+          .select('*')
+          .eq('transaction_date', date)
+          .limit(1000);
+        if (error) throw error;
+        const match = findBestTransactionMatch(data || [], entry);
+        if (match.ambiguous) throw new Error('More than one Supabase transaction matches this entry. Nothing was permanently deleted.');
+        canonicalMatch = match.row;
       }
+
+      if (canonicalMatch) {
+        const { data, error } = await supabase
+          .from('fss_table_transactions')
+          .delete()
+          .eq('id', canonicalMatch.id)
+          .select('id');
+        if (error) throw error;
+        if (!data?.length) throw new Error('Supabase did not confirm permanent deletion of the transaction.');
+      }
+
+      void (async () => {
+        try {
+          let mirrorMatch: any = null;
+          if (await isFssTransactionsAvailable()) {
+            const mirrorIdCandidates = [
+              entry?.supabase_fss_transaction_id,
+              entry?.supabase_id,
+              targetId
+            ].map(value => String(value || '')).filter((value, index, values) =>
+              isDatabaseId(value) && values.indexOf(value) === index
+            );
+            for (const mirrorIdCandidate of mirrorIdCandidates) {
+              const { data, error } = await supabase
+                .from('fss_transactions')
+                .select('*')
+                .eq('id', mirrorIdCandidate)
+                .maybeSingle();
+              if (error) throw error;
+              if (data) {
+                mirrorMatch = data;
+                break;
+              }
+            }
+          }
+          if (!mirrorMatch && await isFssTransactionsAvailable() && date) {
+            const { data, error } = await supabase
+              .from('fss_transactions')
+              .select('*')
+              .eq('transaction_date', date)
+              .limit(1000);
+            if (error) throw error;
+            const match = findBestTransactionMatch(data || [], entry);
+            if (match.ambiguous) throw new Error('More than one legacy transaction matches this entry.');
+            mirrorMatch = match.row;
+          }
+          if (mirrorMatch) {
+            const { error } = await supabase
+              .from('fss_transactions')
+              .delete()
+              .eq('id', mirrorMatch.id);
+            if (error) throw error;
+          }
+        } catch (mirrorError) {
+          console.warn('Could not remove the optional legacy transaction mirror:', mirrorError);
+        }
+      })();
+
+      // Treat a missing row as an already-completed purge so stale local Trash
+      // entries can be removed without requiring a separate Supabase Trash table.
       return true;
     } catch (err) {
       console.error('Exception deleting transaction from Supabase:', err);
-      return false;
+      throw new Error(
+        `Could not permanently delete the transaction: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   },
 
   /**
-   * Loads all transactions from public.fss_table_transactions
+   * Loads all transactions from the authoritative public.fss_table_transactions table.
    */
   async loadTransactionsFromSupabase(): Promise<any[]> {
-    if (!supabase) return [];
+    if (!supabase) throw new Error('Supabase is not configured');
     try {
+      // Keep this table authoritative so stale rows in the optional legacy
+      // mirror cannot bring permanently deleted transactions back.
       let allRecords: any[] = [];
       let from = 0;
       const batchSize = 1000;
@@ -3456,12 +4799,13 @@ export const SupabaseService = {
         const { data, error } = await supabase
           .from('fss_table_transactions')
           .select('*')
+          .or('status.is.null,status.not.ilike.%cancel%')
           .order('transaction_date', { ascending: false })
           .range(from, from + batchSize - 1);
 
         if (error) {
           console.error('Error loading transactions from Supabase:', error);
-          break;
+          throw error;
         }
 
         if (!data || data.length === 0) break;
@@ -3470,10 +4814,123 @@ export const SupabaseService = {
         from += batchSize;
       }
 
-      return allRecords;
+      return this.mergeAccountTransferRows(allRecords, {}, true);
     } catch (err) {
       console.error('Exception loading transactions from Supabase:', err);
-      return [];
+      throw err;
+    }
+  },
+
+  async loadCancelledTransactionsFromSupabase(): Promise<any[]> {
+    if (!supabase) throw new Error('Supabase is not configured');
+    const transactions: any[] = [];
+    let from = 0;
+    const batchSize = 1000;
+
+    while (true) {
+      const { data, error } = await supabase
+        .from('fss_table_transactions')
+        .select('*')
+        .ilike('status', '%cancel%')
+        .range(from, from + batchSize - 1);
+      if (error) throw new Error(`Could not load cancelled Supabase transactions: ${error.message}`);
+      if (!data?.length) break;
+      transactions.push(...data);
+      if (data.length < batchSize) break;
+      from += batchSize;
+    }
+
+    return transactions;
+  },
+
+  /**
+   * Syncs / stores all UI transactions into Supabase fss_transactions table
+   */
+  async syncUiTransactionsToFssTransactions(
+    entries?: any[],
+    options: { force?: boolean; onProgress?: (msg: string) => void } = {}
+  ): Promise<{ success: boolean; total: number; inserted: number; error?: string }> {
+    if (!supabase) return { success: false, total: 0, inserted: 0, error: 'Supabase is not configured' };
+    if (!(await isFssTransactionsAvailable())) return { success: true, total: 0, inserted: 0 };
+
+    try {
+      const allEntries = entries && entries.length
+        ? entries
+        : (typeof (window as any).Store !== 'undefined' && (window as any).Store.data?.entries) || [];
+
+      const valid = (allEntries || []).filter((e: any) => e.date && !e.deleted && e.type !== 'transfer');
+      if (valid.length === 0) {
+        return { success: true, total: 0, inserted: 0 };
+      }
+
+      // Check if fss_transactions already has records when force is false
+      if (!options.force) {
+        const { count, error: countErr } = await supabase
+          .from('fss_transactions')
+          .select('id', { count: 'exact', head: true });
+
+        if (!countErr && typeof count === 'number' && count > 0) {
+          console.log(`Supabase table fss_transactions already has ${count} records. Auto-sync skipped.`);
+          return { success: true, total: valid.length, inserted: 0 };
+        }
+      }
+
+      const parties = (typeof (window as any).Store !== 'undefined' && (window as any).Store.data?.parties) || [];
+      const projects = (typeof (window as any).Store !== 'undefined' && (window as any).Store.data?.projects) || [];
+      const departments = (typeof (window as any).Store !== 'undefined' && (window as any).Store.data?.departments) || [];
+      const categories = (typeof (window as any).Store !== 'undefined' && (window as any).Store.data?.categories) || [];
+      const accounts = (typeof (window as any).Store !== 'undefined' && (window as any).Store.data?.accounts) || [];
+
+      const allowedCols = await getFssTransactionColumns();
+
+      const payloads = valid.map((e: any) =>
+        formatFssTransactionRow(e, allowedCols, parties, projects, departments, categories, accounts)
+      );
+
+      let totalInserted = 0;
+      const CHUNK_SIZE = 100;
+      for (let i = 0; i < payloads.length; i += CHUNK_SIZE) {
+        const chunk = payloads.slice(i, i + CHUNK_SIZE);
+        const originalChunk = valid.slice(i, i + CHUNK_SIZE);
+
+        if (options.onProgress) {
+          options.onProgress(`Storing ${Math.min(i + CHUNK_SIZE, payloads.length)} of ${payloads.length} transactions in Supabase...`);
+        }
+
+        // Try upsert first
+        let res = await supabase
+          .from('fss_transactions')
+          .upsert(chunk, { onConflict: 'id' })
+          .select('id');
+
+        if (res.error) {
+          console.warn(`Upsert batch failed on fss_transactions, trying insert:`, res.error.message);
+          res = await supabase
+            .from('fss_transactions')
+            .insert(chunk)
+            .select('id');
+        }
+
+        if (res.error) {
+          console.error(`Error inserting batch into fss_transactions:`, res.error);
+        } else if (res.data) {
+          res.data.forEach((row: any, idx: number) => {
+            if (originalChunk[idx]) {
+              originalChunk[idx].supabase_fss_transaction_id = row.id;
+              if (!originalChunk[idx].supabase_id) {
+                originalChunk[idx].supabase_id = row.id;
+              }
+            }
+          });
+          totalInserted += res.data.length;
+        }
+      }
+
+      console.log(`✓ Stored ${totalInserted} of ${valid.length} transactions into Supabase fss_transactions.`);
+      return { success: true, total: valid.length, inserted: totalInserted };
+    } catch (err: any) {
+      console.error('Exception syncing UI transactions to Supabase fss_transactions:', err);
+      return { success: false, total: 0, inserted: 0, error: err.message || String(err) };
     }
   },
 
@@ -3491,6 +4948,9 @@ export const SupabaseService = {
     if (!supabase) return [];
     const valid = (localEntries || []).filter((e: any) => e.date && !e.deleted && e.type !== 'transfer');
     if (valid.length === 0) return [];
+
+    // Also sync to fss_transactions
+    void this.syncUiTransactionsToFssTransactions(valid, { force: false });
 
     const payloads = valid.map((e: any) => ({
       ...this.formatTransactionPayload(e, parties, projects, departments, categories, accounts),
@@ -7213,6 +8673,173 @@ export const SupabaseService = {
   },
   async deleteOfficeTravelRow(idOrKey: any): Promise<boolean> {
     return this.deleteOfficeTravel(idOrKey);
+  },
+
+  // By Account – Credited & Debited
+  async loadByAccountCreditedDebitedFromSupabase(
+    startYear = new Date().getMonth() >= 3 ? new Date().getFullYear() : new Date().getFullYear() - 1
+  ): Promise<any[]> {
+    if (!supabase) return [];
+    const { data, error } = await supabase
+      .from('fss_by_account_credited_debited')
+      .select('*')
+      .eq('row_kind', 'ACCOUNT')
+      .eq('financial_year', formatAccountSummaryFinancialYear(startYear))
+      .order('account_name', { ascending: true });
+    if (error) throw new Error(`Could not load fss_by_account_credited_debited: ${error.message}`);
+    return recomputeByAccountCreditedDebitedFyAndShares((data || []).map(mapAccountSummaryRowFromSupabase));
+  },
+
+  async insertByAccountCreditedDebited(
+    accountName: string,
+    startYear = new Date().getMonth() >= 3 ? new Date().getFullYear() : new Date().getFullYear() - 1
+  ): Promise<any[]> {
+    if (!supabase) throw new Error('Supabase is not configured.');
+    const trimmed = String(accountName || '').trim();
+    if (!trimmed) throw new Error('Account name is required.');
+
+    const { data: existing, error: checkErr } = await supabase
+      .from('fss_by_account_credited_debited')
+      .select('account_name')
+      .eq('row_kind', 'ACCOUNT')
+      .eq('financial_year', formatAccountSummaryFinancialYear(startYear))
+      .ilike('account_name', trimmed);
+    if (checkErr) throw new Error(`Could not check the account summary: ${checkErr.message}`);
+    if (existing?.length) {
+      throw new Error(`Account "${trimmed}" already exists.`);
+    }
+
+    const { error: insErr } = await supabase
+      .from('fss_by_account_credited_debited')
+      .insert([
+        { row_kind: 'ACCOUNT', financial_year: formatAccountSummaryFinancialYear(startYear), account_name: trimmed, transaction_type: 'CREDITED' },
+        { row_kind: 'ACCOUNT', financial_year: formatAccountSummaryFinancialYear(startYear), account_name: trimmed, transaction_type: 'DEBITED' }
+      ]);
+    if (insErr) throw new Error(`Could not add account summary rows: ${insErr.message}`);
+
+    return this.loadByAccountCreditedDebitedFromSupabase(startYear);
+  },
+
+  async updateByAccountCreditedDebitedCell(
+    id: number | string,
+    monthCol: string,
+    newValue: number | null,
+    startYear = new Date().getMonth() >= 3 ? new Date().getFullYear() : new Date().getFullYear() - 1
+  ): Promise<any[]> {
+    if (!supabase) throw new Error('Supabase is not configured.');
+    const validCols = Object.keys(BY_ACCOUNT_CD_DB_MONTH_COL);
+    const cleanCol = monthCol.toLowerCase().trim();
+    if (!validCols.includes(cleanCol)) throw new Error(`Invalid month column: ${monthCol}`);
+    const [accountName, transactionType] = String(id).split('::');
+    if (!accountName || !['credited', 'debited'].includes(transactionType || '')) {
+      throw new Error('Could not identify the account summary row to update.');
+    }
+
+    const valToSave = (newValue === null || newValue === undefined || isNaN(Number(newValue))) ? null : Math.round(Number(newValue) * 100) / 100;
+
+    const { error: updErr } = await supabase
+      .from('fss_by_account_credited_debited')
+      .update({ [BY_ACCOUNT_CD_DB_MONTH_COL[cleanCol as keyof typeof BY_ACCOUNT_CD_DB_MONTH_COL]]: valToSave })
+      .eq('row_kind', 'ACCOUNT')
+      .eq('financial_year', formatAccountSummaryFinancialYear(startYear))
+      .eq('account_name', accountName)
+      .eq('transaction_type', transactionType.toUpperCase());
+    if (updErr) throw new Error(`Could not update account summary: ${updErr.message}`);
+    return this.loadByAccountCreditedDebitedFromSupabase(startYear);
+  },
+
+  async deleteByAccountCreditedDebited(
+    accountName: string,
+    startYear = new Date().getMonth() >= 3 ? new Date().getFullYear() : new Date().getFullYear() - 1
+  ): Promise<any[]> {
+    if (!supabase) throw new Error('Supabase is not configured.');
+    const trimmed = String(accountName || '').trim();
+    if (!trimmed) throw new Error('Account name is required.');
+
+    const { error: delErr } = await supabase
+      .from('fss_by_account_credited_debited')
+      .delete()
+      .eq('row_kind', 'ACCOUNT')
+      .eq('financial_year', formatAccountSummaryFinancialYear(startYear))
+      .ilike('account_name', trimmed);
+    if (delErr) throw new Error(`Could not delete account summary: ${delErr.message}`);
+
+    return this.loadByAccountCreditedDebitedFromSupabase(startYear);
+  },
+
+  async syncByAccountCreditedDebitedToSupabase(
+    computedRows: any[],
+    startYear = new Date().getMonth() >= 3 ? new Date().getFullYear() : new Date().getFullYear() - 1
+  ): Promise<any[]> {
+    if (!supabase) return computedRows;
+    try {
+      const financialYear = formatAccountSummaryFinancialYear(startYear);
+      const { data: existing, error: loadErr } = await supabase
+        .from('fss_by_account_credited_debited')
+        .select('*')
+        .eq('row_kind', 'ACCOUNT')
+        .eq('financial_year', financialYear);
+      if (loadErr) {
+        throw new Error(`Could not read existing fss_by_account_credited_debited: ${loadErr.message}`);
+      }
+
+      const existingRows = (existing || []).map(mapAccountSummaryRowFromSupabase);
+
+      for (const row of computedRows || []) {
+        const normName = normalizeAccountName(row.account_name);
+        const normType = String(row.transaction_type || '').toLowerCase();
+
+        const match = existingRows.find((r: any) =>
+          normalizeAccountName(r.account_name) === normName &&
+          String(r.transaction_type || '').toLowerCase() === normType
+        );
+
+        const payload: any = {
+          row_kind: 'ACCOUNT',
+          financial_year: financialYear,
+          account_name: row.account_name,
+          transaction_type: normType.toUpperCase()
+        };
+        for (const [uiColumn, dbColumn] of Object.entries(BY_ACCOUNT_CD_DB_MONTH_COL)) {
+          payload[dbColumn] = row[uiColumn] ?? null;
+        }
+
+        if (match) {
+          const { error: updateErr } = await supabase
+            .from('fss_by_account_credited_debited')
+            .update(payload)
+            .eq('row_kind', 'ACCOUNT')
+            .eq('financial_year', financialYear)
+            .eq('account_name', match.account_name)
+            .eq('transaction_type', String(match.transaction_type || '').toUpperCase());
+          if (updateErr) {
+            if (/cannot update view|read-only|not updateable/i.test(updateErr.message || '')) {
+              console.warn('fss_by_account_credited_debited is read-only; keeping the computed local summary.');
+              return recomputeByAccountCreditedDebitedFyAndShares(computedRows);
+            }
+            throw new Error(`Could not update account summary for "${row.account_name}" (${row.transaction_type}): ${updateErr.message}`);
+          }
+          row.id = match.id;
+        } else {
+          const { error: insErr } = await supabase
+            .from('fss_by_account_credited_debited')
+            .insert([payload]);
+          if (insErr) {
+            if (/cannot insert into view|read-only|not insertable/i.test(insErr.message || '')) {
+              console.warn('fss_by_account_credited_debited is read-only; keeping the computed local summary.');
+              return recomputeByAccountCreditedDebitedFyAndShares(computedRows);
+            }
+            throw new Error(`Could not insert account summary for "${row.account_name}" (${row.transaction_type}): ${insErr.message}`);
+          }
+          row.id = `${row.account_name}::${normType}`;
+        }
+      }
+
+      return recomputeByAccountCreditedDebitedFyAndShares(computedRows);
+    } catch (err: any) {
+      console.error('syncByAccountCreditedDebitedToSupabase failed:', err?.message || err);
+      throw err;
+    }
   },
 };
 
