@@ -7447,13 +7447,18 @@ const ACT = {
       const a = api.get('accounts', el.dataset.id);
       if (!a) return;
       if (!await confirmBox({ title: 'Delete ' + a.name + '?', body: 'Are you sure you want to delete this bank account from the database?', ok: 'Delete' })) return;
-      if (typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteBankAccount === 'function') {
-        const sbId = a.supabase_id || (!isNaN(Number(a.id)) ? Number(a.id) : null);
-        const deleted = await (window as any).__supabaseDeleteBankAccount(sbId || a.name);
-        if (!deleted) {
-          toast('Bank account was not deleted from Supabase.', 'error');
-          return;
+      try {
+        if (typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteBankAccount === 'function') {
+          const sbId = a.supabase_id || (!isNaN(Number(a.id)) ? Number(a.id) : null);
+          const deleted = await (window as any).__supabaseDeleteBankAccount(sbId || a.name);
+          if (!deleted) {
+            toast('Bank account was not deleted from Supabase.', 'error');
+            return;
+          }
         }
+      } catch (err: any) {
+        toast(err?.message || 'Bank account could not be deleted.', 'error');
+        return;
       }
       const idx = Store.data.accounts.findIndex(x => x.id === a.id);
       if (idx >= 0) Store.data.accounts.splice(idx, 1);

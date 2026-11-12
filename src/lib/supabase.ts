@@ -3300,7 +3300,10 @@ export const SupabaseService = {
           .select('id');
         if (error) {
           console.error('Error deleting bank account from fss_bank_accounts by id:', error.message);
-          return false;
+          if (/violates foreign key|referenced from table/i.test(error.message || '')) {
+            throw new Error('This bank account cannot be deleted because transactions still use it. Delete or reassign those transactions first.');
+          }
+          throw new Error(`Could not delete bank account: ${error.message}`);
         }
         return Array.isArray(deleted) && deleted.length > 0;
       } else {
@@ -3311,7 +3314,10 @@ export const SupabaseService = {
           .select('id');
         if (error) {
           console.error('Error deleting bank account from fss_bank_accounts by name:', error.message);
-          return false;
+          if (/violates foreign key|referenced from table/i.test(error.message || '')) {
+            throw new Error('This bank account cannot be deleted because transactions still use it. Delete or reassign those transactions first.');
+          }
+          throw new Error(`Could not delete bank account: ${error.message}`);
         }
         return Array.isArray(deleted) && deleted.length > 0;
       }
