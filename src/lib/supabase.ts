@@ -3293,19 +3293,28 @@ export const SupabaseService = {
     try {
       const numId = Number(accountIdOrName);
       if (!isNaN(numId)) {
-        const { error } = await supabase.from('fss_bank_accounts').delete().eq('id', numId);
+        const { data: deleted, error } = await supabase
+          .from('fss_bank_accounts')
+          .delete()
+          .eq('id', numId)
+          .select('id');
         if (error) {
           console.error('Error deleting bank account from fss_bank_accounts by id:', error.message);
           return false;
         }
+        return Array.isArray(deleted) && deleted.length > 0;
       } else {
-        const { error } = await supabase.from('fss_bank_accounts').delete().eq('account_name', String(accountIdOrName));
+        const { data: deleted, error } = await supabase
+          .from('fss_bank_accounts')
+          .delete()
+          .eq('account_name', String(accountIdOrName))
+          .select('id');
         if (error) {
           console.error('Error deleting bank account from fss_bank_accounts by name:', error.message);
           return false;
         }
+        return Array.isArray(deleted) && deleted.length > 0;
       }
-      return true;
     } catch (err) {
       console.error('Exception deleting bank account:', err);
       return false;
