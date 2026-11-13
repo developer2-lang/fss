@@ -2110,7 +2110,6 @@ async function refreshLedgerFromSupabase() {
 
   ledgerLoading = true;
   ledgerLoadError = '';
-  refreshLedger();
   try {
     const records = await query(ledgerSupabaseFilters());
     if (requestId !== ledgerRequestId || S.page !== 'ledger') return;
@@ -2466,7 +2465,7 @@ const transfers = rows.filter(e => e.type === 'transfer');
     <div><div class="l">TDS in / out</div><div class="v">${money(sum(ins, e => e.tdsAmount))} / ${money(sum(outs, e => e.tdsAmount))}</div></div></div>`;
   const loadStatus = ledgerLoadError
     ? `<div class="notice" role="alert" style="margin:12px">${esc(ledgerLoadError)}</div>`
-    : ledgerLoading ? '<div class="notice" style="margin:12px">Loading transactions from Supabase…</div>' : '';
+    : '';
   if (ledgerLoadError && !rows.length) return strip + loadStatus;
   if (!rows.length) return strip + loadStatus + (ledgerLoading ? '' : `<div class="empty"><b>No transactions match</b>${fmtDate(from)} – ${fmtDate(to)}. Adjust the filters or add an entry.</div>`);
   const table = `<div class="tbl-wrap ledger-table"><table class="tbl"><thead><tr>
