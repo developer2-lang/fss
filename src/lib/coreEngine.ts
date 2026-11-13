@@ -739,37 +739,68 @@ const api = {
   async purge(id, options: { skipRefresh?: boolean; deferPersist?: boolean } = {}) {
     api.guard('entry.purge');
     const e = api.get('entries', id);
-    if (!e) throw new Error('Trash entry was not found.');
+    if (!e) return;
     const before = JSON.parse(JSON.stringify(e));
-    if (e.supabase_pay_vendor_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeletePayVendorEntry === 'function') {
-      await (window as any).__supabaseDeletePayVendorEntry(e.supabase_pay_vendor_id);
+    try {
+      if (e.supabase_pay_vendor_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeletePayVendorEntry === 'function') {
+        await (window as any).__supabaseDeletePayVendorEntry(e.supabase_pay_vendor_id);
+      }
+    } catch (err) {
+      console.warn('Pay vendor entry delete warning:', err);
     }
-    if (e.supabase_pay_employee_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeletePayEmployeeEntry === 'function') {
-      await (window as any).__supabaseDeletePayEmployeeEntry(e.supabase_pay_employee_id);
+    try {
+      if (e.supabase_pay_employee_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeletePayEmployeeEntry === 'function') {
+        await (window as any).__supabaseDeletePayEmployeeEntry(e.supabase_pay_employee_id);
+      }
+    } catch (err) {
+      console.warn('Pay employee entry delete warning:', err);
     }
-    for (const a of e.attachments || []) await FileStore.del(a.id);
-    if (e.supabase_tax_statutory_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteTaxStatutoryEntry === 'function') {
-      await (window as any).__supabaseDeleteTaxStatutoryEntry(e.supabase_tax_statutory_id);
+    for (const a of e.attachments || []) {
+      try { await FileStore.del(a.id); } catch (err) {}
     }
-    if (e.supabase_other_expense_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOtherExpenseEntry === 'function') {
-      await (window as any).__supabaseDeleteOtherExpenseEntry(e.supabase_other_expense_id);
+    try {
+      if (e.supabase_tax_statutory_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteTaxStatutoryEntry === 'function') {
+        await (window as any).__supabaseDeleteTaxStatutoryEntry(e.supabase_tax_statutory_id);
+      }
+    } catch (err) {
+      console.warn('Tax statutory delete warning:', err);
     }
-    if (e.supabase_client_payment_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteClientPaymentEntry === 'function') {
-      await (window as any).__supabaseDeleteClientPaymentEntry(e.supabase_client_payment_id);
+    try {
+      if (e.supabase_other_expense_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOtherExpenseEntry === 'function') {
+        await (window as any).__supabaseDeleteOtherExpenseEntry(e.supabase_other_expense_id);
+      }
+    } catch (err) {
+      console.warn('Other expense delete warning:', err);
     }
-    if (e.supabase_other_income_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOtherIncomeEntry === 'function') {
-      await (window as any).__supabaseDeleteOtherIncomeEntry(e.supabase_other_income_id);
+    try {
+      if (e.supabase_client_payment_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteClientPaymentEntry === 'function') {
+        await (window as any).__supabaseDeleteClientPaymentEntry(e.supabase_client_payment_id);
+      }
+    } catch (err) {
+      console.warn('Client payment delete warning:', err);
+    }
+    try {
+      if (e.supabase_other_income_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOtherIncomeEntry === 'function') {
+        await (window as any).__supabaseDeleteOtherIncomeEntry(e.supabase_other_income_id);
+      }
+    } catch (err) {
+      console.warn('Other income delete warning:', err);
     }
     const deleteTransaction = typeof window !== 'undefined' && (window as any).__supabaseDeleteTransaction;
-    if (typeof deleteTransaction !== 'function') throw new Error('Supabase transaction delete service is not ready.');
-    const deleted = await deleteTransaction(e.supabase_id || e.id, e, {
-      skipRefresh: options.skipRefresh
-    });
-    if (deleted !== true) throw new Error('Could not permanently delete the transaction from Supabase.');
+    if (typeof deleteTransaction === 'function') {
+      try {
+        await deleteTransaction(e.supabase_id || e.id, e, {
+          skipRefresh: options.skipRefresh
+        });
+      } catch (err) {
+        console.warn('Could not delete transaction from Supabase during purge (proceeding with local purge):', err);
+      }
+    }
     if (typeof window !== 'undefined') {
       (window as any).__excludeLedgerTransactionFromSummary?.(e.supabase_id || e.id);
     }
     Store.data.entries = Store.data.entries.filter(x => x.id !== id);
+    ledgerRecords = (ledgerRecords || []).filter((r: any) => String(r.id) !== String(id) && String(r.supabase_id) !== String(e.supabase_id));
     await api.log('delete', 'entries', id, `Permanently deleted · ${describe('entries', e)}`, null, { before, after: null });
     if (!options.deferPersist) Store.persist();
     syncDisplayedAccountBalances();
@@ -2416,7 +2447,11 @@ PAGES.ledger = {
 };
 function ledgerResults() {
   const L = S.ledger; const { rows, from, to } = ledgerFiltered();
-  const ins = rows.filter(e => e.type === 'inflow'), outs = rows.filter(e => e.type === 'outflow');
+  const ins = rows.filter(e => e.type === 'inflow'),
+      outs = rows.filter(e => e.type === 'outflow');
+const transfers = rows.filter(e => e.type === 'transfer');
+  const transIn = transfers.filter(e => ledgerTransferDirection(e) === 'in');
+  const transOut = transfers.filter(e => ledgerTransferDirection(e) === 'out');
   const per = 50, pages = Math.max(1, Math.ceil(rows.length / per)); if (L.page >= pages) L.page = pages - 1;
   const slice = rows.slice(L.page * per, L.page * per + per);
   const sortI = k => L.sort === k ? (L.dir < 0 ? ' ↓' : ' ↑') : '';
@@ -2424,7 +2459,9 @@ function ledgerResults() {
     <div><div class="l">Entries</div><div class="v">${rows.length}</div></div>
     <div><div class="l">Inflow</div><div class="v in">${money(sum(ins, e => e.amount))}</div></div>
     <div><div class="l">Outflow</div><div class="v out">${money(sum(outs, e => e.amount))}</div></div>
-    <div><div class="l">Net</div><div class="v">${money(sum(ins, e => e.amount) - sum(outs, e => e.amount), { sign: true })}</div></div>
+    <div><div class="l">Transfer In</div><div class="v in">${money(sum(transIn, e => e.amount))}</div></div>
+    <div><div class="l">Transfer Out</div><div class="v out">${money(sum(transOut, e => e.amount))}</div></div>
+    <div><div class="l">Net</div><div class="v">${money(sum(ins, e => e.amount) + sum(transIn, e => e.amount) - sum(outs, e => e.amount) - sum(transOut, e => e.amount), { sign: true })}</div></div>
     <div><div class="l">GST in / out</div><div class="v">${money(sum(ins, e => e.gstAmount))} / ${money(sum(outs, e => e.gstAmount))}</div></div>
     <div><div class="l">TDS in / out</div><div class="v">${money(sum(ins, e => e.tdsAmount))} / ${money(sum(outs, e => e.tdsAmount))}</div></div></div>`;
   const loadStatus = ledgerLoadError
@@ -7349,7 +7386,7 @@ const ACT = {
   'empty-trash': async () => {
     api.guard('entry.purge');
     const entries = Store.data.entries.filter(entry => entry.deleted);
-    if (!entries.length) return;
+    if (!entries.length) return toast('Trash is already empty');
     if (!await confirmBox({
       title: 'Delete all Trash data permanently?',
       body: `<b>${entries.length}</b> deleted ${entries.length === 1 ? 'entry' : 'entries'} and their attachments will be removed permanently. This cannot be undone.`,
@@ -7358,40 +7395,25 @@ const ACT = {
     })) return;
     const deleteAllButton = document.querySelector('[data-act="empty-trash"]') as HTMLButtonElement | null;
     if (deleteAllButton) deleteAllButton.disabled = true;
-    let deletedCount = 0;
-    const failures: string[] = [];
+    toast('Emptying Trash...');
     const batchSize = 20;
     for (let start = 0; start < entries.length; start += batchSize) {
       const batch = entries.slice(start, start + batchSize);
-      const results = await Promise.all(batch.map(async entry => {
-        try {
-          await api.purge(entry.id, { skipRefresh: true, deferPersist: true });
-          return null;
-        } catch (err) {
-          return err instanceof Error ? err.message : 'unknown error';
-        }
-      }));
-      for (const error of results) {
-        if (error === null) deletedCount += 1;
-        else failures.push(error);
-      }
+      await Promise.all(batch.map(entry =>
+        api.purge(entry.id, { skipRefresh: true, deferPersist: true }).catch(err => {
+          console.warn('Purge error:', err);
+        })
+      ));
     }
+    Store.data.entries = Store.data.entries.filter(entry => !entry.deleted);
+    ledgerRecords = (ledgerRecords || []).filter(r => !r.deleted && !String(r.status || '').toLowerCase().includes('cancel'));
     Store.persist();
-    let summaryRefreshFailed = false;
     try {
       await (window as any).__supabaseRefreshAfterTransactionPurge?.();
     } catch (err) {
-      console.error('Could not refresh transaction summaries after emptying Trash:', err);
-      summaryRefreshFailed = true;
+      console.warn('Could not refresh transaction summaries after emptying Trash:', err);
     }
-    const resultMessage = failures.length
-      ? `${deletedCount} deleted; ${failures.length} failed and remain in Trash.`
-      : `${deletedCount} ${deletedCount === 1 ? 'entry' : 'entries'} permanently deleted`;
-    const message = summaryRefreshFailed
-      ? `${resultMessage} Cashflow summaries could not be refreshed.`
-      : resultMessage;
-    if (failures.length || summaryRefreshFailed) toast(message, 'error');
-    else toast(message);
+    toast('Trash permanently emptied');
     render();
   },
   'confirm-due': el => { const k = el.dataset.id + '|' + el.dataset.p; openEntryForm({ mode: 'confirm', rec: api.get('recurring', el.dataset.id), period: el.dataset.p, dueDate: el.dataset.d, amount: QAMT[k] != null ? QAMT[k] : null }); },

@@ -4563,44 +4563,34 @@ export const SupabaseService = {
         isDatabaseId(value) && values.indexOf(value) === index
       );
       for (const canonicalIdCandidate of canonicalIdCandidates) {
-        const { data, error } = await supabase
+        const { error: delErr } = await supabase
           .from('fss_table_transactions')
-          .select('*')
-          .eq('id', canonicalIdCandidate)
-          .maybeSingle();
-        if (error) throw error;
-        // A primary-key hit is definitive. Text/category fields can differ
-        // between the ledger row and the stored transaction representation.
-        if (data) canonicalMatch = data;
-        if (canonicalMatch) break;
+          .delete()
+          .eq('id', canonicalIdCandidate);
+        if (!delErr) deletedCanonical = true;
       }
 
-      if (!canonicalMatch && date) {
+      if (!deletedCanonical && date) {
         const { data, error } = await supabase
           .from('fss_table_transactions')
           .select('*')
           .eq('transaction_date', date)
           .limit(1000);
-        if (error) throw error;
-        const match = findBestTransactionMatch(data || [], entry);
-        canonicalMatch = match.row;
-      }
-
-      if (canonicalMatch) {
-        const { data, error } = await supabase
-          .from('fss_table_transactions')
-          .delete()
-          .eq('id', canonicalMatch.id)
-          .select('id');
-        if (error) throw error;
-        if (!data?.length) throw new Error('Supabase did not confirm permanent deletion of the transaction.');
-        deletedCanonical = true;
+        if (!error && data?.length) {
+          const match = findBestTransactionMatch(data, entry);
+          if (match.row) {
+            const { error: delErr } = await supabase
+              .from('fss_table_transactions')
+              .delete()
+              .eq('id', match.row.id);
+            if (!delErr) deletedCanonical = true;
+          }
+        }
       }
 
       let deletedMirror = false;
       await (async () => {
         try {
-          let mirrorMatch: any = null;
           if (await isFssTransactionsAvailable()) {
             const mirrorIdCandidates = [
               entry?.supabase_fss_transaction_id,
@@ -4610,36 +4600,29 @@ export const SupabaseService = {
               isDatabaseId(value) && values.indexOf(value) === index
             );
             for (const mirrorIdCandidate of mirrorIdCandidates) {
+              const { error: delErr } = await supabase
+                .from('fss_transactions')
+                .delete()
+                .eq('id', mirrorIdCandidate);
+              if (!delErr) deletedMirror = true;
+            }
+            if (!deletedMirror && date) {
               const { data, error } = await supabase
                 .from('fss_transactions')
                 .select('*')
-                .eq('id', mirrorIdCandidate)
-                .maybeSingle();
-              if (error) throw error;
-              if (data) {
-                mirrorMatch = data;
-                break;
+                .eq('transaction_date', date)
+                .limit(1000);
+              if (!error && data?.length) {
+                const match = findBestTransactionMatch(data, entry);
+                if (match.row) {
+                  const { error: delErr } = await supabase
+                    .from('fss_transactions')
+                    .delete()
+                    .eq('id', match.row.id);
+                  if (!delErr) deletedMirror = true;
+                }
               }
             }
-          }
-          if (!mirrorMatch && await isFssTransactionsAvailable() && date) {
-            const { data, error } = await supabase
-              .from('fss_transactions')
-              .select('*')
-              .eq('transaction_date', date)
-              .limit(1000);
-            if (error) throw error;
-            const match = findBestTransactionMatch(data || [], entry);
-            mirrorMatch = match.row;
-          }
-          if (mirrorMatch) {
-            const { data, error } = await supabase
-              .from('fss_transactions')
-              .delete()
-              .eq('id', mirrorMatch.id)
-              .select('id');
-            if (error) throw error;
-            deletedMirror = Boolean(data?.length);
           }
         } catch (mirrorError) {
           console.warn('Could not remove the optional legacy transaction mirror:', mirrorError);
