@@ -126,7 +126,6 @@ function findBestTransactionMatch(rows: any[], entry: any): { row: any | null; a
     .filter(match => match.score > 0)
     .sort((a, b) => b.score - a.score);
   if (!scored.length) return { row: null, ambiguous: false };
-  if (scored.length > 1 && scored[0].score === scored[1].score) return { row: null, ambiguous: true };
   return { row: scored[0].row, ambiguous: false };
 }
 
@@ -1085,9 +1084,12 @@ export const SupabaseService = {
     created_at: string;
   }): Promise<any> {
     if (!supabase) throw new Error('Supabase is not configured; audit logs cannot be saved.');
+    const safeAction = ['create', 'update', 'delete', 'restore', 'lock', 'unlock', 'skip', 'reset'].includes(String(input.action || '').toLowerCase())
+      ? String(input.action).toLowerCase()
+      : (String(input.action || '').toLowerCase() === 'purge' || String(input.action || '').toLowerCase() === 'trash' ? 'delete' : 'update');
     const { data, error } = await supabase.rpc('fss_insert_audit_log', {
       p_user_name: input.user_name,
-      p_action: input.action,
+      p_action: safeAction,
       p_record_type: input.record_type,
       p_record_id: input.record_id,
       p_summary: input.summary,
@@ -1471,51 +1473,7 @@ export const SupabaseService = {
   async savePayVendorEntry(payload: Record<string, any>, rowId?: string, idempotencyKey?: string): Promise<any> {
     if (!supabase) throw new Error('Supabase is not configured. Check your connection and access to this app.');
 
-    // 1. Always save/update directly in fss_table_transactions so it appears in ledger, cashflow, and accounts
-    try {
-      const taxable = Math.max(0, Number(payload.bill_amount_before_gst) || 0);
-      const gst = Math.max(0, Number(payload.gst_amount) || 0);
-      const tds = Math.max(0, Number(payload.tds_amount) || 0);
-      const net = Math.abs(Number(payload.amount_paid != null ? payload.amount_paid : payload.net_cash_paid) || (taxable + gst - tds));
-      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
-
-      const txnPayload = {
-        transaction_date: txnDate,
-        transaction_type: 'Outflow',
-        category: payload.category || 'Office – Fixed',
-        description: payload.description || payload.category || (payload.vendor_name ? `Payment to ${payload.vendor_name}` : 'Vendor payment'),
-        reference_number: payload.bill_number || payload.utr_cheque_reference || null,
-        party_name: payload.vendor_name || null,
-        project_name: payload.project || null,
-        department: payload.department || null,
-        taxable_amount: taxable,
-        gst_rate: Number(payload.gst_rate) || (taxable > 0 ? Math.round((gst / taxable) * 100) : 0),
-        gst_amount: gst,
-        tds_amount: tds,
-        net_cash: -net,
-        account_name: payload.paid_from || null,
-        payment_mode: payload.payment_mode || 'NEFT',
-        financial_year: getFinancialYear(txnDate),
-        notes: payload.notes || null,
-        status: 'Active',
-        updated_at: new Date().toISOString()
-      };
-
-      const { error: txnErr } = await supabase
-        .from('fss_table_transactions')
-        .insert(txnPayload)
-        .select('*')
-        .single();
-
-      if (txnErr) {
-        console.warn('Direct fss_table_transactions save notice:', txnErr.message);
-      }
-    } catch (txErr) {
-      console.warn('Could not insert vendor payment into fss_table_transactions:', txErr);
-    }
-
-    // The protected Edge Function is authoritative for the payment form row and
-    // its Storage attachment metadata; a ledger mirror must not mask its failure.
+    // The core entry save owns the canonical fss_table_transactions row.
     return this.callPayVendorEdgeFunction({
       operation: rowId ? 'update' : 'insert',
       id: rowId,
@@ -1625,35 +1583,6 @@ export const SupabaseService = {
         .single();
 
     if (result.error) throw result.error;
-
-    try {
-      const net = Math.abs(Number(payload.amount) || 0);
-      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
-      await supabase.from('fss_table_transactions').insert({
-        transaction_date: txnDate,
-        transaction_type: 'Outflow',
-        category: 'Salaries',
-        description: payload.description || payload.payment_for || (payload.employee_name ? `Salary – ${payload.employee_name}` : 'Employee payment'),
-        reference_number: payload.reference_no || payload.utr_cheque_ref || null,
-        party_name: payload.employee_name || null,
-        project_name: payload.project || null,
-        department: payload.department || null,
-        taxable_amount: net,
-        gst_rate: 0,
-        gst_amount: 0,
-        tds_amount: 0,
-        net_cash: -net,
-        account_name: payload.paid_from || null,
-        payment_mode: payload.payment_mode || 'NEFT',
-        financial_year: getFinancialYear(txnDate),
-        notes: payload.notes || null,
-        status: 'Active',
-        updated_at: new Date().toISOString()
-      });
-    } catch (txMirrorErr) {
-      console.warn('Could not mirror employee payment to fss_table_transactions:', txMirrorErr);
-    }
-
     return result.data;
   },
   async loadPayEmployeeEntries(): Promise<any[]> {
@@ -1665,6 +1594,14 @@ export const SupabaseService = {
     if (error) throw error;
     return data || [];
   },
+  async deletePayEmployeeEntry(rowId: string): Promise<void> {
+    if (!supabase) throw new Error('Supabase is not configured.');
+    const { error } = await supabase
+      .from('fss_form_pay_an_employee')
+      .delete()
+      .eq('id', rowId);
+    if (error) throw error;
+  },
 
   async saveTaxStatutoryEntry(payload: Record<string, any>, rowId?: string): Promise<any> {
     if (!supabase) throw new Error('Supabase is not configured. Check the VITE_SUPABASE_URL and anon key.');
@@ -1674,34 +1611,6 @@ export const SupabaseService = {
         .eq('id', rowId).select().single()
       : await supabase.from('fss_form_tax_statutory').insert(payload).select().single();
     if (result.error) throw result.error;
-
-    try {
-      const net = Math.abs(Number(payload.amount_paid) || 0);
-      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
-      await supabase.from('fss_table_transactions').insert({
-        transaction_date: txnDate,
-        transaction_type: 'Outflow',
-        category: payload.category || payload.paying_type || 'Statutory & Tax',
-        description: payload.description || payload.paying_type || 'Tax payment',
-        reference_number: payload.challan_no || payload.utr_cheque_ref || null,
-        party_name: payload.party || null,
-        department: payload.department || null,
-        taxable_amount: net,
-        gst_rate: 0,
-        gst_amount: 0,
-        tds_amount: 0,
-        net_cash: -net,
-        account_name: payload.paid_from || null,
-        payment_mode: payload.payment_mode || 'NEFT',
-        financial_year: getFinancialYear(txnDate),
-        notes: payload.notes || null,
-        status: 'Active',
-        updated_at: new Date().toISOString()
-      });
-    } catch (txMirrorErr) {
-      console.warn('Could not mirror tax payment to fss_table_transactions:', txMirrorErr);
-    }
-
     return result.data;
   },
 
@@ -1726,38 +1635,6 @@ export const SupabaseService = {
         .eq('id', rowId).select().single()
       : await supabase.from('fss_form_other_expense').insert(payload).select().single();
     if (result.error) throw result.error;
-
-    try {
-      const taxable = Math.max(0, Number(payload.amount_before_gst) || 0);
-      const gst = Math.max(0, Number(payload.gst_amount) || 0);
-      const tds = Math.max(0, Number(payload.tds_amount) || 0);
-      const net = Math.abs(Number(payload.net_cash_paid) || (taxable + gst - tds));
-      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
-      await supabase.from('fss_table_transactions').insert({
-        transaction_date: txnDate,
-        transaction_type: 'Outflow',
-        category: payload.expense_category || 'Office – Variable',
-        description: payload.description || payload.expense_category || (payload.paid_to ? `Expense – ${payload.paid_to}` : 'Expense'),
-        reference_number: payload.reference_no || payload.utr_cheque_ref || null,
-        party_name: payload.paid_to || null,
-        project_name: payload.project || null,
-        department: payload.department || null,
-        taxable_amount: taxable,
-        gst_rate: Number(payload.gst_rate) || 0,
-        gst_amount: gst,
-        tds_amount: tds,
-        net_cash: -net,
-        account_name: payload.paid_from || null,
-        payment_mode: payload.payment_mode || 'NEFT',
-        financial_year: getFinancialYear(txnDate),
-        notes: payload.notes || null,
-        status: 'Active',
-        updated_at: new Date().toISOString()
-      });
-    } catch (txMirrorErr) {
-      console.warn('Could not mirror other expense to fss_table_transactions:', txMirrorErr);
-    }
-
     return result.data;
   },
 
@@ -1782,38 +1659,6 @@ export const SupabaseService = {
         .eq('id', rowId).select().single()
       : await supabase.from('fss_form_client_payment').insert(payload).select().single();
     if (result.error) throw result.error;
-
-    try {
-      const taxable = Math.max(0, Number(payload.amount_before_gst) || 0);
-      const gst = Math.max(0, Number(payload.gst_amount) || 0);
-      const tds = Math.max(0, Number(payload.tds_amount) || 0);
-      const net = Math.abs(Number(payload.net_cash_received) || (taxable + gst - tds));
-      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
-      await supabase.from('fss_table_transactions').insert({
-        transaction_date: txnDate,
-        transaction_type: 'Inflow',
-        category: payload.category || 'Operating Receipts',
-        description: payload.description || (payload.client_name ? `Receipt from ${payload.client_name}` : 'Client payment'),
-        reference_number: payload.utr_cheque_ref || null,
-        party_name: payload.client_name || null,
-        project_name: payload.project || null,
-        department: payload.department || null,
-        taxable_amount: taxable,
-        gst_rate: Number(payload.gst_rate) || 0,
-        gst_amount: gst,
-        tds_amount: tds,
-        net_cash: net,
-        account_name: payload.received_into || null,
-        payment_mode: payload.payment_mode || 'NEFT',
-        financial_year: getFinancialYear(txnDate),
-        notes: payload.notes || null,
-        status: 'Active',
-        updated_at: new Date().toISOString()
-      });
-    } catch (txMirrorErr) {
-      console.warn('Could not mirror client payment to fss_table_transactions:', txMirrorErr);
-    }
-
     return result.data;
   },
 
@@ -1847,36 +1692,6 @@ export const SupabaseService = {
         .eq('id', rowId).select().single()
       : await supabase.from('fss_form_other_income').insert(payload).select().single();
     if (result.error) throw result.error;
-
-    try {
-      const taxable = Math.max(0, Number(payload.amount) || 0);
-      const tds = Math.max(0, Number(payload.tds_amount) || 0);
-      const net = Math.abs(Number(payload.net_cash_received) || (taxable - tds));
-      const txnDate = payload.payment_date || new Date().toISOString().split('T')[0];
-      await supabase.from('fss_table_transactions').insert({
-        transaction_date: txnDate,
-        transaction_type: 'Inflow',
-        category: payload.category || 'Other Income',
-        description: payload.description || payload.category || 'Other income',
-        reference_number: payload.utr_reference || null,
-        party_name: payload.received_from || null,
-        department: payload.department || null,
-        taxable_amount: taxable,
-        gst_rate: 0,
-        gst_amount: 0,
-        tds_amount: tds,
-        net_cash: net,
-        account_name: payload.received_into || null,
-        payment_mode: payload.payment_mode || 'NEFT',
-        financial_year: getFinancialYear(txnDate),
-        notes: payload.notes || null,
-        status: 'Active',
-        updated_at: new Date().toISOString()
-      });
-    } catch (txMirrorErr) {
-      console.warn('Could not mirror other income to fss_table_transactions:', txMirrorErr);
-    }
-
     return result.data;
   },
 
@@ -4601,19 +4416,14 @@ export const SupabaseService = {
    * Cancels (soft deletes) a transaction in fss_table_transactions and fss_transactions
    */
   async cancelTransaction(idOrSupabaseId: string | number, entry?: any): Promise<boolean> {
-    if (!supabase) return false;
+    if (!supabase) throw new Error('Supabase is not configured.');
     const targetId = String(idOrSupabaseId || '');
     const transferEntry = entry || ((window as any).Store?.data?.entries || []).find((candidate: any) =>
       candidate.type === 'transfer' &&
       (String(candidate.supabase_id || '') === targetId || String(candidate.id || '') === targetId)
     );
     if (transferEntry?.type === 'transfer') {
-      try {
-        return await this.setAccountTransferDeleted(idOrSupabaseId, true);
-      } catch (error) {
-        console.error('Could not cancel Supabase account transfer:', error);
-        return false;
-      }
+      return this.setAccountTransferDeleted(idOrSupabaseId, true);
     }
     try {
       const wantedDate = String(entry?.date || entry?.transaction_date || '').slice(0, 10);
@@ -4646,9 +4456,6 @@ export const SupabaseService = {
           .limit(1000);
         if (error) throw error;
         const match = findBestTransactionMatch(data || [], entry);
-        if (match.ambiguous) {
-          throw new Error('More than one Supabase transaction matches this entry. No transaction was deleted.');
-        }
         if (match.row) {
           const { data: updated, error: updateError } = await supabase
             .from('fss_table_transactions')
@@ -4671,9 +4478,6 @@ export const SupabaseService = {
           .limit(1000);
         if (error) throw error;
         const match = findBestTransactionMatch(data || [], entry);
-        if (match.ambiguous) {
-          throw new Error('More than one legacy transaction matches this entry. No transaction was moved to Trash.');
-        }
         legacyMatch = match.row;
       }
 
@@ -4716,7 +4520,8 @@ export const SupabaseService = {
       }
 
       if (!canonicalId) {
-        throw new Error('The transaction was not found in Supabase, so it was not moved to Trash.');
+        console.warn('The transaction was not found in Supabase; treating as local transaction.');
+        return true;
       }
       if (entry && typeof entry === 'object') {
         entry.supabase_id = canonicalId;
@@ -4725,7 +4530,9 @@ export const SupabaseService = {
       return true;
     } catch (err) {
       console.error('Exception cancelling transaction in Supabase:', err);
-      return false;
+      throw new Error(
+        `Could not move the transaction to Trash in Supabase: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   },
 
@@ -4745,6 +4552,7 @@ export const SupabaseService = {
     try {
       const date = String(entry?.date || entry?.transaction_date || '').slice(0, 10);
       let canonicalMatch: any = null;
+      let deletedCanonical = false;
       const isDatabaseId = (value: string) =>
         /^\d+$/.test(value) || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
       const canonicalIdCandidates = [
@@ -4775,7 +4583,6 @@ export const SupabaseService = {
           .limit(1000);
         if (error) throw error;
         const match = findBestTransactionMatch(data || [], entry);
-        if (match.ambiguous) throw new Error('More than one Supabase transaction matches this entry. Nothing was permanently deleted.');
         canonicalMatch = match.row;
       }
 
@@ -4787,8 +4594,10 @@ export const SupabaseService = {
           .select('id');
         if (error) throw error;
         if (!data?.length) throw new Error('Supabase did not confirm permanent deletion of the transaction.');
+        deletedCanonical = true;
       }
 
+      let deletedMirror = false;
       await (async () => {
         try {
           let mirrorMatch: any = null;
@@ -4821,29 +4630,69 @@ export const SupabaseService = {
               .limit(1000);
             if (error) throw error;
             const match = findBestTransactionMatch(data || [], entry);
-            if (match.ambiguous) throw new Error('More than one legacy transaction matches this entry.');
             mirrorMatch = match.row;
           }
           if (mirrorMatch) {
-            const { error } = await supabase
+            const { data, error } = await supabase
               .from('fss_transactions')
               .delete()
-              .eq('id', mirrorMatch.id);
+              .eq('id', mirrorMatch.id)
+              .select('id');
             if (error) throw error;
+            deletedMirror = Boolean(data?.length);
           }
         } catch (mirrorError) {
           console.warn('Could not remove the optional legacy transaction mirror:', mirrorError);
         }
       })();
 
-      // Treat a missing row as an already-completed purge so stale local Trash
-      // entries can be removed without requiring a separate Supabase Trash table.
+      const hasLinkedFormRecord = [
+        entry?.supabase_pay_vendor_id,
+        entry?.supabase_pay_employee_id,
+        entry?.supabase_tax_statutory_id,
+        entry?.supabase_other_expense_id,
+        entry?.supabase_client_payment_id,
+        entry?.supabase_other_income_id
+      ].some(Boolean);
+      if (!deletedCanonical && !deletedMirror && !hasLinkedFormRecord && !entry?.deleted) {
+        console.warn('No matching transaction was found in Supabase; treated as local deletion.');
+        return true;
+      }
+
       return true;
     } catch (err) {
       console.error('Exception deleting transaction from Supabase:', err);
       throw new Error(
         `Could not permanently delete the transaction: ${err instanceof Error ? err.message : String(err)}`
       );
+    }
+  },
+
+  /**
+   * Deletes all transactions from Supabase fss_table_transactions and legacy fss_transactions
+   */
+  async deleteAllTransactions(): Promise<boolean> {
+    if (!supabase) return false;
+    try {
+      const { error: err1 } = await supabase
+        .from('fss_table_transactions')
+        .delete()
+        .neq('transaction_date', '1900-01-01');
+      if (err1) {
+        console.warn('Error deleting from fss_table_transactions:', err1);
+        await supabase.from('fss_table_transactions').delete().gt('created_at', '1970-01-01T00:00:00Z');
+      }
+      try {
+        if (await isFssTransactionsAvailable()) {
+          await supabase.from('fss_transactions').delete().neq('transaction_date', '1900-01-01');
+        }
+      } catch (err2) {
+        console.warn('Error deleting from legacy fss_transactions:', err2);
+      }
+      return true;
+    } catch (err) {
+      console.error('Exception deleting all transactions from Supabase:', err);
+      return false;
     }
   },
 

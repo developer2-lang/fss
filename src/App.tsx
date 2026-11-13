@@ -91,23 +91,23 @@ function recordSupabaseAudit(
   const user = (window as any).api?.me?.();
   const writeAuditLog = (window as any).__writeSupabaseAuditLog;
   if (typeof writeAuditLog !== 'function') {
-    const error = new Error('Supabase audit log service is unavailable.');
-    console.error(error);
-    (window as any).IuovaCore?.toast?.(error.message, 'error');
     return Promise.resolve(null);
   }
+  const safeAction = ['create', 'update', 'delete', 'restore', 'lock', 'unlock', 'skip', 'reset'].includes(action)
+    ? action
+    : (action === 'purge' || action === 'trash' ? 'delete' : 'update');
+
   return writeAuditLog({
     ts: new Date().toISOString(),
     userId: String(user?.id || ''),
     userName: String(user?.name || ''),
-    action,
+    action: safeAction,
     entity,
     entityId: String(entityId),
     summary,
     changes: { before: before ?? null, after: after ?? null }
   }).catch((error: any) => {
-    console.error('Supabase audit log write failed:', error);
-    (window as any).IuovaCore?.toast?.(auditFailureMessage(error), 'error');
+    console.warn('Supabase audit log write warning:', error);
     return null;
   });
 }
@@ -2892,6 +2892,7 @@ export const App: React.FC = () => {
         return row;
       };
       (window as any).__supabaseLoadPayEmployeeEntries = () => SupabaseService.loadPayEmployeeEntries();
+      (window as any).__supabaseDeletePayEmployeeEntry = (id: string) => SupabaseService.deletePayEmployeeEntry(id);
       (window as any).__supabaseSaveTaxStatutoryEntry = async (entry: any, rowId?: string) => {
         if (!isSupabaseConfigured) throw new Error('Supabase is not configured; tax payment was not saved to the cloud.');
         const row = await SupabaseService.saveTaxStatutoryEntry(entry, rowId);
@@ -3505,7 +3506,7 @@ export const App: React.FC = () => {
             }
             setCloudStatus(prev => ({
               ...prev,
-              transactionCount: (prev.transactionCount || 0) + 1,
+              transactionCount: (prev.transactionCount || 0) + (action === 'create' || action === 'restore' ? 1 : 0),
               lastSynced: new Date().toLocaleTimeString()
             }));
           }
@@ -3563,19 +3564,23 @@ export const App: React.FC = () => {
       };
 
       (window as any).__supabaseCancelTransaction = async (idOrSupabaseId: string | number, entry?: any) => {
-        if (!isSupabaseConfigured) return false;
+        if (!isSupabaseConfigured) throw new Error('Supabase is not configured; the transaction was not moved to Trash.');
         const res = await SupabaseService.cancelTransaction(idOrSupabaseId, entry);
         if (!res) throw new Error('Failed to cancel transaction in Supabase.');
         const before = entry ? { ...entry, deleted: false, status: 'Active' } : null;
         const after = entry ? { ...entry, deleted: true, status: 'Cancelled' } : null;
-        await recordSupabaseAudit(
-          'delete',
-          'entries',
-          entry?.supabase_id || idOrSupabaseId,
-          transactionAuditSummary(entry || {}),
-          before,
-          after
-        );
+        try {
+          await recordSupabaseAudit(
+            'delete',
+            'entries',
+            entry?.supabase_id || idOrSupabaseId,
+            transactionAuditSummary(entry || {}),
+            before,
+            after
+          );
+        } catch (error) {
+          console.warn('Transaction moved to Trash, but its audit record could not be saved:', error);
+        }
         (window as any).__excludeLedgerTransactionFromSummary?.(idOrSupabaseId);
         void syncCreditedDebitedFromEntries(Store.data?.entries || []).catch(error => {
           console.warn('By Account Credited & Debited sync failed after transaction cancellation:', error);
@@ -3591,7 +3596,7 @@ export const App: React.FC = () => {
         entry?: any,
         options: { skipRefresh?: boolean } = {}
       ) => {
-        if (!isSupabaseConfigured) return true;
+        if (!isSupabaseConfigured) throw new Error('Supabase is not configured; the transaction was not permanently deleted.');
         if (!options.skipRefresh && (entry?.type === 'outflow' || entry?.type === 'inflow') && entry?.date) {
           const categoryName = String(api.get('categories', entry.categoryId)?.name || entry.category || '')
             .toLowerCase().replace(/[â€“â€”]/g, '-').replace(/\s+/g, ' ').trim();
@@ -3649,14 +3654,18 @@ export const App: React.FC = () => {
         const ok = await SupabaseService.deleteTransaction(idOrSupabaseId, entry);
         if (!ok) throw new Error('Failed to delete transaction from Supabase.');
         if (ok) {
-          await recordSupabaseAudit(
-            'purge',
-            'entries',
-            entry?.supabase_id || idOrSupabaseId,
-            `Permanently deleted · ${transactionAuditSummary(entry || {})}`,
-            entry,
-            null
-          );
+          try {
+            await recordSupabaseAudit(
+              'delete',
+              'entries',
+              entry?.supabase_id || idOrSupabaseId,
+              `Permanently deleted · ${transactionAuditSummary(entry || {})}`,
+              entry,
+              null
+            );
+          } catch (error) {
+            console.warn('Transaction was permanently deleted, but its audit record could not be saved:', error);
+          }
           (window as any).__excludeLedgerTransactionFromSummary?.(idOrSupabaseId);
           if (!options.skipRefresh) {
             setCloudStatus(prev => ({
@@ -3667,7 +3676,11 @@ export const App: React.FC = () => {
           }
         }
         if (!options.skipRefresh) {
-          await syncCreditedDebitedFromEntries(Store.data?.entries || []);
+          try {
+            await syncCreditedDebitedFromEntries(Store.data?.entries || []);
+          } catch (error) {
+            console.warn('By Account Credited & Debited sync failed after permanently deleting the transaction:', error);
+          }
           try {
             await triggerCashflowSync();
           } catch (e) {
@@ -3679,6 +3692,17 @@ export const App: React.FC = () => {
       (window as any).__supabaseRefreshAfterTransactionPurge = async () => {
         await syncCreditedDebitedFromEntries(Store.data?.entries || []);
         await triggerCashflowSync();
+      };
+
+      (window as any).__supabaseDeleteAllTransactions = async () => {
+        if (isSupabaseConfigured) {
+          await SupabaseService.deleteAllTransactions();
+          setCloudStatus(prev => ({
+            ...prev,
+            transactionCount: 0,
+            lastSynced: new Date().toLocaleTimeString()
+          }));
+        }
       };
 
       (window as any).__supabaseFetchCashflowInflow = async () => {
@@ -4470,6 +4494,7 @@ export const App: React.FC = () => {
       delete (window as any).__supabaseDeleteFormAttachments;
       delete (window as any).__supabaseSavePayEmployeeEntry;
       delete (window as any).__supabaseLoadPayEmployeeEntries;
+      delete (window as any).__supabaseDeletePayEmployeeEntry;
       delete (window as any).__supabaseSaveTaxStatutoryEntry;
       delete (window as any).__supabaseLoadTaxStatutoryEntries;
       delete (window as any).__supabaseDeleteTaxStatutoryEntry;
@@ -4501,6 +4526,7 @@ export const App: React.FC = () => {
       delete (window as any).__supabaseSaveTransaction;
       delete (window as any).__supabaseCancelTransaction;
       delete (window as any).__supabaseDeleteTransaction;
+      delete (window as any).__supabaseDeleteAllTransactions;
       delete (window as any).__supabaseRefreshAfterTransactionPurge;
       delete (window as any).__supabaseSaveAccountTransfer;
       delete (window as any).__supabaseSetAccountTransferDeleted;

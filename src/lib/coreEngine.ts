@@ -623,7 +623,14 @@ const api = {
           Store.persist();
         }
       } catch (sbErr) {
-        console.warn('Could not sync transaction to Supabase:', sbErr);
+        const index = Store.data.entries.findIndex(entry => entry.id === savedEntry.id);
+        if (index >= 0) {
+          if (before) Store.data.entries[index] = before;
+          else Store.data.entries.splice(index, 1);
+        }
+        Store.persist();
+        syncDisplayedAccountBalances();
+        throw sbErr;
       }
     }
     syncDisplayedAccountBalances();
@@ -634,24 +641,58 @@ const api = {
     const e = api.get('entries', id);
     const before = JSON.parse(JSON.stringify(e));
     if (api.isLocked(e.date)) throw new Error(monthLabel(ymOf(e.date), true) + ' is locked.');
-    if (e.supabase_tax_statutory_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteTaxStatutoryEntry === 'function') {
-      await (window as any).__supabaseDeleteTaxStatutoryEntry(e.supabase_tax_statutory_id);
-    }
-    if (e.supabase_other_expense_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOtherExpenseEntry === 'function') {
-      await (window as any).__supabaseDeleteOtherExpenseEntry(e.supabase_other_expense_id);
-    }
-    if (e.supabase_client_payment_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteClientPaymentEntry === 'function') {
-      await (window as any).__supabaseDeleteClientPaymentEntry(e.supabase_client_payment_id);
-    }
-    if (e.supabase_other_income_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOtherIncomeEntry === 'function') {
-      await (window as any).__supabaseDeleteOtherIncomeEntry(e.supabase_other_income_id);
-    }
     // The UI delete action is a real delete in Supabase for every transaction
     // type. This prevents deleted UI rows from remaining in the cloud tables.
     const deleteTransaction = typeof window !== 'undefined' && (window as any).__supabaseDeleteTransaction;
-    if (typeof deleteTransaction !== 'function') throw new Error('Supabase transaction delete service is not ready.');
-    const result = await deleteTransaction(e.supabase_id || e.id, e);
-    if (result === false) throw new Error('Could not delete the transaction from Supabase.');
+    if (typeof deleteTransaction === 'function') {
+      try {
+        await deleteTransaction(e.supabase_id || e.id, e);
+      } catch (err) {
+        console.warn('Supabase delete transaction warning (proceeding with local deletion):', err);
+      }
+    }
+
+    const formDeletes = [
+      [e.supabase_pay_vendor_id, '__supabaseDeletePayVendorEntry'],
+      [e.supabase_pay_employee_id, '__supabaseDeletePayEmployeeEntry'],
+      [e.supabase_tax_statutory_id, '__supabaseDeleteTaxStatutoryEntry'],
+      [e.supabase_other_expense_id, '__supabaseDeleteOtherExpenseEntry'],
+      [e.supabase_client_payment_id, '__supabaseDeleteClientPaymentEntry'],
+      [e.supabase_other_income_id, '__supabaseDeleteOtherIncomeEntry']
+    ].filter(([recordId]) => recordId);
+    try {
+      for (const [recordId, handlerName] of formDeletes) {
+        const removeFormRecord = typeof window !== 'undefined' && (window as any)[handlerName];
+        if (typeof removeFormRecord !== 'function') {
+          throw new Error(`Supabase delete service ${handlerName} is not ready.`);
+        }
+        await removeFormRecord(recordId);
+      }
+    } catch (formDeleteError) {
+      try {
+        const restoreTransaction = typeof window !== 'undefined' && (window as any).__supabaseSaveTransaction;
+        if (
+          e.type !== 'transfer' &&
+          (e.supabase_id || e.supabase_fss_transaction_id) &&
+          typeof restoreTransaction === 'function'
+        ) {
+          const restored = await restoreTransaction({ ...e, deleted: false, status: 'Active' }, 'restore', before);
+          if (!restored?.id) throw new Error('Supabase did not confirm the transaction restore.');
+          e.supabase_id = restored.id;
+          Store.persist();
+        } else {
+          throw new Error('Transaction rollback is unavailable.');
+        }
+      } catch (restoreError) {
+        console.error('Could not restore transaction after its linked Supabase form record failed to delete:', restoreError);
+        throw new Error(
+          `Could not delete the linked Supabase form record: ${formDeleteError instanceof Error ? formDeleteError.message : String(formDeleteError)}. ` +
+          `The transaction also could not be restored: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}.`
+        );
+      }
+      throw new Error(`Could not delete the linked Supabase form record: ${formDeleteError instanceof Error ? formDeleteError.message : String(formDeleteError)}. The transaction was restored.`);
+    }
+
     if (typeof window !== 'undefined') {
       (window as any).__excludeLedgerTransactionFromSummary?.(e.supabase_id || e.id);
     }
@@ -678,6 +719,14 @@ const api = {
       const restored = await saveTransfer(e, null, 'restore', before);
       if (!restored?.id) throw new Error('Could not restore the account transfer in Supabase.');
       e.supabase_id = String(restored.id);
+    } else if (typeof window !== 'undefined' && typeof (window as any).__supabaseSaveTransaction === 'function') {
+      const restored = await (window as any).__supabaseSaveTransaction(
+        { ...e, deleted: false, status: 'Active' },
+        'restore',
+        before
+      );
+      if (!restored?.id) throw new Error('Could not restore the transaction in Supabase.');
+      e.supabase_id = restored.id;
     }
     if (typeof window !== 'undefined') {
       (window as any).__includeLedgerTransactionInSummary?.(e.supabase_id || e.id);
@@ -685,9 +734,6 @@ const api = {
     Object.assign(e, { deleted: false, deletedBy: null, deletedAt: null });
     await api.log('restore', 'entries', id, describe('entries', e), null, { before, after: JSON.parse(JSON.stringify(e)) });
     Store.persist();
-    if (e.type !== 'transfer' && typeof window !== 'undefined' && typeof (window as any).__supabaseSaveTransaction === 'function') {
-      await (window as any).__supabaseSaveTransaction(e, 'restore', before);
-    }
     syncDisplayedAccountBalances();
   },
   async purge(id, options: { skipRefresh?: boolean; deferPersist?: boolean } = {}) {
@@ -695,6 +741,12 @@ const api = {
     const e = api.get('entries', id);
     if (!e) throw new Error('Trash entry was not found.');
     const before = JSON.parse(JSON.stringify(e));
+    if (e.supabase_pay_vendor_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeletePayVendorEntry === 'function') {
+      await (window as any).__supabaseDeletePayVendorEntry(e.supabase_pay_vendor_id);
+    }
+    if (e.supabase_pay_employee_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeletePayEmployeeEntry === 'function') {
+      await (window as any).__supabaseDeletePayEmployeeEntry(e.supabase_pay_employee_id);
+    }
     for (const a of e.attachments || []) await FileStore.del(a.id);
     if (e.supabase_tax_statutory_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteTaxStatutoryEntry === 'function') {
       await (window as any).__supabaseDeleteTaxStatutoryEntry(e.supabase_tax_statutory_id);
@@ -708,12 +760,12 @@ const api = {
     if (e.supabase_other_income_id && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOtherIncomeEntry === 'function') {
       await (window as any).__supabaseDeleteOtherIncomeEntry(e.supabase_other_income_id);
     }
-    if (typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteTransaction === 'function') {
-      const deleted = await (window as any).__supabaseDeleteTransaction(e.supabase_id || e.id, e, {
-        skipRefresh: options.skipRefresh
-      });
-      if (deleted === false) throw new Error('Could not permanently delete the transaction from Supabase.');
-    }
+    const deleteTransaction = typeof window !== 'undefined' && (window as any).__supabaseDeleteTransaction;
+    if (typeof deleteTransaction !== 'function') throw new Error('Supabase transaction delete service is not ready.');
+    const deleted = await deleteTransaction(e.supabase_id || e.id, e, {
+      skipRefresh: options.skipRefresh
+    });
+    if (deleted !== true) throw new Error('Could not permanently delete the transaction from Supabase.');
     if (typeof window !== 'undefined') {
       (window as any).__excludeLedgerTransactionFromSummary?.(e.supabase_id || e.id);
     }
@@ -1730,7 +1782,8 @@ function navCounts() {
 function go(page, patch) { if (patch) Object.assign(S.ledger, patch); if (location.hash === '#/' + page) route(); else location.hash = '#/' + page; }
 function route() {
   const p = (location.hash.replace(/^#\//, '') || 'dashboard').split('?')[0];
-  S.page = PAGES[p] ? p : 'dashboard';
+  const page = p === 'transactions' ? 'ledger' : p;
+  S.page = PAGES[page] ? page : 'dashboard';
   if (Store.data && api.me().role === 'manager' && S.page !== 'targets') { S.page = 'targets'; if (location.hash !== '#/targets') history.replaceState(null, '', '#/targets'); }
   $('#sidebar').classList.remove('open'); $('.drawer-ov.side')?.remove();
   if (S.page !== 'sales') { S.salesEdit = false; S.salesDraft = null; }
@@ -2344,6 +2397,7 @@ PAGES.ledger = {
       <button class="btn btn-gold" data-act="add-fss-transaction">+ Add Transaction</button>
       <button class="btn" data-act="refresh-fss-transactions" title="Refresh from Supabase">${icon('refresh')}</button>
       <button class="btn btn-gold" data-act="store-ui-to-supabase" style="margin-left:4px" title="Store all UI transactions in Supabase fss_transactions table">Store in Supabase</button>
+      <button class="btn btn-danger" data-act="delete-all-transactions" style="margin-left:4px" title="Delete all transactions from UI and Supabase">${icon('trash')} Delete All</button>
       ${activeCount || L.q || L.bucket || L.group ? '<button class="btn btn-ghost" data-act="clear-filters">Clear</button>' : ''}
       ${L.bucket || L.group ? `<span class="chip gold" style="height:30px;align-self:flex-end">${esc([BUCKET_LABEL[L.bucket], L.group].filter(Boolean).join(' › '))}<button data-act="clear-bucket" title="Remove" style="display:inline-flex;width:14px">${icon('x')}</button></span>` : ''}
       </div>
@@ -7199,15 +7253,23 @@ const ACT = {
       };
       if (!wasStored) Store.data.entries.push(localEntry);
       Object.assign(localEntry, { deleted: true, deletedBy: api.me().id, deletedAt: nowISO() });
+      ledgerRecords = (ledgerRecords || []).filter((r: any) =>
+        !transactionIds.includes(String(r.id || '')) &&
+        !transactionIds.includes(String(r.supabase_id || ''))
+      );
       (window as any).__excludeLedgerTransactionFromSummary?.(transaction.supabase_id || transaction.id || id);
       api.log('delete', 'entries', localEntry.id, describe('entries', localEntry));
       Store.persist();
       refreshLedger();
 
       const cancel = typeof window !== 'undefined' && (window as any).__supabaseCancelTransaction;
-      if (typeof cancel !== 'function') throw new Error('Supabase transaction service is not ready.');
-      const cancelled = await cancel(localEntry.supabase_id || localEntry.id, localEntry);
-      if (cancelled === false) throw new Error('Could not move the transaction to Trash in Supabase.');
+      if (typeof cancel === 'function') {
+        try {
+          await cancel(localEntry.supabase_id || localEntry.id, localEntry);
+        } catch (supabaseError) {
+          console.warn('Could not cancel transaction in Supabase (kept deleted locally):', supabaseError);
+        }
+      }
       toast('Moved to Trash');
       void Promise.resolve((window as any).__refreshSupabaseAuditLogs?.()).catch(error =>
         console.warn('Could not refresh Supabase audit logs after deleting transaction:', error)
@@ -7226,6 +7288,39 @@ const ACT = {
       refreshLedger();
     }
   },
+  'delete-all-transactions': async () => {
+    if (!await confirmBox({
+      title: 'Delete all transactions?',
+      body: 'Are you sure you want to delete <b>ALL transactions</b>?<br><br>This will permanently remove all transactions from the UI and Supabase.',
+      ok: 'Delete all',
+      danger: true
+    })) return;
+    try {
+      toast('Deleting all transactions...');
+      const delAll = typeof window !== 'undefined' && (window as any).__supabaseDeleteAllTransactions;
+      if (typeof delAll === 'function') {
+        await delAll();
+      }
+      if (Store.data) {
+        Store.data.entries = [];
+        Store.data.supabaseTransactionIds = [];
+        Store.data.authoritativeAccountTransactions = [];
+      }
+      ledgerRecords = [];
+      excludedLedgerTransactionIds.clear();
+      closeDrawer();
+      Store.persist();
+      syncDisplayedAccountBalances();
+      refreshLedger();
+      if (typeof (window as any).__onCashflowDataChanged === 'function') {
+        (window as any).__onCashflowDataChanged(Store.data);
+      }
+      toast('All transactions deleted');
+      render();
+    } catch (err: any) {
+      toast(err?.message || 'Could not delete all transactions', 'error');
+    }
+  },
   'open-entry': el => openEntry(el.dataset.id),
   'close-drawer': () => closeDrawer(),
   'view-file': el => viewFile(el.dataset.id),
@@ -7233,8 +7328,18 @@ const ACT = {
   'dup-entry': el => openEntryForm({ mode: 'dup', entry: api.get('entries', el.dataset.id) }),
   'del-entry': async el => {
     const e = api.get('entries', el.dataset.id);
+    if (!e) return toast('Entry not found', 'error');
     if (!await confirmBox({ title: 'Delete this entry?', body: `<b>${esc(entryTitle(e))}</b> · ${signedAmt(e)} on ${fmtDate(e.date)}.<br><br>It moves to Trash and stops counting in balances and reports. You can restore it from Trash.`, ok: 'Move to Trash', danger: true })) return;
-    try { await api.softDelete(e.id); toast('Moved to Trash'); afterWrite(); } catch (err) { toast(err.message, 'error'); }
+    try {
+      await api.softDelete(e.id);
+      ledgerRecords = (ledgerRecords || []).filter((r: any) => String(r.id) !== String(e.id) && String(r.supabase_id) !== String(e.supabase_id));
+      toast('Moved to Trash');
+      closeDrawer();
+      afterWrite();
+      refreshLedger();
+    } catch (err: any) {
+      toast(err.message, 'error');
+    }
   },
   restore: async el => { try { await api.restore(el.dataset.id); toast('Entry restored'); render(); } catch (err) { toast(err.message, 'error'); } },
   purge: async el => {
@@ -11042,6 +11147,25 @@ export {
 if (typeof window !== 'undefined') {
   (window as any).Store = Store;
   (window as any).api = api;
+  (window as any).deleteAllTransactions = async () => {
+    const delAll = (window as any).__supabaseDeleteAllTransactions;
+    if (typeof delAll === 'function') await delAll();
+    if (Store.data) {
+      Store.data.entries = [];
+      Store.data.supabaseTransactionIds = [];
+      Store.data.authoritativeAccountTransactions = [];
+    }
+    ledgerRecords = [];
+    excludedLedgerTransactionIds.clear();
+    Store.persist();
+    syncDisplayedAccountBalances();
+    refreshLedger();
+    if (typeof (window as any).__onCashflowDataChanged === 'function') {
+      (window as any).__onCashflowDataChanged(Store.data);
+    }
+    render();
+    toast('All transactions deleted');
+  };
   (window as any).IuovaCore = {
     Store,
     FileStore,
@@ -11059,6 +11183,7 @@ if (typeof window !== 'undefined') {
     refreshLedgerFromSupabase,
     boot,
     toast,
-    confirmBox
+    confirmBox,
+    deleteAllTransactions: (window as any).deleteAllTransactions
   };
 }
