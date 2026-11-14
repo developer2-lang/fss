@@ -6137,10 +6137,21 @@ async function saveEntryFromForm(F) {
   const tiPI = F.kind === 'client' && F.issueTI && input.piId ? api.get('pis', input.piId) : null;
   if (tiPI && !tiPI.taxInvoiceDate) { if (typeof assertGstOpen === 'function') assertGstOpen([ymOf(input.date)], 'this invoice'); if (!F.auto || F.auto.refNo !== false || !input.refNo || input.refNo === tiPI.piNo) input.refNo = nextInvoiceNo(input.date); }
   checkEmail(F.email);
-  // Keep a locally saved vendor entry attached to this open form if its cloud
-  // insert fails, so correcting Auth and pressing Save again does not create a
-  // second local payment.
   const saved = F._pendingCloudVendorSaved || F._pendingCloudEmployeeSaved || F._pendingCloudTaxStatutorySaved || F._pendingCloudOtherExpenseSaved || F._pendingCloudClientPaymentSaved || F._pendingCloudOtherIncomeSaved || await api.saveEntry(input, F.mode === 'edit' ? v.id : null);
+  if (tiPI && !tiPI.taxInvoiceDate) { try { await issueTaxInvoice(tiPI.id, saved.date, saved.refNo); } catch (err: any) { toast('Saved, but the tax invoice was not issued: ' + err.message, 'error'); } }
+  if (F.repeat && F.mode === 'new') {
+    const r = { name: (nameOf('categories', saved.categoryId) + ' – ' + nameOf('parties', saved.partyId)).slice(0, 60), type: saved.type, categoryId: saved.categoryId, departmentId: saved.departmentId, partyId: saved.partyId, projectId: saved.projectId, description: saved.description, taxable: saved.taxable, gstType: saved.gstType, gstRate: saved.gstRate, tdsRate: saved.tdsRate, itc: saved.itc, paymentMode: saved.paymentMode, accountId: saved.accountId, frequency: F.rFreq, dayOfMonth: +saved.date.slice(8), startDate: saved.date, endDate: null, active: true, skipped: [] };
+    const rr = await api.create('recurring', r);
+    saved.recurringId = rr.id; saved.recurringPeriod = ymOf(saved.date); Store.persist();
+  }
+  toast((F.mode === 'edit' ? 'Entry updated' : F.mode === 'confirm' ? 'Recorded ' + F.rec.name : 'Entry saved · ' + money(saved.amount)) + (F.email?.on ? ' · email is being queued' : ''));
+  void syncSavedEntryToCloud(F, saved);
+  return saved;
+}
+
+async function syncSavedEntryToCloud(F: any, saved: any) {
+  try {
+    const v = F.v;
   if (F.kind === 'vendor' && typeof window !== 'undefined' && typeof (window as any).__supabaseSavePayVendorEntry === 'function') {
     const vendor = api.get('parties', saved.partyId) || {};
     const category = api.get('categories', saved.categoryId) || {};
@@ -6388,7 +6399,6 @@ async function saveEntryFromForm(F) {
     await deleteRemovedFormAttachments(F, FORM_ATTACHMENT_BUCKET_BY_KIND.other_in);
     delete F._pendingCloudOtherIncomeSaved;
   }
-  if (tiPI && !tiPI.taxInvoiceDate) { try { await issueTaxInvoice(tiPI.id, saved.date, saved.refNo); } catch (err) { toast('Saved, but the tax invoice was not issued: ' + err.message, 'error'); } }
   if (F.email?.on) {
     void finalizeEmail(F.email, { entity: 'entries', entityId: saved.id, docs: saved.attachments || [] })
       .then(mail => {
@@ -6396,20 +6406,16 @@ async function saveEntryFromForm(F) {
       })
       .catch(err => toast('Entry saved, but the email was not queued: ' + err.message, 'error'));
   }
-  for (const id of F.removed) await FileStore.del(id).catch(() => { });
-  if (F.repeat && F.mode === 'new') {
-    const r = { name: (nameOf('categories', saved.categoryId) + ' – ' + nameOf('parties', saved.partyId)).slice(0, 60), type: saved.type, categoryId: saved.categoryId, departmentId: saved.departmentId, partyId: saved.partyId, projectId: saved.projectId, description: saved.description, taxable: saved.taxable, gstType: saved.gstType, gstRate: saved.gstRate, tdsRate: saved.tdsRate, itc: saved.itc, paymentMode: saved.paymentMode, accountId: saved.accountId, frequency: F.rFreq, dayOfMonth: +saved.date.slice(8), startDate: saved.date, endDate: null, active: true, skipped: [] };
-    const rr = await api.create('recurring', r);
-    saved.recurringId = rr.id; saved.recurringPeriod = ymOf(saved.date); Store.persist();
-  }
+  for (const id of (F.removed || [])) await FileStore.del(id).catch(() => { });
   if (typeof window !== 'undefined' && typeof (window as any).__syncByAccountCreditedDebited === 'function') {
     void (window as any).__syncByAccountCreditedDebited();
   }
   if (typeof window !== 'undefined' && typeof (window as any).__refreshSupabaseAuditLogs === 'function') {
     void (window as any).__refreshSupabaseAuditLogs();
   }
-  toast((F.mode === 'edit' ? 'Entry updated' : F.mode === 'confirm' ? 'Recorded ' + F.rec.name : 'Entry saved · ' + money(saved.amount)) + (F.email?.on ? ' · email is being queued' : ''));
-  return saved;
+  } catch (cloudErr: any) {
+    console.error('Background cloud sync error:', cloudErr);
+  }
 }
 async function saveTemplate(F) {
   const v = F.v, errs = {};

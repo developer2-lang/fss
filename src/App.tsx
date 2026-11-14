@@ -131,9 +131,9 @@ function transactionAuditSummary(transaction: any): string {
     transaction?.project || findName('projects', transaction?.projectId);
   const transferAccounts = [
     transaction?.transfer_from_account_name || transaction?.transferFromAccountName ||
-      findName('accounts', transaction?.accountId),
+    findName('accounts', transaction?.accountId),
     transaction?.transfer_to_account_name || transaction?.transferToAccountName ||
-      findName('accounts', transaction?.toAccountId)
+    findName('accounts', transaction?.toAccountId)
   ].filter(Boolean);
   return [
     `${typeLabel} ₹${amountLabel}`,
@@ -1004,10 +1004,10 @@ export function deduplicateEntries(entries: any[]): any[] {
 
   const validEntries = hasSupabaseEntries
     ? (entries || []).filter((e: any) => Boolean(
-        e.supabase_id || e.supabase_tax_statutory_id || e.supabase_other_expense_id ||
-        e.supabase_client_payment_id || e.supabase_other_income_id || e.supabase_vendor_id ||
-        e.supabase_employee_id || e.isUserCreated || e.deleted
-      ))
+      e.supabase_id || e.supabase_tax_statutory_id || e.supabase_other_expense_id ||
+      e.supabase_client_payment_id || e.supabase_other_income_id || e.supabase_vendor_id ||
+      e.supabase_employee_id || e.isUserCreated || e.deleted
+    ))
     : (entries || []);
 
   // Sort so real Supabase entries (with supabase_id) come first, then latest by date
@@ -1312,7 +1312,7 @@ export const App: React.FC = () => {
       const accRec = convertFssBankAccountToLocal(newAcc);
       const existingIdx = Store.data.accounts.findIndex(
         (a: any) => (a.supabase_id && a.supabase_id === newAcc.id) ||
-                    (a.name && a.name.trim().toLowerCase() === newAcc.account_name.trim().toLowerCase())
+          (a.name && a.name.trim().toLowerCase() === newAcc.account_name.trim().toLowerCase())
       );
       const previous = existingIdx >= 0 ? { ...Store.data.accounts[existingIdx] } : null;
       if (existingIdx >= 0) {
@@ -1341,7 +1341,7 @@ export const App: React.FC = () => {
       const catRec = convertFssCategoryToLocal(newCat, Store.data.categories);
       const existingIdx = Store.data.categories.findIndex(
         (c: any) => (c.supabase_id && c.supabase_id === newCat.id) ||
-                    (c.name && c.name.trim().toLowerCase() === (newCat.category_name || '').trim().toLowerCase())
+          (c.name && c.name.trim().toLowerCase() === (newCat.category_name || '').trim().toLowerCase())
       );
       const previous = existingIdx >= 0 ? { ...Store.data.categories[existingIdx] } : null;
       if (existingIdx >= 0) {
@@ -1538,7 +1538,7 @@ export const App: React.FC = () => {
           (project: any) => convertFssProjectToLocal(project, Store.data.parties || [], Store.data.departments || []),
           (local: any, remote: any) => local.supabase_id === remote.id ||
             String(local.code || local.project_code || '').trim().toLowerCase() ===
-              String(remote.project_code || '').trim().toLowerCase()
+            String(remote.project_code || '').trim().toLowerCase()
         );
         Store.persist();
         render({ keepScroll: true });
@@ -1712,7 +1712,7 @@ export const App: React.FC = () => {
           const ordNum = (so.po_number || so.order_number || '').trim().toLowerCase();
           const existingIdx = Store.data.orders.findIndex(
             (o: any) => (o.supabase_id && o.supabase_id === so.id) ||
-                        (o.orderNo && o.orderNo.trim().toLowerCase() === ordNum)
+              (o.orderNo && o.orderNo.trim().toLowerCase() === ordNum)
           );
           if (existingIdx >= 0) {
             Store.data.orders[existingIdx] = {
@@ -1850,14 +1850,14 @@ export const App: React.FC = () => {
           };
           const existingIdx = Store.data.entries.findIndex(
             (e: any) => (e.supabase_id && e.supabase_id === st.id) ||
-                        (e.id === st.id || e.id === `e_${st.id}`) ||
-                        (st.reference_number && e.refNo && normStr(e.refNo) === normStr(st.reference_number)) ||
-                        (e.date === st.transaction_date &&
-                         String(e.type || '').toLowerCase() === String(st.transaction_type || '').toLowerCase() &&
-                         sameTransferAccounts(e) &&
-                         Math.abs((Number(e.taxable) || Number(e.amount) || 0) - (Number(st.taxable_amount) || Number(st.net_cash) || 0)) < 1 &&
-                         Boolean(normStr(e.description) && normStr(st.description) &&
-                         (normStr(e.description) === normStr(st.description) || normStr(e.description).includes(normStr(st.description)) || normStr(st.description).includes(normStr(e.description)))))
+              (e.id === st.id || e.id === `e_${st.id}`) ||
+              (st.reference_number && e.refNo && normStr(e.refNo) === normStr(st.reference_number)) ||
+              (e.date === st.transaction_date &&
+                String(e.type || '').toLowerCase() === String(st.transaction_type || '').toLowerCase() &&
+                sameTransferAccounts(e) &&
+                Math.abs((Number(e.taxable) || Number(e.amount) || 0) - (Number(st.taxable_amount) || Number(st.net_cash) || 0)) < 1 &&
+                Boolean(normStr(e.description) && normStr(st.description) &&
+                  (normStr(e.description) === normStr(st.description) || normStr(e.description).includes(normStr(st.description)) || normStr(st.description).includes(normStr(e.description)))))
           );
           if (existingIdx >= 0) {
             Store.data.entries[existingIdx] = {
@@ -2328,7 +2328,7 @@ export const App: React.FC = () => {
           finalCapexRows = syncRes.capex;
         }
       }
-      const allCapexNull = finalCapexRows.length > 0 && finalCapexRows.every((r: any) => ['jan_26','feb_26','mar_26','apr_26','may_26','jun_26','jul_26','aug_26','sep_26','oct_26','nov_26','dec_26'].every((m: string) => r[m] == null));
+      const allCapexNull = finalCapexRows.length > 0 && finalCapexRows.every((r: any) => ['jan_26', 'feb_26', 'mar_26', 'apr_26', 'may_26', 'jun_26', 'jul_26', 'aug_26', 'sep_26', 'oct_26', 'nov_26', 'dec_26'].every((m: string) => r[m] == null));
       if (!opts.skipAutoSeed && (finalCapexRows.length === 0 || allCapexNull) && Store.data?.entries) {
         const computedCapex = computeCashflowOutflowCapexRows(Store.data.entries, currentFy);
         if (computedCapex) {
@@ -2336,7 +2336,7 @@ export const App: React.FC = () => {
           finalCapexRows = syncRes.capex;
         }
       }
-      const allFinancingOwnerNull = finalFinancingAndOwnerRows.length > 0 && finalFinancingAndOwnerRows.every((r: any) => ['jan_26','feb_26','mar_26','apr_26','may_26','jun_26','jul_26','aug_26','sep_26','oct_26','nov_26','dec_26'].every((m: string) => r[m] == null));
+      const allFinancingOwnerNull = finalFinancingAndOwnerRows.length > 0 && finalFinancingAndOwnerRows.every((r: any) => ['jan_26', 'feb_26', 'mar_26', 'apr_26', 'may_26', 'jun_26', 'jul_26', 'aug_26', 'sep_26', 'oct_26', 'nov_26', 'dec_26'].every((m: string) => r[m] == null));
       if (!opts.skipAutoSeed && (finalFinancingAndOwnerRows.length === 0 || allFinancingOwnerNull) && Store.data?.entries) {
         const computedFinancingAndOwner = computeCashflowOutflowFinancingAndOwnerRows(Store.data.entries, currentFy);
         if (computedFinancingAndOwner) {
@@ -2344,7 +2344,7 @@ export const App: React.FC = () => {
           finalFinancingAndOwnerRows = syncRes.financingAndOwner;
         }
       }
-      const allOfficeFixedNull = finalOfficeFixedRows.length > 0 && finalOfficeFixedRows.every((r: any) => ['jan26','feb26','mar26','apr26','may26','jun26','july26','aug26','sept26','oct26','nov26','dec26'].every((m: string) => r[m] == null));
+      const allOfficeFixedNull = finalOfficeFixedRows.length > 0 && finalOfficeFixedRows.every((r: any) => ['jan26', 'feb26', 'mar26', 'apr26', 'may26', 'jun26', 'july26', 'aug26', 'sept26', 'oct26', 'nov26', 'dec26'].every((m: string) => r[m] == null));
       if (!opts.skipAutoSeed && (finalOfficeFixedRows.length === 0 || allOfficeFixedNull) && Store.data?.entries) {
         const computedOfficeFixed = computeCashflowOutflowOfficeFixedRows(Store.data.entries, currentFy);
         if (computedOfficeFixed) {
@@ -2352,7 +2352,7 @@ export const App: React.FC = () => {
           finalOfficeFixedRows = syncRes.officeFixed;
         }
       }
-      const allOfficeVariableNull = finalOfficeVariableRows.length > 0 && finalOfficeVariableRows.every((r: any) => ['jan26','feb26','mar26','apr26','may26','jun26','july26','aug26','sept26','oct26','nov26','dec26'].every((m: string) => r[m] == null));
+      const allOfficeVariableNull = finalOfficeVariableRows.length > 0 && finalOfficeVariableRows.every((r: any) => ['jan26', 'feb26', 'mar26', 'apr26', 'may26', 'jun26', 'july26', 'aug26', 'sept26', 'oct26', 'nov26', 'dec26'].every((m: string) => r[m] == null));
       if (!opts.skipAutoSeed && (finalOfficeVariableRows.length === 0 || allOfficeVariableNull) && Store.data?.entries) {
         const computedOfficeVariable = computeCashflowOutflowOfficeVariableRows(Store.data.entries, currentFy);
         if (computedOfficeVariable) {
@@ -2361,7 +2361,7 @@ export const App: React.FC = () => {
         }
       }
       const allTravelNull = finalTravelRows.length > 0 && finalTravelRows.every((r: any) =>
-        ['jan26','feb26','mar26','apr26','may26','jun26','july26','aug26','sept26','oct26','nov26','dec26']
+        ['jan26', 'feb26', 'mar26', 'apr26', 'may26', 'jun26', 'july26', 'aug26', 'sept26', 'oct26', 'nov26', 'dec26']
           .every((m: string) => r[m] == null || Number(r[m]) === 0)
       );
       if (!opts?.skipAutoSeed && (finalTravelRows.length === 0 || allTravelNull) && Store.data?.entries) {
@@ -2445,7 +2445,7 @@ export const App: React.FC = () => {
           localStorage.setItem(travelUiSyncKey, '1');
         }
       }
-      const allProfessionalAdminNull = finalProfessionalAdminRows.length > 0 && finalProfessionalAdminRows.every((r: any) => ['jan26','feb26','mar26','apr26','may26','jun26','july26','aug26','sept26','oct26','nov26','dec26'].every((m: string) => r[m] == null));
+      const allProfessionalAdminNull = finalProfessionalAdminRows.length > 0 && finalProfessionalAdminRows.every((r: any) => ['jan26', 'feb26', 'mar26', 'apr26', 'may26', 'jun26', 'july26', 'aug26', 'sept26', 'oct26', 'nov26', 'dec26'].every((m: string) => r[m] == null));
       const professionalAdminUiSyncKey = 'fss-professional-admin-ui-values-synced-v2';
       const needsProfessionalAdminSeed = !opts?.skipAutoSeed &&
         localStorage.getItem(professionalAdminUiSyncKey) !== '1' &&
@@ -2509,7 +2509,7 @@ export const App: React.FC = () => {
         finalProfessionalAdminRows = syncRes.professionalAdmin;
         localStorage.setItem(professionalAdminUiSyncKey, '1');
       }
-      const allTaxStatutoryNull = finalTaxStatutoryRows.length > 0 && finalTaxStatutoryRows.every((r: any) => ['jan_26','feb_26','mar_26','apr_26','may_26','jun_26','jul_26','aug_26','sep_26','oct_26','nov_26','dec_26'].every((m: string) => r[m] == null));
+      const allTaxStatutoryNull = finalTaxStatutoryRows.length > 0 && finalTaxStatutoryRows.every((r: any) => ['jan_26', 'feb_26', 'mar_26', 'apr_26', 'may_26', 'jun_26', 'jul_26', 'aug_26', 'sep_26', 'oct_26', 'nov_26', 'dec_26'].every((m: string) => r[m] == null));
       const needsTaxStatutorySeed = !opts?.skipAutoSeed && (finalTaxStatutoryRows.length === 0 || allTaxStatutoryNull);
       if (needsTaxStatutorySeed && Store.data?.entries) {
         const computedTaxStatutory = computeCashflowOutflowTaxStatutoryRows(Store.data.entries, currentFy);
@@ -2810,7 +2810,7 @@ export const App: React.FC = () => {
           lastSynced: new Date().toLocaleTimeString(),
           error: null
         }));
-        await refreshSupabaseAuditLogs();
+        void refreshSupabaseAuditLogs();
         return row;
       };
       (window as any).__fssQueryTransactions = (filters: any) => SupabaseService.queryFssTransactions(filters);
@@ -4617,8 +4617,8 @@ export const App: React.FC = () => {
                   cloudStatus.connected
                     ? `Supabase Connected · ${cloudStatus.clientCount ?? 0} clients, ${cloudStatus.vendorCount ?? 0} vendors, ${cloudStatus.transactionCount ?? 0} transactions, ${cloudStatus.orderCount ?? 0} orders · Last synced: ${cloudStatus.lastSynced || 'Just now'}`
                     : cloudStatus.configured
-                    ? 'Supabase Configured (Connecting...)'
-                    : 'Local Mode (Click to connect Supabase)'
+                      ? 'Supabase Configured (Connecting...)'
+                      : 'Local Mode (Click to connect Supabase)'
                 }
               >
                 <span className="cloud-dot"></span>
@@ -4626,10 +4626,10 @@ export const App: React.FC = () => {
                   {cloudStatus.syncing
                     ? 'Syncing...'
                     : cloudStatus.connected
-                    ? `Supabase (${cloudStatus.transactionCount ?? 0} txns · ${cloudStatus.orderCount ?? 0} orders · ${cloudStatus.clientCount ?? 0} clients · ${cloudStatus.vendorCount ?? 0} vendors)`
-                    : cloudStatus.configured
-                    ? 'Connecting'
-                    : 'Local Mode'}
+                      ? `Supabase (${cloudStatus.transactionCount ?? 0} txns · ${cloudStatus.orderCount ?? 0} orders · ${cloudStatus.clientCount ?? 0} clients · ${cloudStatus.vendorCount ?? 0} vendors)`
+                      : cloudStatus.configured
+                        ? 'Connecting'
+                        : 'Local Mode'}
                 </span>
               </button>
 
@@ -4673,8 +4673,8 @@ export const App: React.FC = () => {
                     {cloudStatus.connected
                       ? `Connected (${cloudStatus.transactionCount ?? 0} transactions, ${cloudStatus.orderCount ?? 0} orders, ${cloudStatus.clientCount ?? 0} clients, ${cloudStatus.vendorCount ?? 0} vendors)`
                       : cloudStatus.configured
-                      ? 'Connecting to Supabase...'
-                      : 'Running in Local Mode'}
+                        ? 'Connecting to Supabase...'
+                        : 'Running in Local Mode'}
                   </strong>
                   <div className="sub" style={{ fontSize: '12px', color: 'var(--muted)' }}>
                     {cloudStatus.lastSynced ? `Last synchronized at ${cloudStatus.lastSynced}` : 'Local data persistence'}

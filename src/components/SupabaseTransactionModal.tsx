@@ -129,6 +129,7 @@ export const SupabaseTransactionModal: React.FC<SupabaseTransactionModalProps> =
     setIsSaving(true);
     try {
       await onSave(transaction?.id || null, input);
+      onClose();
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : 'Could not save this transaction.');
       setIsSaving(false);
