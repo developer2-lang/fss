@@ -766,6 +766,12 @@ export function convertFssPIToLocal(
   const taxable = Number(spi.pre_gst_amount ?? match?.taxable ?? 0);
   const gstRate = Number(spi.gst_rate ?? match?.gstRate ?? 18);
   const gstAmount = Number(spi.gst_amount ?? match?.gstAmount ?? 0);
+  const rawGstType = String(spi.gst_type ?? match?.gstType ?? '').trim().toLowerCase();
+  const gstType = rawGstType === 'igst' || rawGstType === 'inter'
+    ? 'inter'
+    : rawGstType === 'none' || gstRate === 0
+      ? 'none'
+      : 'intra';
   const total = Number(spi.total_amount ?? (taxable + gstAmount));
   const tdsAmount = Number(spi.tds_amount ?? match?.tdsAmount ?? 0);
   const tdsRate = Number(match?.tdsRate ?? (taxable > 0 && tdsAmount > 0 ? Math.round((tdsAmount / taxable) * 100) : 10));
@@ -783,13 +789,14 @@ export function convertFssPIToLocal(
     taxable,
     total,
     gstRate,
-    gstType: (spi.gst_type || match?.gstType || 'intra') as 'intra' | 'inter' | 'none',
+    gstType,
     gstAmount,
     tdsRate,
     tdsAmount,
     status: (spi.status || match?.status || 'issued') as 'issued' | 'part' | 'paid' | 'cancelled',
     notes: spi.notes ?? match?.notes ?? '',
     taxInvoiceNo: spi.tax_invoice_number ?? match?.taxInvoiceNo ?? '',
+    taxInvoiceDate: spi.tax_invoice_date ?? match?.taxInvoiceDate ?? null,
     attachments: match?.attachments || [],
     deleted: false
   };
@@ -1746,52 +1753,23 @@ export const App: React.FC = () => {
     }
   }, []);
 
-  // Hydrate orders from Supabase fss_table_orders
+  // Hydrate orders and their split rows from the canonical Supabase tables.
   const loadSupabaseOrders = useCallback(async () => {
     if (!isSupabaseConfigured) return;
     try {
       setCloudStatus(prev => ({ ...prev, syncing: true, error: null }));
-      let supabaseOrders = await SupabaseService.loadOrdersFromSupabase();
-
-      // If fss_table_orders is empty in Supabase, auto-seed with local active orders
-      if (supabaseOrders.length === 0 && Store.data?.orders) {
-        const validOrders = Store.data.orders.filter((o: any) => o.orderNo && !o.deleted);
-        if (validOrders.length > 0) {
-          console.log('fss_table_orders table is empty in Supabase. Syncing existing orders to Supabase...');
-          await SupabaseService.syncLocalOrdersToSupabase(
-            Store.data.orders,
-            Store.data.parties || [],
-            Store.data.projects || [],
-            Store.data.departments || []
-          );
-          supabaseOrders = await SupabaseService.loadOrdersFromSupabase();
-        }
-      }
-
-      if (supabaseOrders && Store.data?.orders) {
-        supabaseOrders.forEach((so: any) => {
-          const ordRecord = convertFssOrderToLocal(
+      const supabaseOrders = await SupabaseService.loadOrdersFromSupabase();
+      if (supabaseOrders && Store.data) {
+        const existingOrders = Store.data.orders || [];
+        Store.data.orders = supabaseOrders.map((so: any) =>
+          convertFssOrderToLocal(
             so,
-            Store.data.orders,
+            existingOrders,
             Store.data.parties || [],
             Store.data.projects || [],
             Store.data.departments || []
-          );
-          const ordNum = (so.po_number || so.order_number || '').trim().toLowerCase();
-          const existingIdx = Store.data.orders.findIndex(
-            (o: any) => (o.supabase_id && o.supabase_id === so.id) ||
-              (o.orderNo && o.orderNo.trim().toLowerCase() === ordNum)
-          );
-          if (existingIdx >= 0) {
-            Store.data.orders[existingIdx] = {
-              ...Store.data.orders[existingIdx],
-              ...ordRecord,
-              id: Store.data.orders[existingIdx].id // preserve local id (e.g. ord_1)
-            };
-          } else {
-            Store.data.orders.unshift(ordRecord);
-          }
-        });
+          )
+        );
         Store.persist();
         render({ keepScroll: true });
       }
@@ -1806,10 +1784,14 @@ export const App: React.FC = () => {
       }));
     } catch (err: any) {
       console.error('Error syncing Supabase orders:', err);
+      if (Store.data) {
+        Store.data.orders = [];
+        render({ keepScroll: true });
+      }
       setCloudStatus(prev => ({
         ...prev,
         syncing: false,
-        error: err.message || 'Error connecting to fss_table_orders table'
+        error: err.message || 'Error connecting to fss_table_order_po and its detail tables'
       }));
     }
   }, []);
@@ -1818,45 +1800,18 @@ export const App: React.FC = () => {
   const loadSupabasePIs = useCallback(async () => {
     if (!isSupabaseConfigured) return;
     try {
-      let supabasePis = await SupabaseService.loadProformaInvoicesFromSupabase();
-
-      // If proforma_invoices table is empty in Supabase, auto-seed with local active PIs
-      if (supabasePis.length === 0 && Store.data?.pis) {
-        const validPis = Store.data.pis.filter((p: any) => (p.piNo || p.pi_number) && !p.deleted);
-        if (validPis.length > 0) {
-          console.log('proforma_invoices table is empty in Supabase. Syncing existing PIs to Supabase...');
-          await SupabaseService.syncLocalPIsToSupabase(
-            Store.data.pis,
-            Store.data.orders || []
-          );
-          supabasePis = await SupabaseService.loadProformaInvoicesFromSupabase();
-        }
-      }
-
-      if (supabasePis && Store.data?.pis) {
-        supabasePis.forEach((spi: any) => {
-          const piRecord = convertFssPIToLocal(
+      const supabasePis = await SupabaseService.loadProformaInvoicesFromSupabase();
+      if (supabasePis && Store.data) {
+        const existingPis = Store.data.pis || [];
+        Store.data.pis = supabasePis.map((spi: any) =>
+          convertFssPIToLocal(
             spi,
-            Store.data.pis,
+            existingPis,
             Store.data.orders || [],
             Store.data.parties || [],
             Store.data.projects || []
-          );
-          const piNum = (spi.pi_number || spi.piNo || '').trim().toLowerCase();
-          const existingIdx = Store.data.pis.findIndex(
-            (p: any) => (p.supabase_id && p.supabase_id === spi.id) ||
-              (p.piNo && p.piNo.trim().toLowerCase() === piNum)
-          );
-          if (existingIdx >= 0) {
-            Store.data.pis[existingIdx] = {
-              ...Store.data.pis[existingIdx],
-              ...piRecord,
-              id: Store.data.pis[existingIdx].id
-            };
-          } else {
-            Store.data.pis.unshift(piRecord);
-          }
-        });
+          )
+        );
         Store.persist();
         render({ keepScroll: true });
       }
@@ -1871,6 +1826,10 @@ export const App: React.FC = () => {
       }));
     } catch (err: any) {
       console.error('Error syncing Supabase proforma invoices:', err);
+      if (Store.data) {
+        Store.data.pis = [];
+        render({ keepScroll: true });
+      }
       setCloudStatus(prev => ({
         ...prev,
         syncing: false,
@@ -2008,6 +1967,14 @@ export const App: React.FC = () => {
       }));
     } catch (err: any) {
       console.error('Error syncing Supabase transactions:', err);
+      if (Store.data) {
+        Store.data.entries = [];
+        Store.data.cashflowEntries = [];
+        Store.data.supabaseTransactionIds = [];
+        Store.data.authoritativeAccountTransactions = [];
+        refreshCashflowEntriesFromStore();
+        render({ keepScroll: true });
+      }
       setCloudStatus(prev => ({
         ...prev,
         syncing: false,
@@ -2485,10 +2452,10 @@ export const App: React.FC = () => {
         loadSupabaseProjects(),
         loadSupabaseBankAccounts(),
         loadSupabaseCategories(),
-        loadSupabaseOrders(),
-        loadSupabasePIs(),
         loadSupabaseTransactions()
       ]);
+      await loadSupabaseOrders();
+      await loadSupabasePIs();
       await loadSupabaseCashflowTables();
     } finally {
       isHydratingSupabase.current = wasHydratingSupabase;
@@ -2663,37 +2630,6 @@ export const App: React.FC = () => {
       };
       (window as any).__computeByAccountCreditedDebitedRows = computeByAccountCreditedDebitedRows;
 
-      const syncUiTransactionsToSupabase = async (opts?: { force?: boolean }) => {
-        if (!isSupabaseConfigured) {
-          (window as any).IuovaCore?.toast?.('Supabase is not configured', 'bad');
-          return { success: false, total: 0, inserted: 0 };
-        }
-        const entries = Store.data?.entries || [];
-        const valid = entries.filter((e: any) => e.date && !e.deleted && e.type !== 'transfer');
-        (window as any).IuovaCore?.toast?.(`Storing ${valid.length} transactions into Supabase fss_table_transactions...`);
-
-        const res = await SupabaseService.syncUiTransactionsToFssTransactions(entries, {
-          force: opts?.force ?? true,
-          onProgress: (msg) => {
-            console.log(msg);
-          }
-        });
-
-        if (res.success) {
-          (window as any).IuovaCore?.toast?.(`✓ Successfully stored ${res.inserted || valid.length} transactions in Supabase table fss_table_transactions!`, 'good');
-          setCloudStatus(prev => ({
-            ...prev,
-            connected: true,
-            transactionCount: Math.max(prev.transactionCount || 0, res.inserted || valid.length),
-            lastSynced: new Date().toLocaleTimeString()
-          }));
-        } else {
-          (window as any).IuovaCore?.toast?.(`Failed to store transactions: ${res.error || 'Unknown error'}`, 'bad');
-        }
-        return res;
-      };
-      (window as any).syncUiTransactionsToSupabase = syncUiTransactionsToSupabase;
-      (window as any).__syncUiTransactionsToSupabase = syncUiTransactionsToSupabase;
       if (S.page === 'ledger') {
         void (window as any).IuovaCore?.refreshLedgerFromSupabase?.();
       }
@@ -2997,16 +2933,18 @@ export const App: React.FC = () => {
           console.warn('Supabase is not configured yet in .env; saving in local offline mode.');
           return null;
         }
+        const isNewOrder = !orderData.supabase_id;
         const res = await SupabaseService.saveOrder(
           orderData,
           Store.data?.parties || [],
           Store.data?.projects || [],
           Store.data?.departments || []
         );
+        if (!res?.id) throw new Error('Supabase did not return the saved order.');
         if (res) {
           setCloudStatus(prev => ({
             ...prev,
-            orderCount: (prev.orderCount || 0) + 1,
+            orderCount: Math.max(0, prev.orderCount || 0) + (isNewOrder ? 1 : 0),
             lastSynced: new Date().toLocaleTimeString()
           }));
         }
@@ -3014,8 +2952,9 @@ export const App: React.FC = () => {
       };
 
       (window as any).__supabaseDeleteOrder = async (orderIdOrNo: string | number) => {
-        if (!isSupabaseConfigured) return false;
+        if (!isSupabaseConfigured) return null;
         const ok = await SupabaseService.deleteOrder(orderIdOrNo);
+        if (!ok) throw new Error('Supabase did not confirm deletion of the order.');
         if (ok) {
           setCloudStatus(prev => ({
             ...prev,
@@ -3032,23 +2971,24 @@ export const App: React.FC = () => {
           console.warn('Supabase is not configured yet in .env; saving in local offline mode.');
           return null;
         }
+        const isNewPI = !piData.supabase_id;
         const res = await SupabaseService.saveProformaInvoice(
           piData,
           Store.data?.orders || []
         );
-        if (res) {
-          setCloudStatus(prev => ({
-            ...prev,
-            piCount: (prev.piCount || 0) + 1,
-            lastSynced: new Date().toLocaleTimeString()
-          }));
-        }
+        if (!res?.id) throw new Error('Supabase did not return the saved proforma invoice.');
+        setCloudStatus(prev => ({
+          ...prev,
+          piCount: Math.max(0, prev.piCount || 0) + (isNewPI ? 1 : 0),
+          lastSynced: new Date().toLocaleTimeString()
+        }));
         return res;
       };
 
       (window as any).__supabaseDeletePI = async (piIdOrNo: string | number) => {
-        if (!isSupabaseConfigured) return false;
+        if (!isSupabaseConfigured) return null;
         const ok = await SupabaseService.deleteProformaInvoice(piIdOrNo);
+        if (!ok) throw new Error('Supabase did not confirm deletion of the proforma invoice.');
         if (ok) {
           setCloudStatus(prev => ({
             ...prev,
@@ -3060,8 +3000,9 @@ export const App: React.FC = () => {
       };
 
       (window as any).__supabaseDeleteAllPIs = async () => {
-        if (!isSupabaseConfigured) return false;
+        if (!isSupabaseConfigured) throw new Error('Supabase is not configured; proforma invoices were not deleted.');
         const ok = await SupabaseService.deleteAllProformaInvoices();
+        if (!ok) throw new Error('Supabase did not confirm deletion of all proforma invoices.');
         if (ok) {
           setCloudStatus(prev => ({
             ...prev,
@@ -3069,6 +3010,18 @@ export const App: React.FC = () => {
             lastSynced: new Date().toLocaleTimeString()
           }));
         }
+        return ok;
+      };
+
+      (window as any).__supabaseDeleteAllOrders = async () => {
+        if (!isSupabaseConfigured) throw new Error('Supabase is not configured; orders were not deleted.');
+        const ok = await SupabaseService.deleteAllOrders();
+        if (!ok) throw new Error('Supabase did not confirm deletion of all orders.');
+        setCloudStatus(prev => ({
+          ...prev,
+          orderCount: 0,
+          lastSynced: new Date().toLocaleTimeString()
+        }));
         return ok;
       };
 
@@ -3572,31 +3525,31 @@ export const App: React.FC = () => {
       };
 
       (window as any).__supabaseDeleteAllTransactions = async () => {
-        if (isSupabaseConfigured) {
-          await SupabaseService.deleteAllTransactions();
-          if (Store.data) {
-            Store.data.entries = [];
-            Store.data.cashflowEntries = [];
-            Store.data.supabaseTransactionIds = [];
-            Store.data.authoritativeAccountTransactions = [];
-          }
-          await doSyncCashflowInflow();
-          try {
-            await syncCashOutflowSummary();
-          } catch (e) {
-            console.warn('syncCashOutflowSummary after deleteAllTransactions error:', e);
-          }
-          try {
-            await syncCreditedDebitedFromEntries([]);
-          } catch (e) {
-            console.warn('syncCreditedDebitedFromEntries after deleteAllTransactions error:', e);
-          }
-          setCloudStatus(prev => ({
-            ...prev,
-            transactionCount: 0,
-            lastSynced: new Date().toLocaleTimeString()
-          }));
+        if (!isSupabaseConfigured) throw new Error('Supabase is not configured; transactions were not deleted.');
+        const ok = await SupabaseService.deleteAllTransactions();
+        if (!ok) throw new Error('Supabase did not confirm deletion of all transactions.');
+        if (Store.data) {
+          Store.data.entries = [];
+          Store.data.cashflowEntries = [];
+          Store.data.supabaseTransactionIds = [];
+          Store.data.authoritativeAccountTransactions = [];
         }
+        await doSyncCashflowInflow();
+        try {
+          await syncCashOutflowSummary();
+        } catch (e) {
+          console.warn('syncCashOutflowSummary after deleteAllTransactions error:', e);
+        }
+        try {
+          await syncCreditedDebitedFromEntries([]);
+        } catch (e) {
+          console.warn('syncCreditedDebitedFromEntries after deleteAllTransactions error:', e);
+        }
+        setCloudStatus(prev => ({
+          ...prev,
+          transactionCount: 0,
+          lastSynced: new Date().toLocaleTimeString()
+        }));
       };
 
       (window as any).__supabaseFetchCashflowInflow = async () => {
@@ -4348,10 +4301,10 @@ export const App: React.FC = () => {
               loadSupabaseProjects(),
               loadSupabaseBankAccounts(),
               loadSupabaseCategories(),
-              loadSupabaseOrders(),
-              loadSupabasePIs(),
               loadSupabaseTransactions()
             ]);
+            await loadSupabaseOrders();
+            await loadSupabasePIs();
             await loadSupabaseCashflowTables();
           } finally {
             isHydratingSupabase.current = false;
@@ -4421,6 +4374,7 @@ export const App: React.FC = () => {
       delete (window as any).__supabaseSavePI;
       delete (window as any).__supabaseDeletePI;
       delete (window as any).__supabaseDeleteAllPIs;
+      delete (window as any).__supabaseDeleteAllOrders;
       delete (window as any).__supabaseSaveTransaction;
       delete (window as any).__supabaseCancelTransaction;
       delete (window as any).__supabaseDeleteTransaction;
@@ -4590,7 +4544,9 @@ export const App: React.FC = () => {
                 <strong>Table Integration</strong>
                 <p style={{ marginTop: '6px', color: 'var(--ink-2)', lineHeight: '1.5' }}>
                   Transactions: <code>fss_table_transactions</code>.<br />
-                  Orders: <code>fss_table_orders</code>, <code>fss_table_order_departments</code>, <code>fss_table_order_milestones</code>, <code>fss_table_order_documents</code>.<br />
+                  Orders: <code>fss_table_order_po</code>, <code>fss_table_order_departments</code>, <code>fss_table_order_payment_terms</code>, <code>fss_table_order_details</code>.<br />
+                  Department order books: <code>order_book_design</code>, <code>order_book_engineering</code>, <code>order_book_operations_admin</code>, <code>order_book_hr</code>, <code>order_book_sales_bd</code>, <code>order_book_finance</code> (current calendar year, derived from saved splits).<br />
+                  PI department books: <code>pi_engineering</code>, <code>pi_design</code>, <code>pi_operations_admin</code>, <code>pi_finance</code>, <code>pi_hr</code>, <code>pi_sales_bd</code> (current calendar year, split by each order's departments).<br />
                   Clients: <code>fss_client</code> &amp; <code>fss_client_people</code>.<br />
                   Vendors: <code>fss_vendor</code> &amp; <code>fss_vendor_people</code>.<br />
                   Employees: <code>fss_employe</code>.<br />
@@ -4603,7 +4559,7 @@ export const App: React.FC = () => {
                   People Outflow: <code>fss_outflow_oc_people</code> ({cloudStatus.peopleCount ?? '—'}), <code>fss_outflow_oc_people_report</code> (View).
                 </p>
                 <div style={{ marginTop: '8px', fontSize: '12px', color: 'var(--muted)' }}>
-                  Target tables: <code>fss.fss_operation_receipts</code>, <code>fss.fss_income</code>, <code>fss.fss_financing</code>, <code>fss.fss_cash_inflow</code>, <code>fss.fss_outflow_oc_people</code>, <code>fss.fss_table_transactions</code>, <code>fss.fss_table_orders</code>, <code>fss.fss_client</code>, <code>fss.fss_vendor</code>, <code>fss.fss_employe</code>, <code>fss.fss_other_parties</code>, <code>fss.fss_projects</code>, <code>fss.fss_departments</code>, <code>fss.fss_bank_accounts</code>, <code>fss.fss_categories</code>
+                  Target tables: <code>fss.fss_operation_receipts</code>, <code>fss.fss_income</code>, <code>fss.fss_financing</code>, <code>fss.fss_cash_inflow</code>, <code>fss.fss_outflow_oc_people</code>, <code>fss.fss_table_transactions</code>, <code>fss.fss_table_order_po</code>, <code>fss.fss_table_order_departments</code>, <code>fss.fss_table_order_payment_terms</code>, <code>fss.fss_table_order_details</code>, <code>fss.order_book_design</code>, <code>fss.order_book_engineering</code>, <code>fss.order_book_operations_admin</code>, <code>fss.order_book_hr</code>, <code>fss.order_book_sales_bd</code>, <code>fss.order_book_finance</code>, <code>fss.pi_engineering</code>, <code>fss.pi_design</code>, <code>fss.pi_operations_admin</code>, <code>fss.pi_finance</code>, <code>fss.pi_hr</code>, <code>fss.pi_sales_bd</code>, <code>fss.fss_client</code>, <code>fss.fss_vendor</code>, <code>fss.fss_employe</code>, <code>fss.fss_other_parties</code>, <code>fss.fss_projects</code>, <code>fss.fss_departments</code>, <code>fss.fss_bank_accounts</code>, <code>fss.fss_categories</code>
                 </div>
               </div>
 

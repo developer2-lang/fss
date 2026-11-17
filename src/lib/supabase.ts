@@ -3919,162 +3919,165 @@ export const SupabaseService = {
     const orderPoId = savedPo.id;
 
     // 5. Save into fss.fss_table_order_departments
-    try {
-      await supabase.from('fss_table_order_departments').delete().eq('order_po_id', orderPoId);
+    const { error: departmentDeleteError } = await supabase
+      .from('fss_table_order_departments')
+      .delete()
+      .eq('order_po_id', orderPoId);
+    if (departmentDeleteError) {
+      throw new Error(`Could not replace the order department split: ${departmentDeleteError.message}`);
+    }
 
-      const deptRows: any[] = [];
-
-      if (Array.isArray(orderData.split) && orderData.split.length > 0) {
-        orderData.split.forEach((s: any) => {
-          if (!s.departmentId && !s.department_name && !s.departmentName) return;
-          const dp = deptList.find((d: any) => d.id === s.departmentId);
-          const dName = dp?.name || s.department_name || s.departmentName || s.departmentId || 'Operations / Admin';
-          const amt = Math.max(0, Number(s.amount != null && s.amount !== '' ? s.amount : (preGstAmount * (s.pct || 100) / 100)));
-          deptRows.push({
-            order_po_id: orderPoId,
-            po_number: orderNumber,
-            client_name: clientName,
-            department_name: dName,
-            amount: amt,
-            order_value_pre_gst: preGstAmount,
-            gst_rate: gstRate,
-            gst_type: gstType,
-            order_total_incl_gst: totalAmount,
-            updated_at: new Date().toISOString()
-          });
-        });
-      }
-
-      if (deptRows.length === 0) {
-        const dp = deptList.find((d: any) => d.id === orderData.departmentId);
-        const dName = dp?.name || orderData.department_name || orderData.departmentId || 'Operations / Admin';
+    const deptRows: any[] = [];
+    if (Array.isArray(orderData.split) && orderData.split.length > 0) {
+      orderData.split.forEach((s: any) => {
+        if (!s.departmentId && !s.department_name && !s.departmentName) return;
+        const dp = deptList.find((d: any) => d.id === s.departmentId || d.supabase_id === s.departmentId);
+        const dName = dp?.name || s.department_name || s.departmentName || s.departmentId || 'Operations / Admin';
+        const amt = Math.max(0, Number(s.amount != null && s.amount !== '' ? s.amount : (preGstAmount * (s.pct || 100) / 100)));
         deptRows.push({
           order_po_id: orderPoId,
           po_number: orderNumber,
           client_name: clientName,
           department_name: dName,
-          amount: preGstAmount,
+          amount: amt,
           order_value_pre_gst: preGstAmount,
           gst_rate: gstRate,
           gst_type: gstType,
           order_total_incl_gst: totalAmount,
           updated_at: new Date().toISOString()
         });
-      }
-
-      if (deptRows.length > 0) {
-        await supabase.from('fss_table_order_departments').insert(deptRows);
-      }
-    } catch (dErr) {
-      console.warn('Error syncing order departments:', dErr);
-    }
-
-    // 6. Save into fss.fss_table_order_payment_terms
-    try {
-      await supabase.from('fss_table_order_payment_terms').delete().eq('order_po_id', orderPoId);
-
-      const termsRows: any[] = [];
-      const rawTerms = Array.isArray(orderData.terms) && orderData.terms.length > 0
-        ? orderData.terms
-        : [{ label: '100% on delivery', pct: 100 }];
-
-      rawTerms.forEach((t: any, idx: number) => {
-        const pct = Math.min(100, Math.max(0, Number(t.pct || t.percentage || 0)));
-        const amt = Math.max(0, Number(t.amount != null && t.amount !== '' ? t.amount : Math.round(preGstAmount * pct / 100)));
-        const isLast = idx === rawTerms.length - 1;
-        const isBalance = Boolean(t.is_balance ?? (isLast && rawTerms.length > 1));
-        termsRows.push({
-          order_po_id: orderPoId,
-          po_number: orderNumber,
-          client_name: clientName,
-          milestone_name: String(t.label || t.milestone_name || `Milestone ${idx + 1}`).trim(),
-          milestone_amount: amt,
-          percentage: pct,
-          sequence_number: idx + 1,
-          is_balance: isBalance,
-          updated_at: new Date().toISOString()
-        });
       });
-
-      if (termsRows.length > 0) {
-        await supabase.from('fss_table_order_payment_terms').insert(termsRows);
-      }
-    } catch (mErr) {
-      console.warn('Error syncing order payment terms:', mErr);
     }
 
-    // 7. Save into fss.fss_table_order_details
-    try {
-      const att = Array.isArray(orderData.attachments) && orderData.attachments.length > 0 ? orderData.attachments[0] : null;
-      const docName = att?.name || att?.file_name || orderData.document_name || null;
-      const docPath = att?.path || att?.storage_path || orderData.document_path || null;
-      const docUrl = att?.url || orderData.document_url || null;
-
-      const detailsPayload: any = {
+    if (deptRows.length === 0) {
+      const dp = deptList.find((d: any) => d.id === orderData.departmentId || d.supabase_id === orderData.departmentId);
+      const dName = dp?.name || orderData.department_name || orderData.departmentId || 'Operations / Admin';
+      deptRows.push({
         order_po_id: orderPoId,
         po_number: orderNumber,
         client_name: clientName,
-        scope: (orderData.scope && String(orderData.scope).trim()) || null,
-        expected_completion: expectedCompletion,
-        client_contact: (orderData.contact || orderData.client_contact || '').trim() || null,
-        notes: (orderData.notes && String(orderData.notes).trim()) || null,
-        document_name: docName,
-        document_path: docPath,
-        document_url: docUrl,
+        department_name: dName,
+        amount: preGstAmount,
+        order_value_pre_gst: preGstAmount,
+        gst_rate: gstRate,
+        gst_type: gstType,
+        order_total_incl_gst: totalAmount,
         updated_at: new Date().toISOString()
-      };
+      });
+    }
 
-      await supabase
-        .from('fss_table_order_details')
-        .upsert(detailsPayload, { onConflict: 'order_po_id' });
-    } catch (detErr) {
-      console.warn('Error syncing order details:', detErr);
+    const { error: departmentInsertError } = await supabase
+      .from('fss_table_order_departments')
+      .insert(deptRows);
+    if (departmentInsertError) {
+      throw new Error(`Could not save the order department split: ${departmentInsertError.message}`);
+    }
+
+    // 6. Save into fss.fss_table_order_payment_terms
+    const { error: termsDeleteError } = await supabase
+      .from('fss_table_order_payment_terms')
+      .delete()
+      .eq('order_po_id', orderPoId);
+    if (termsDeleteError) {
+      throw new Error(`Could not replace order payment terms: ${termsDeleteError.message}`);
+    }
+
+    const termsRows: any[] = [];
+    const rawTerms = Array.isArray(orderData.terms) && orderData.terms.length > 0
+      ? orderData.terms
+      : [{ label: '100% on delivery', pct: 100 }];
+    rawTerms.forEach((t: any, idx: number) => {
+      const pct = Math.min(100, Math.max(0, Number(t.pct || t.percentage || 0)));
+      const amt = Math.max(0, Number(t.amount != null && t.amount !== '' ? t.amount : Math.round(preGstAmount * pct / 100)));
+      const isLast = idx === rawTerms.length - 1;
+      const isBalance = Boolean(t.is_balance ?? (isLast && rawTerms.length > 1));
+      termsRows.push({
+        order_po_id: orderPoId,
+        po_number: orderNumber,
+        client_name: clientName,
+        milestone_name: String(t.label || t.milestone_name || `Milestone ${idx + 1}`).trim(),
+        milestone_amount: amt,
+        percentage: pct,
+        sequence_number: idx + 1,
+        is_balance: isBalance,
+        updated_at: new Date().toISOString()
+      });
+    });
+
+    if (termsRows.length > 0) {
+      const { error: termsInsertError } = await supabase
+        .from('fss_table_order_payment_terms')
+        .insert(termsRows);
+      if (termsInsertError) {
+        throw new Error(`Could not save order payment terms: ${termsInsertError.message}`);
+      }
+    }
+
+    // 7. Save into fss.fss_table_order_details
+    const att = Array.isArray(orderData.attachments) && orderData.attachments.length > 0 ? orderData.attachments[0] : null;
+    const docName = att?.name || att?.file_name || orderData.document_name || null;
+    const docPath = att?.path || att?.storage_path || orderData.document_path || null;
+    const docUrl = att?.url || orderData.document_url || null;
+    const detailsPayload: any = {
+      order_po_id: orderPoId,
+      po_number: orderNumber,
+      client_name: clientName,
+      scope: (orderData.scope && String(orderData.scope).trim()) || null,
+      expected_completion: expectedCompletion,
+      client_contact: (orderData.contact || orderData.client_contact || '').trim() || null,
+      notes: (orderData.notes && String(orderData.notes).trim()) || null,
+      document_name: docName,
+      document_path: docPath,
+      document_url: docUrl,
+      updated_at: new Date().toISOString()
+    };
+    const { error: detailsError } = await supabase
+      .from('fss_table_order_details')
+      .upsert(detailsPayload, { onConflict: 'order_po_id' });
+    if (detailsError) {
+      throw new Error(`Could not save order details: ${detailsError.message}`);
     }
 
     // Return joined order
-    const { data: fullOrder } = await supabase
-      .from('fss_table_order_po')
-      .select(`
-        *,
-        fss_table_order_departments(*),
-        fss_table_order_payment_terms(*),
-        fss_table_order_details(*)
-      `)
-      .eq('id', orderPoId)
-      .single();
-
+    const [fullOrder] = await this.loadOrdersFromSupabase(orderPoId);
+    if (!fullOrder) throw new Error('Order was saved but could not be reloaded from Supabase.');
     return fullOrder || savedPo;
   },
 
   /**
    * Loads all orders with departments, payment terms, and details from Supabase
    */
-  async loadOrdersFromSupabase(): Promise<any[]> {
+  async loadOrdersFromSupabase(orderPoId?: string): Promise<any[]> {
     if (!supabase) return [];
     try {
-      const { data, error } = await supabase
+      let query = supabase
         .from('fss_table_order_po')
-        .select(`
-          *,
-          fss_table_order_departments(*),
-          fss_table_order_payment_terms(*),
-          fss_table_order_details(*)
-        `)
+        .select('*')
         .order('order_date', { ascending: false });
+      if (orderPoId) query = query.eq('id', orderPoId);
+      const { data: orders, error } = await query;
+      if (error) throw new Error(`Could not load orders from fss_table_order_po: ${error.message}`);
+      if (!orders?.length) return [];
 
-      if (error) {
-        console.warn('Error fetching orders from fss_table_order_po:', error.message);
-        // Fallback to fss_table_orders if needed
-        const { data: legacyData } = await supabase
-          .from('fss_table_orders')
-          .select(`*, fss_table_order_departments(*), fss_table_order_milestones(*), fss_table_order_documents(*)`)
-          .order('order_date', { ascending: false });
-        return legacyData || [];
-      }
-      return data || [];
+      const orderIds = orders.map((order: any) => order.id);
+      const [departmentsResult, termsResult, detailsResult] = await Promise.all([
+        supabase.from('fss_table_order_departments').select('*').in('order_po_id', orderIds),
+        supabase.from('fss_table_order_payment_terms').select('*').in('order_po_id', orderIds),
+        supabase.from('fss_table_order_details').select('*').in('order_po_id', orderIds)
+      ]);
+      if (departmentsResult.error) throw new Error(`Could not load order department splits: ${departmentsResult.error.message}`);
+      if (termsResult.error) throw new Error(`Could not load order payment terms: ${termsResult.error.message}`);
+      if (detailsResult.error) throw new Error(`Could not load order details: ${detailsResult.error.message}`);
+
+      return orders.map((order: any) => ({
+        ...order,
+        fss_table_order_departments: (departmentsResult.data || []).filter((row: any) => row.order_po_id === order.id),
+        fss_table_order_payment_terms: (termsResult.data || []).filter((row: any) => row.order_po_id === order.id),
+        fss_table_order_details: (detailsResult.data || []).filter((row: any) => row.order_po_id === order.id)
+      }));
     } catch (err) {
       console.error('Unexpected error loading orders:', err);
-      return [];
+      throw err;
     }
   },
 
@@ -4086,28 +4089,69 @@ export const SupabaseService = {
     try {
       const idStr = String(orderIdOrNo);
       const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idStr);
-      let query = supabase.from('fss_table_order_po').delete();
-      if (isUUID) {
-        query = query.eq('id', idStr);
-      } else {
-        query = query.eq('po_number', idStr);
-      }
-      const { error } = await query;
-      if (error) {
-        console.error('Error deleting order from fss_table_order_po:', error);
-      }
+      let lookup = supabase.from('fss_table_order_po').select('id');
+      lookup = isUUID ? lookup.eq('id', idStr) : lookup.eq('po_number', idStr);
+      const { data: orders, error: lookupError } = await lookup;
+      if (lookupError) throw new Error(`Could not find order in fss_table_order_po: ${lookupError.message}`);
+      if (!orders?.length) return false;
+      const ids = orders.map((order: any) => order.id);
 
-      // Also attempt cleanup on legacy fss_table_orders
-      try {
-        const q2 = supabase.from('fss_table_orders').delete();
-        if (isUUID) await q2.eq('id', idStr);
-        else await q2.eq('order_number', idStr);
-      } catch (_) {}
+      const childDeletes = await Promise.all([
+        supabase.from('fss_table_order_departments').delete().in('order_po_id', ids),
+        supabase.from('fss_table_order_payment_terms').delete().in('order_po_id', ids),
+        supabase.from('fss_table_order_details').delete().in('order_po_id', ids)
+      ]);
+      const childError = childDeletes.find(result => result.error)?.error;
+      if (childError) throw new Error(`Could not delete order details from Supabase: ${childError.message}`);
+
+      const { data, error } = await supabase
+        .from('fss_table_order_po')
+        .delete()
+        .in('id', ids)
+        .select('id');
+      if (error) {
+        throw new Error(`Could not delete order from fss_table_order_po: ${error.message}`);
+      }
+      if (!data?.length) return false;
+      if (!data?.length) return false;
 
       return true;
     } catch (err) {
       console.error('Exception deleting order from Supabase:', err);
       return false;
+    }
+  },
+
+  /**
+   * Deletes every order from the canonical order table.
+   */
+  async deleteAllOrders(): Promise<boolean> {
+    if (!supabase) return false;
+    try {
+      const { data: orders, error: lookupError } = await supabase
+        .from('fss_table_order_po')
+        .select('id');
+      if (lookupError) throw new Error(`Could not load orders before deletion: ${lookupError.message}`);
+      const ids = (orders || []).map((order: any) => order.id);
+      if (!ids.length) return true;
+
+      const childDeletes = await Promise.all([
+        supabase.from('fss_table_order_departments').delete().in('order_po_id', ids),
+        supabase.from('fss_table_order_payment_terms').delete().in('order_po_id', ids),
+        supabase.from('fss_table_order_details').delete().in('order_po_id', ids)
+      ]);
+      const childError = childDeletes.find(result => result.error)?.error;
+      if (childError) throw new Error(`Could not delete order details from Supabase: ${childError.message}`);
+
+      const { error } = await supabase
+        .from('fss_table_order_po')
+        .delete()
+        .in('id', ids);
+      if (error) throw new Error(`Could not delete all orders from Supabase: ${error.message}`);
+      return true;
+    } catch (err) {
+      console.error('Exception deleting all orders from Supabase:', err);
+      throw err;
     }
   },
 
@@ -4147,7 +4191,7 @@ export const SupabaseService = {
     const isUUID = (s: any) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(s || ''));
 
     const piNumber = String(piData.piNo || piData.pi_number || '').trim();
-    if (!piNumber) return null;
+    if (!piNumber) throw new Error('A PI number is required to save the proforma invoice.');
 
     // Resolve order_po_id
     let orderPoId: string | null = null;
@@ -4177,6 +4221,12 @@ export const SupabaseService = {
     const gstRate = Number(piData.gstRate ?? piData.gst_rate ?? 0);
     const gstAmount = Number(piData.gstAmount ?? piData.gst_amount ?? 0);
     const tdsAmount = Number(piData.tdsAmount ?? piData.tds_amount ?? 0);
+    const rawGstType = String(piData.gstType || piData.gst_type || '').trim().toLowerCase();
+    const gstType = rawGstType === 'inter' || rawGstType === 'igst'
+      ? 'IGST'
+      : rawGstType === 'none' || gstRate === 0
+        ? 'NONE'
+        : 'CGST + SGST';
 
     const payload: any = {
       pi_number: piNumber,
@@ -4184,12 +4234,13 @@ export const SupabaseService = {
       payment_due_date: piData.dueDate || piData.payment_due_date || null,
       pre_gst_amount: preGstAmount,
       gst_rate: gstRate,
-      gst_type: String(piData.gstType || piData.gst_type || 'intra'),
+      gst_type: gstType,
       gst_amount: gstAmount,
       tds_amount: tdsAmount,
       notes: piData.notes || null,
       status: String(piData.status || 'issued'),
       tax_invoice_number: piData.taxInvoiceNo || piData.tax_invoice_number || null,
+      tax_invoice_date: piData.taxInvoiceDate || piData.tax_invoice_date || null,
       updated_at: new Date().toISOString()
     };
 
@@ -4198,61 +4249,49 @@ export const SupabaseService = {
       payload.order_id = orderPoId;
     }
 
-    try {
-      // 1. If existing supabase_id (UUID), try update by id
-      const targetId = (piData.supabase_id && isUUID(piData.supabase_id))
-        ? piData.supabase_id
-        : (isUUID(piData.id) ? piData.id : null);
+    const targetId = (piData.supabase_id && isUUID(piData.supabase_id))
+      ? piData.supabase_id
+      : (isUUID(piData.id) ? piData.id : null);
 
-      if (targetId) {
-        const { data: updated, error: updateErr } = await supabase
-          .from('proforma_invoices')
-          .update(payload)
-          .eq('id', targetId)
-          .select()
-          .maybeSingle();
-
-        if (!updateErr && updated) {
-          return updated;
-        }
-      }
-
-      // 2. Otherwise check if pi_number already exists in Supabase
-      const { data: existingPI } = await supabase
+    if (targetId) {
+      const { data: updated, error: updateErr } = await supabase
         .from('proforma_invoices')
-        .select('*')
-        .eq('pi_number', piNumber)
+        .update(payload)
+        .eq('id', targetId)
+        .select()
         .maybeSingle();
+      if (updateErr) throw new Error(`Could not update PI in Supabase: ${updateErr.message}`);
+      if (updated) return updated;
+    }
 
-      if (existingPI && existingPI.id) {
-        const { data: updated, error: updateErr } = await supabase
-          .from('proforma_invoices')
-          .update(payload)
-          .eq('id', existingPI.id)
-          .select()
-          .single();
-        if (!updateErr && updated) return updated;
-      }
+    const { data: existingPI, error: lookupErr } = await supabase
+      .from('proforma_invoices')
+      .select('*')
+      .eq('pi_number', piNumber)
+      .maybeSingle();
+    if (lookupErr) throw new Error(`Could not find PI in Supabase: ${lookupErr.message}`);
 
-      // 3. Otherwise insert new row (omitting total_amount since it is a generated column)
-      const { data: inserted, error: insertErr } = await supabase
+    if (existingPI?.id) {
+      const { data: updated, error: updateErr } = await supabase
         .from('proforma_invoices')
-        .insert({
-          ...payload,
-          created_at: piData.createdAt || new Date().toISOString()
-        })
+        .update(payload)
+        .eq('id', existingPI.id)
         .select()
         .single();
-
-      if (insertErr) {
-        console.warn('Error inserting proforma invoice to Supabase:', insertErr.message);
-        return null;
-      }
-      return inserted;
-    } catch (err: any) {
-      console.error('Exception saving proforma invoice to Supabase:', err);
-      return null;
+      if (updateErr) throw new Error(`Could not update PI in Supabase: ${updateErr.message}`);
+      return updated;
     }
+
+    const { data: inserted, error: insertErr } = await supabase
+      .from('proforma_invoices')
+      .insert({
+        ...payload,
+        created_at: piData.createdAt || new Date().toISOString()
+      })
+      .select()
+      .single();
+    if (insertErr) throw new Error(`Could not save PI to Supabase: ${insertErr.message}`);
+    return inserted;
   },
 
   /**
@@ -4267,13 +4306,12 @@ export const SupabaseService = {
         .order('pi_date', { ascending: false });
 
       if (error) {
-        console.warn('Error fetching proforma invoices from Supabase:', error.message);
-        return [];
+        throw new Error(`Could not load proforma invoices from Supabase: ${error.message}`);
       }
       return data || [];
     } catch (err) {
       console.error('Unexpected error loading proforma invoices:', err);
-      return [];
+      throw err;
     }
   },
 
@@ -4291,12 +4329,12 @@ export const SupabaseService = {
       } else {
         query = query.eq('pi_number', idStr);
       }
-      const { error } = await query;
+      const { data, error } = await query.select('id');
       if (error) {
         console.error('Error deleting proforma invoice from Supabase:', error);
         return false;
       }
-      return true;
+      return Boolean(data?.length);
     } catch (err) {
       console.error('Exception deleting proforma invoice from Supabase:', err);
       return false;
@@ -4861,17 +4899,18 @@ export const SupabaseService = {
   async deleteAllTransactions(): Promise<boolean> {
     if (!supabase) return false;
     try {
-      const { error: err1 } = await supabase
+      const { error } = await supabase
         .from('fss_table_transactions')
         .delete()
-        .neq('transaction_date', '1900-01-01');
-      if (err1) {
-        console.warn('Error deleting from fss_table_transactions:', err1);
-        await supabase.from('fss_table_transactions').delete().gt('created_at', '1970-01-01T00:00:00Z');
-      }
+        .not('id', 'is', null);
+      if (error) throw new Error(`Could not delete all transactions from fss_table_transactions: ${error.message}`);
       try {
         if (await isFssTransactionsAvailable()) {
-          await supabase.from('fss_transactions').delete().neq('transaction_date', '1900-01-01');
+          const { error: mirrorError } = await supabase
+            .from('fss_transactions')
+            .delete()
+            .not('id', 'is', null);
+          if (mirrorError) console.warn('Could not clear optional fss_transactions mirror:', mirrorError.message);
         }
       } catch (err2) {
         console.warn('Error deleting from legacy fss_transactions:', err2);
@@ -4879,7 +4918,7 @@ export const SupabaseService = {
       return true;
     } catch (err) {
       console.error('Exception deleting all transactions from Supabase:', err);
-      return false;
+      throw err;
     }
   },
 

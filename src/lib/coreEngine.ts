@@ -849,6 +849,7 @@ const api = {
     }
     if (o.clientId && o.orderNo && api.list('orders').some(x => x.id !== id && x.clientId === o.clientId && x.orderNo.trim().toLowerCase() === String(o.orderNo).trim().toLowerCase())) errs.orderNo = 'This client already has an order with that number';
     const old = id ? api.get('orders', id) : null;
+    const oldSnapshot = old ? JSON.parse(JSON.stringify(old)) : null;
     if (old && Math.abs(old.taxable - o.taxable) > 0.004 && !reason) errs.reason = 'Give a reason for the value change';
     if (Object.keys(errs).length) { const e = new Error(Object.values(errs)[0]); e.fields = errs; throw e; }
     if (newProject) { api.guard('project.create'); const pr = await api.create('projects', { code: newProject.code, name: newProject.name, clientId: o.clientId || '', departmentId: o.departmentId || '', contractValue: 0, startDate: o.date, status: 'active', active: true }); o.projectId = pr.id; }
@@ -885,13 +886,18 @@ const api = {
           Store.persist();
         }
       } catch (sbErr) {
-        console.warn('Could not sync order to Supabase:', sbErr);
+        if (old && oldSnapshot) Object.assign(old, oldSnapshot);
+        else Store.data.orders = Store.data.orders.filter((order: any) => order.id !== savedOrder.id);
+        Store.persist();
+        throw new Error(`Order was not saved to Supabase: ${sbErr instanceof Error ? sbErr.message : String(sbErr)}`);
       }
     }
     return savedOrder;
   },
   async setOrderStatus(id, status) {
     api.guard(status === 'active' ? 'order.edit' : 'order.cancel');
+    const order = api.get('orders', id);
+    const before = JSON.parse(JSON.stringify(order));
     const updated = await api.update('orders', id, { status }, { action: status === 'cancelled' ? 'cancel' : status === 'closed' ? 'close' : 'reopen' });
     if (updated) {
       const clientParty = api.get('parties', updated.clientId) || api.list('parties').find((p: any) => p.id === updated.clientId || p.supabase_id === updated.clientId);
@@ -908,7 +914,15 @@ const api = {
       }
     }
     if (updated && typeof window !== 'undefined' && typeof (window as any).__supabaseSaveOrder === 'function') {
-      (window as any).__supabaseSaveOrder(updated).catch(console.warn);
+      try {
+        const savedOrder = await (window as any).__supabaseSaveOrder(updated);
+        if (savedOrder?.id) updated.supabase_id = savedOrder.id;
+        Store.persist();
+      } catch (error) {
+        Object.assign(updated, before);
+        Store.persist();
+        throw new Error(`Order status was not updated in Supabase: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     return updated;
   },
@@ -928,9 +942,20 @@ const api = {
     p.clientId = ord.clientId; p.projectId = ord.projectId;
     if (id) {
       api.guard('pi.edit');
+      const before = JSON.parse(JSON.stringify(api.get('pis', id)));
       const updated = await api.update('pis', id, p);
       if (updated && typeof window !== 'undefined' && typeof (window as any).__supabaseSavePI === 'function') {
-        (window as any).__supabaseSavePI(updated).catch(console.warn);
+        try {
+          const savedPI = await (window as any).__supabaseSavePI(updated);
+          if (savedPI?.id) {
+            updated.supabase_id = savedPI.id;
+            Store.persist();
+          }
+        } catch (error) {
+          Object.assign(updated, before);
+          Store.persist();
+          throw new Error(`PI was not updated in Supabase: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       return updated;
     }
@@ -939,21 +964,34 @@ const api = {
     if (created && typeof window !== 'undefined' && typeof (window as any).__supabaseSavePI === 'function') {
       try {
         const sbPI = await (window as any).__supabaseSavePI(created);
-        if (sbPI && sbPI.id) {
+        if (sbPI?.id) {
           created.supabase_id = sbPI.id;
           Store.persist();
         }
       } catch (err) {
-        console.warn('Could not sync newly created PI to Supabase:', err);
+        Store.data.pis = Store.data.pis.filter((pi: any) => pi.id !== created.id);
+        Store.persist();
+        throw new Error(`PI was not saved to Supabase: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     return created;
   },
   async setPIStatus(id, status) {
     api.guard(status === 'cancelled' ? 'pi.cancel' : 'pi.edit');
+    const before = JSON.parse(JSON.stringify(api.get('pis', id)));
     const updated = await api.update('pis', id, { status }, { action: status === 'cancelled' ? 'cancel' : 'reopen' });
     if (updated && typeof window !== 'undefined' && typeof (window as any).__supabaseSavePI === 'function') {
-      (window as any).__supabaseSavePI(updated).catch(console.warn);
+      try {
+        const savedPI = await (window as any).__supabaseSavePI(updated);
+        if (savedPI?.id) {
+          updated.supabase_id = savedPI.id;
+          Store.persist();
+        }
+      } catch (error) {
+        Object.assign(updated, before);
+        Store.persist();
+        throw new Error(`PI status was not updated in Supabase: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     return updated;
   },
@@ -962,14 +1000,13 @@ const api = {
     const r = api.get(col, id);
     if (col === 'orders' && api.list('pis').some(p => p.orderId === id)) throw new Error('This order has PIs. Cancel it instead, or delete its PIs first.');
     if (col === 'pis' && Calc.live().some(e => e.piId === id)) throw new Error('Receipts are linked to this PI. Cancel it instead.');
+    const deleteHandler = typeof window !== 'undefined' && (window as any)[col === 'orders' ? '__supabaseDeleteOrder' : '__supabaseDeletePI'];
+    if (typeof deleteHandler === 'function') {
+      const deleted = await deleteHandler(r.supabase_id || r.id || (col === 'orders' ? r.orderNo : r.piNo));
+      if (deleted === false) throw new Error(`Could not delete ${col === 'orders' ? 'order' : 'proforma invoice'} from Supabase.`);
+    }
     Object.assign(r, { deleted: true, deletedBy: api.me().id, deletedAt: nowISO() });
     api.log('delete', col, id, describe(col, r)); Store.persist();
-    if (col === 'orders' && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOrder === 'function') {
-      (window as any).__supabaseDeleteOrder(r.supabase_id || r.id || r.orderNo).catch(console.warn);
-    }
-    if (col === 'pis' && typeof window !== 'undefined' && typeof (window as any).__supabaseDeletePI === 'function') {
-      (window as any).__supabaseDeletePI(r.supabase_id || r.id || r.piNo).catch(console.warn);
-    }
   },
   async saveTargets(fy, rows) {
     api.guard('targets.edit');
@@ -2467,8 +2504,7 @@ PAGES.ledger = {
       <button class="btn" data-act="toggle-filters">${icon('list')} Filters${activeCount ? ` <span class="chip navy">${activeCount}</span>` : ''}</button>
       <button class="btn btn-gold" data-act="add-fss-transaction">+ Add Transaction</button>
       <button class="btn" data-act="refresh-fss-transactions" title="Refresh from Supabase">${icon('refresh')}</button>
-      <button class="btn btn-gold" data-act="store-ui-to-supabase" style="margin-left:4px" title="Store all UI transactions in Supabase fss_table_transactions table">Store in Supabase</button>
-      <button class="btn btn-danger" data-act="delete-all-transactions" style="margin-left:4px" title="Delete all transactions from UI and Supabase">${icon('trash')} Delete All</button>
+      ${api.can('entry.delete') ? `<button class="btn btn-danger" data-act="delete-all-transactions" style="margin-left:4px" title="Delete all transactions from Supabase">${icon('trash')} Delete All</button>` : ''}
       ${activeCount || L.q || L.bucket || L.group ? '<button class="btn btn-ghost" data-act="clear-filters">Clear</button>' : ''}
       ${L.bucket || L.group ? `<span class="chip gold" style="height:30px;align-self:flex-end">${esc([BUCKET_LABEL[L.bucket], L.group].filter(Boolean).join(' › '))}<button data-act="clear-bucket" title="Remove" style="display:inline-flex;width:14px">${icon('x')}</button></span>` : ''}
       </div>
@@ -7280,15 +7316,6 @@ const ACT = {
     }
   },
   'refresh-fss-transactions': () => { void refreshLedgerFromSupabase(); },
-  'store-ui-to-supabase': async () => {
-    const syncFn = typeof window !== 'undefined' && ((window as any).syncUiTransactionsToSupabase || (window as any).__syncUiTransactionsToSupabase);
-    if (typeof syncFn === 'function') {
-      await syncFn({ force: true });
-      await refreshLedgerFromSupabase();
-    } else {
-      toast('Supabase sync is not ready. Please verify your connection.', 'bad');
-    }
-  },
   'edit-fss-transaction': el => {
     const id = String(el.dataset.id);
     const transaction = ledgerRecords.find((row: any) => String(row.id) === id) ||
@@ -7372,14 +7399,21 @@ const ACT = {
     }
   },
   'delete-all-transactions': async () => {
+    try { api.guard('entry.delete'); } catch (err: any) { return toast(err.message, 'error'); }
+    const delAll = typeof window !== 'undefined' && (window as any).__supabaseDeleteAllTransactions;
+    if (typeof delAll !== 'function') return toast('Supabase is not ready. No transactions were deleted.', 'error');
+    const count = Store.data?.entries?.filter((entry: any) => !entry.deleted).length || ledgerRecords.length;
+    if (!count) return toast('No transactions to delete');
     if (!await confirmBox({
       title: 'Delete all transactions?',
-      body: 'Are you sure you want to delete <b>ALL transactions</b>?<br><br>This will permanently remove all transactions from the UI and Supabase.',
+      body: `Are you sure you want to permanently delete <b>ALL ${count} transactions</b> from Supabase? This cannot be undone.`,
       ok: 'Delete all',
-      danger: true
+      danger: true,
+      typed: 'DELETE'
     })) return;
     try {
       toast('Deleting all transactions...');
+      await delAll();
       if (Store.data) {
         Store.data.entries = [];
         Store.data.cashflowEntries = [];
@@ -7392,11 +7426,6 @@ const ACT = {
       Store.persist();
       syncDisplayedAccountBalances();
       refreshLedger();
-
-      const delAll = typeof window !== 'undefined' && (window as any).__supabaseDeleteAllTransactions;
-      if (typeof delAll === 'function') {
-        await delAll();
-      }
 
       if (typeof (window as any).__onCashflowDataChanged === 'function') {
         (window as any).__onCashflowDataChanged(Store.data);
@@ -8305,7 +8334,7 @@ PAGES.orders = {
       <div class="field" style="flex:2;min-width:200px"><label>Search</label><input class="input" data-inp="oq" value="${esc(F.q)}" placeholder="Order no., project, client…"></div>
       <div class="field"><label>Client</label><select class="select" data-of="clientId">${partyOptions('client', F.clientId, 'All clients')}</select></div>
       <div class="field"><label>Department</label><select class="select" data-of="departmentId">${deptOptions(F.departmentId, 'All departments')}</select></div>
-      <span class="spacer"></span>${api.can('order.create') ? `<button class="btn btn-gold" data-act="new-order">${icon('plus')} New order</button>` : ''}</div>
+      <span class="spacer"></span>${api.can('order.delete') ? `<button class="btn btn-danger" data-act="delete-all-orders" title="Delete all purchase orders">${icon('trash')} Delete all</button>` : ''}${api.can('order.create') ? `<button class="btn btn-gold" data-act="new-order">${icon('plus')} New order</button>` : ''}</div>
       <div class="card" id="ordResults"><div class="summary-strip"><div><div class="l">Orders</div><div class="v">${rows.length}</div></div><div><div class="l">Order value</div><div class="v">${money(T('value'))}</div></div><div><div class="l">Invoiced</div><div class="v">${money(T('invoiced'))}</div></div><div><div class="l">Received</div><div class="v in">${money(T('received'))}</div></div><div><div class="l">To invoice</div><div class="v">${money(T('toInvoice'))}</div></div></div>
       <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Order</th><th>Date</th><th>Client · project</th><th>Department</th><th class="num">Order value</th><th style="width:150px">Invoiced</th><th class="num">Received</th><th class="num">To invoice</th><th>Status</th></tr></thead><tbody>
       ${rows.map(x => `<tr class="click" data-act="open-order" data-id="${x.o.id}"><td><div class="cell-main">${esc(x.o.orderNo)}</div><div class="cell-sub">${esc(x.o.type)}${(x.o.amendments || []).length ? ' · amended' : ''}</div></td><td class="nowrap">${fmtDate(x.o.date)}</td>
@@ -8335,7 +8364,7 @@ PAGES.pis = {
       <div class="field"><label>Department</label><select class="select" data-pf="departmentId">${deptOptions(F.departmentId, 'All departments')}</select></div>
       <span class="spacer"></span>
       ${api.can('pi.create') ? `<button class="btn btn-gold" data-act="new-pi">${icon('plus')} New PI</button>` : ''}
-      <button class="btn btn-danger" data-act="delete-all-pis" style="margin-left:8px" title="Delete all proforma invoices">${icon('trash')} Delete all</button></div>
+      ${api.can('pi.delete') ? `<button class="btn btn-danger" data-act="delete-all-pis" style="margin-left:8px" title="Delete all proforma invoices">${icon('trash')} Delete all</button>` : ''}</div>
       <div class="card"><div class="summary-strip"><div><div class="l">PIs</div><div class="v">${rows.length}</div></div><div><div class="l">Value (pre-GST)</div><div class="v">${money(sum(rows, x => x.p.status === 'cancelled' ? 0 : x.p.taxable))}</div></div><div><div class="l">Total incl. GST</div><div class="v">${money(sum(rows, x => x.p.status === 'cancelled' ? 0 : x.p.total))}</div></div><div><div class="l">Received</div><div class="v in">${money(sum(rows, x => x.gross))}</div></div><div><div class="l">Outstanding</div><div class="v out">${money(sum(rows, x => x.outstanding))}</div></div></div>
       <div class="tbl-wrap"><table class="tbl"><thead><tr><th>PI no.</th><th>Date</th><th>Client · order</th><th>Milestone</th><th class="num">Pre-GST</th><th class="num">Total incl. GST</th><th class="num">Received</th><th class="num">Outstanding</th><th>Due</th><th>Status</th></tr></thead><tbody>
       ${rows.map(x => `<tr class="click" data-act="open-pi" data-id="${x.p.id}"><td><div class="cell-main mono" style="font-size:12.5px">${esc(x.p.piNo)}</div>${x.p.taxInvoiceNo ? `<div class="cell-sub">TI ${esc(x.p.taxInvoiceNo)}</div>` : ''}</td><td class="nowrap">${fmtDate(x.p.date)}</td>
@@ -8729,6 +8758,67 @@ Object.assign(ACT, {
   'edit-order': el => { closeDrawer(); openOrderForm(el.dataset.id); },
   'new-pi': el => { if (!api.can('pi.create')) return toast('Not allowed for your role', 'error'); closeDrawer(); openPIForm(null, el.dataset.order || ''); },
   'edit-pi': el => { closeDrawer(); openPIForm(el.dataset.id); },
+  'delete-all-pis': async () => {
+    try { api.guard('pi.delete'); } catch (err: any) { return toast(err.message, 'error'); }
+    const allPis = api.list('pis');
+    if (!allPis.length) return toast('No proforma invoices to delete');
+    const deleteAll = typeof window !== 'undefined' && (window as any).__supabaseDeleteAllPIs;
+    if (typeof deleteAll !== 'function') return toast('Supabase is not ready. No proforma invoices were deleted.', 'error');
+    if (!await confirmBox({
+      title: 'Delete all proforma invoices?',
+      body: `This permanently deletes all <b>${allPis.length} proforma invoices</b> from Supabase. Linked receipts will remain but be unlinked. This cannot be undone.`,
+      ok: 'Delete all',
+      danger: true,
+      typed: 'DELETE'
+    })) return;
+
+    try {
+      toast('Deleting all proforma invoices...');
+      await deleteAll();
+      for (const p of allPis) {
+        for (const a of p.attachments || []) {
+          if (a?.id) await FileStore.del(a.id).catch((error: any) => console.warn('Could not delete local PI attachment:', error));
+        }
+      }
+      if (Store.data) {
+        Store.data.entries.forEach((entry: any) => { if (entry?.piId) entry.piId = null; });
+        Store.data.pis = [];
+      }
+      Store.persist();
+      await api.log('delete', 'pis', 'all', `Deleted all ${allPis.length} proforma invoices`);
+      afterWrite();
+      toast('All proforma invoices deleted');
+    } catch (err: any) {
+      toast(err?.message || 'Could not delete proforma invoices', 'error');
+    }
+  },
+  'delete-all-orders': async () => {
+    try { api.guard('order.delete'); } catch (err: any) { return toast(err.message, 'error'); }
+    const orders = api.list('orders');
+    if (!orders.length) return toast('No purchase orders to delete');
+    if (api.list('pis').some((pi: any) => orders.some((order: any) => pi.orderId === order.id))) {
+      return toast('Delete all proforma invoices first; purchase orders with linked PIs cannot be deleted.', 'error');
+    }
+    const deleteAll = typeof window !== 'undefined' && (window as any).__supabaseDeleteAllOrders;
+    if (typeof deleteAll !== 'function') return toast('Supabase is not ready. No orders were deleted.', 'error');
+    if (!await confirmBox({
+      title: 'Delete all purchase orders?',
+      body: `This permanently deletes all <b>${orders.length} purchase orders</b> from Supabase. This cannot be undone.`,
+      ok: 'Delete all',
+      danger: true,
+      typed: 'DELETE'
+    })) return;
+    try {
+      await deleteAll();
+      Store.data.orders = [];
+      Store.persist();
+      await api.log('delete', 'orders', 'all', `Deleted all ${orders.length} purchase orders`);
+      afterWrite();
+      toast('All purchase orders deleted');
+    } catch (err: any) {
+      toast(err?.message || 'Could not delete purchase orders', 'error');
+    }
+  },
   'order-status': async el => {
     const o = api.get('orders', el.dataset.id), v = el.dataset.v;
     const msg = { cancelled: 'Cancelled orders drop out of the order book and booked revenue. Existing PIs stay as they are.', closed: 'Closing marks the order complete; any value not yet invoiced leaves the order book.', active: 'The order returns to the active order book.' }[v];
@@ -8743,55 +8833,6 @@ Object.assign(ACT, {
   'del-rec': async el => {
     if (!await confirmBox({ title: 'Delete permanently?', body: 'This removes the record from all views. The audit log keeps a note of it.', ok: 'Delete', danger: true })) return;
     try { await api.removeRecord(el.dataset.col, el.dataset.id); toast('Deleted'); afterWrite(); } catch (err) { toast(err.message, 'error'); }
-  },
-  'delete-all-pis': async () => {
-    const allPis = (Store.data && Store.data.pis) ? Store.data.pis.filter((p: any) => !p.deleted) : [];
-    if (!allPis.length) {
-      return toast('No proforma invoices to delete');
-    }
-    const count = allPis.length;
-    if (!await confirmBox({
-      title: 'Delete all proforma invoices?',
-      body: `Are you sure you want to delete <b>ALL ${count} proforma invoices</b>?<br><br>This will permanently remove them from the system.`,
-      ok: 'Delete all',
-      danger: true
-    })) return;
-
-    try {
-      toast('Deleting all proforma invoices...');
-      const pisToDelete = (Store.data && Store.data.pis) || [];
-      for (const p of pisToDelete) {
-        for (const a of (p.attachments || [])) {
-          if (a && a.id) await FileStore.del(a.id).catch(() => {});
-        }
-      }
-      if (Store.data && Array.isArray(Store.data.entries)) {
-        Store.data.entries.forEach((e: any) => {
-          if (e && e.piId) e.piId = null;
-        });
-      }
-      if (Store.data) {
-        Store.data.pis = [];
-      }
-      if (typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteAllPIs === 'function') {
-        await (window as any).__supabaseDeleteAllPIs().catch(console.warn);
-      } else {
-        try {
-          const sb = typeof window !== 'undefined' ? (window as any).supabase : null;
-          if (sb) {
-            await sb.from('proforma_invoices').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-          }
-        } catch (sbErr) {
-          console.warn('Could not delete proforma_invoices from Supabase:', sbErr);
-        }
-      }
-      Store.persist();
-      await api.log('delete', 'pis', 'all', `Deleted all ${count} proforma invoices`).catch(() => null);
-      toast('All proforma invoices deleted');
-      afterWrite();
-    } catch (err: any) {
-      toast(err?.message || 'Could not delete proforma invoices', 'error');
-    }
   },
   'pi-receipt': el => {
     const p = api.get('pis', el.dataset.id), st = Sales.piState(p), o = Sales.orderOfPI(p), pr = api.get('projects', p.projectId);
@@ -10533,9 +10574,20 @@ async function issueTaxInvoice(piId, date, no) {
   assertGstOpen([ymOf(date)], 'this invoice');
   no = no || nextInvoiceNo(date);
   if (api.list('pis').some(p => p.id !== piId && p.taxInvoiceNo === no)) throw new Error('Tax invoice no. ' + no + ' is already used');
+  const before = JSON.parse(JSON.stringify(pi));
   const updated = await api.update('pis', piId, { taxInvoiceNo: no, taxInvoiceDate: date }, { summary: `Tax invoice ${no} issued for PI ${pi.piNo} · ${fmtDate(date)}` });
   if (updated && typeof window !== 'undefined' && typeof (window as any).__supabaseSavePI === 'function') {
-    (window as any).__supabaseSavePI(updated).catch(console.warn);
+    try {
+      const savedPI = await (window as any).__supabaseSavePI(updated);
+      if (savedPI?.id) {
+        updated.supabase_id = savedPI.id;
+        Store.persist();
+      }
+    } catch (error) {
+      Object.assign(updated, before);
+      Store.persist();
+      throw new Error(`Tax invoice was not updated in Supabase: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   return no;
 }
@@ -11273,6 +11325,10 @@ if (typeof window !== 'undefined') {
   (window as any).Store = Store;
   (window as any).api = api;
   (window as any).deleteAllTransactions = async () => {
+    const delAll = (window as any).__supabaseDeleteAllTransactions;
+    if (typeof delAll !== 'function') throw new Error('Supabase is not ready. No transactions were deleted.');
+    api.guard('entry.delete');
+    await delAll();
     if (Store.data) {
       Store.data.entries = [];
       Store.data.cashflowEntries = [];
@@ -11281,8 +11337,6 @@ if (typeof window !== 'undefined') {
     }
     ledgerRecords = [];
     excludedLedgerTransactionIds.clear();
-    const delAll = (window as any).__supabaseDeleteAllTransactions;
-    if (typeof delAll === 'function') await delAll();
     Store.persist();
     syncDisplayedAccountBalances();
     refreshLedger();
@@ -11293,11 +11347,13 @@ if (typeof window !== 'undefined') {
     toast('All transactions deleted');
   };
   (window as any).deleteAllPIs = async () => {
+    api.guard('pi.delete');
     const allPis = (Store.data && Store.data.pis) || [];
-    for (const p of allPis) {
-      for (const a of (p.attachments || [])) {
-        if (a && a.id) await FileStore.del(a.id).catch(() => {});
-      }
+    const deleteAll = (window as any).__supabaseDeleteAllPIs;
+    if (typeof deleteAll !== 'function') throw new Error('Supabase is not ready. No proforma invoices were deleted.');
+    await deleteAll();
+    for (const p of allPis) for (const a of (p.attachments || [])) if (a?.id) {
+      await FileStore.del(a.id).catch((error: any) => console.warn('Could not delete local PI attachment:', error));
     }
     if (Store.data && Array.isArray(Store.data.entries)) {
       Store.data.entries.forEach((e: any) => {
@@ -11306,18 +11362,6 @@ if (typeof window !== 'undefined') {
     }
     if (Store.data) {
       Store.data.pis = [];
-    }
-    if (typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteAllPIs === 'function') {
-      await (window as any).__supabaseDeleteAllPIs().catch(console.warn);
-    } else {
-      try {
-        const sb = typeof window !== 'undefined' ? (window as any).supabase : null;
-        if (sb) {
-          await sb.from('proforma_invoices').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-        }
-      } catch (sbErr) {
-        console.warn('Could not delete proforma_invoices from Supabase:', sbErr);
-      }
     }
     Store.persist();
     afterWrite();
