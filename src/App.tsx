@@ -150,9 +150,9 @@ function syncCreditedDebitedFromEntries(entries?: any[]): Promise<void> {
   const sync = async () => {
     const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
     const getEffectiveEntries = (window as any).__getAllDeduplicatedTransactions;
-    const effectiveEntries = typeof getEffectiveEntries === 'function'
-      ? getEffectiveEntries()
-      : entries || Store.data?.entries || [];
+    const effectiveEntries = entries !== undefined
+      ? entries
+      : (typeof getEffectiveEntries === 'function' ? getEffectiveEntries() : Store.data?.entries || []);
     const computedCD = computeByAccountCreditedDebitedRows(
       effectiveEntries,
       Store.data?.fss_by_account_credited_debited || [],
@@ -192,6 +192,7 @@ export interface CloudStatus {
   bankAccountCount?: number;
   categoryCount?: number;
   orderCount?: number;
+  piCount?: number;
   transactionCount?: number;
   operationReceiptCount?: number;
   incomeCount?: number;
@@ -723,6 +724,73 @@ export function convertFssOrderToLocal(
     status,
     createdAt: so.created_at || new Date().toISOString(),
     updatedAt: so.updated_at || new Date().toISOString(),
+    deleted: false
+  };
+}
+
+// Convert Supabase fss.proforma_invoices rows into CRM PI format
+export function convertFssPIToLocal(
+  spi: any,
+  existingPis: any[] = [],
+  orders: any[] = [],
+  _parties: any[] = [],
+  _projects: any[] = []
+) {
+  const piNum = (spi.pi_number || spi.piNo || '').trim();
+  const match = (existingPis || []).find((p: any) =>
+    (p.supabase_id && p.supabase_id === spi.id) ||
+    (p.piNo && p.piNo.trim().toLowerCase() === piNum.toLowerCase())
+  );
+  const localId = match ? match.id : (spi.id ? `pi_${spi.id}` : `pi_${Date.now()}`);
+
+  // Resolve order, client, project
+  let orderId = match?.orderId || '';
+  let clientId = match?.clientId || '';
+  let projectId = match?.projectId || '';
+
+  if (spi.order_po_id || spi.order_id) {
+    const oMatch = (orders || []).find((o: any) =>
+      o.supabase_id === spi.order_po_id ||
+      o.id === spi.order_po_id ||
+      o.supabase_id === spi.order_id ||
+      o.id === spi.order_id ||
+      (o.orderNo && spi.order_id && String(o.orderNo).toLowerCase() === String(spi.order_id).toLowerCase())
+    );
+    if (oMatch) {
+      orderId = oMatch.id;
+      clientId = oMatch.clientId || clientId;
+      projectId = oMatch.projectId || projectId;
+    }
+  }
+
+  const taxable = Number(spi.pre_gst_amount ?? match?.taxable ?? 0);
+  const gstRate = Number(spi.gst_rate ?? match?.gstRate ?? 18);
+  const gstAmount = Number(spi.gst_amount ?? match?.gstAmount ?? 0);
+  const total = Number(spi.total_amount ?? (taxable + gstAmount));
+  const tdsAmount = Number(spi.tds_amount ?? match?.tdsAmount ?? 0);
+  const tdsRate = Number(match?.tdsRate ?? (taxable > 0 && tdsAmount > 0 ? Math.round((tdsAmount / taxable) * 100) : 10));
+
+  return {
+    id: localId,
+    supabase_id: spi.id,
+    orderId,
+    clientId,
+    projectId,
+    piNo: piNum,
+    date: spi.pi_date || new Date().toISOString().slice(0, 10),
+    dueDate: spi.payment_due_date || spi.pi_date || new Date().toISOString().slice(0, 10),
+    milestone: match?.milestone || 'Milestone 1',
+    taxable,
+    total,
+    gstRate,
+    gstType: (spi.gst_type || match?.gstType || 'intra') as 'intra' | 'inter' | 'none',
+    gstAmount,
+    tdsRate,
+    tdsAmount,
+    status: (spi.status || match?.status || 'issued') as 'issued' | 'part' | 'paid' | 'cancelled',
+    notes: spi.notes ?? match?.notes ?? '',
+    taxInvoiceNo: spi.tax_invoice_number ?? match?.taxInvoiceNo ?? '',
+    attachments: match?.attachments || [],
     deleted: false
   };
 }
@@ -1746,6 +1814,71 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  // Hydrate proforma invoices from Supabase fss.proforma_invoices
+  const loadSupabasePIs = useCallback(async () => {
+    if (!isSupabaseConfigured) return;
+    try {
+      let supabasePis = await SupabaseService.loadProformaInvoicesFromSupabase();
+
+      // If proforma_invoices table is empty in Supabase, auto-seed with local active PIs
+      if (supabasePis.length === 0 && Store.data?.pis) {
+        const validPis = Store.data.pis.filter((p: any) => (p.piNo || p.pi_number) && !p.deleted);
+        if (validPis.length > 0) {
+          console.log('proforma_invoices table is empty in Supabase. Syncing existing PIs to Supabase...');
+          await SupabaseService.syncLocalPIsToSupabase(
+            Store.data.pis,
+            Store.data.orders || []
+          );
+          supabasePis = await SupabaseService.loadProformaInvoicesFromSupabase();
+        }
+      }
+
+      if (supabasePis && Store.data?.pis) {
+        supabasePis.forEach((spi: any) => {
+          const piRecord = convertFssPIToLocal(
+            spi,
+            Store.data.pis,
+            Store.data.orders || [],
+            Store.data.parties || [],
+            Store.data.projects || []
+          );
+          const piNum = (spi.pi_number || spi.piNo || '').trim().toLowerCase();
+          const existingIdx = Store.data.pis.findIndex(
+            (p: any) => (p.supabase_id && p.supabase_id === spi.id) ||
+              (p.piNo && p.piNo.trim().toLowerCase() === piNum)
+          );
+          if (existingIdx >= 0) {
+            Store.data.pis[existingIdx] = {
+              ...Store.data.pis[existingIdx],
+              ...piRecord,
+              id: Store.data.pis[existingIdx].id
+            };
+          } else {
+            Store.data.pis.unshift(piRecord);
+          }
+        });
+        Store.persist();
+        render({ keepScroll: true });
+      }
+
+      setCloudStatus(prev => ({
+        ...prev,
+        connected: true,
+        syncing: false,
+        piCount: (supabasePis || []).length,
+        lastSynced: new Date().toLocaleTimeString(),
+        error: null
+      }));
+    } catch (err: any) {
+      console.error('Error syncing Supabase proforma invoices:', err);
+      setCloudStatus(prev => ({
+        ...prev,
+        syncing: false,
+        error: err.message || 'Error connecting to proforma_invoices table'
+      }));
+    }
+  }, []);
+
   // Hydrate transactions from Supabase fss_table_transactions
   const loadSupabaseTransactions = useCallback(async () => {
     if (!isSupabaseConfigured) return;
@@ -2657,13 +2790,14 @@ export const App: React.FC = () => {
         loadSupabaseBankAccounts(),
         loadSupabaseCategories(),
         loadSupabaseOrders(),
+        loadSupabasePIs(),
         loadSupabaseTransactions()
       ]);
       await loadSupabaseCashflowTables();
     } finally {
       isHydratingSupabase.current = wasHydratingSupabase;
     }
-  }, [loadSupabaseClients, loadSupabaseVendors, loadSupabaseEmployees, loadSupabaseOtherParties, loadSupabaseProjects, loadSupabaseDepartments, loadSupabaseBankAccounts, loadSupabaseCategories, loadSupabaseOrders, loadSupabaseTransactions, loadSupabaseCashflowTables, syncCashOutflowSummary]);
+  }, [loadSupabaseClients, loadSupabaseVendors, loadSupabaseEmployees, loadSupabaseOtherParties, loadSupabaseProjects, loadSupabaseDepartments, loadSupabaseBankAccounts, loadSupabaseCategories, loadSupabaseOrders, loadSupabasePIs, loadSupabaseTransactions, loadSupabaseCashflowTables, syncCashOutflowSummary]);
 
   // Initialize Core Application and Supabase
   useEffect(() => {
@@ -3196,6 +3330,52 @@ export const App: React.FC = () => {
         return ok;
       };
 
+      // 10b. Register global Supabase proforma invoice saver for the core UI form
+      (window as any).__supabaseSavePI = async (piData: any) => {
+        if (!isSupabaseConfigured) {
+          console.warn('Supabase is not configured yet in .env; saving in local offline mode.');
+          return null;
+        }
+        const res = await SupabaseService.saveProformaInvoice(
+          piData,
+          Store.data?.orders || []
+        );
+        if (res) {
+          setCloudStatus(prev => ({
+            ...prev,
+            piCount: (prev.piCount || 0) + 1,
+            lastSynced: new Date().toLocaleTimeString()
+          }));
+        }
+        return res;
+      };
+
+      (window as any).__supabaseDeletePI = async (piIdOrNo: string | number) => {
+        if (!isSupabaseConfigured) return false;
+        const ok = await SupabaseService.deleteProformaInvoice(piIdOrNo);
+        if (ok) {
+          setCloudStatus(prev => ({
+            ...prev,
+            piCount: Math.max(0, (prev.piCount || 1) - 1),
+            lastSynced: new Date().toLocaleTimeString()
+          }));
+        }
+        return ok;
+      };
+
+      (window as any).__supabaseDeleteAllPIs = async () => {
+        if (!isSupabaseConfigured) return false;
+        const ok = await SupabaseService.deleteAllProformaInvoices();
+        if (ok) {
+          setCloudStatus(prev => ({
+            ...prev,
+            piCount: 0,
+            lastSynced: new Date().toLocaleTimeString()
+          }));
+        }
+        return ok;
+      };
+
       // 11. Register Supabase Cashflow Inflow Sync and Fetch handlers
       let isSyncingCashflow = false;
       let pendingSyncRequested = false;
@@ -3203,6 +3383,7 @@ export const App: React.FC = () => {
       const doSyncCashflowInflow = async () => {
         if (!isSupabaseConfigured) return null;
         try {
+          refreshCashflowEntriesFromStore();
           const currentFy = (typeof S !== 'undefined' && S.fy) ? S.fy : 2026;
           const entriesList = Store.data?.cashflowEntries || Store.data?.entries || [];
           const officeFixedComputed = computeCashflowOutflowOfficeFixedRows(entriesList, currentFy);
@@ -3697,6 +3878,23 @@ export const App: React.FC = () => {
       (window as any).__supabaseDeleteAllTransactions = async () => {
         if (isSupabaseConfigured) {
           await SupabaseService.deleteAllTransactions();
+          if (Store.data) {
+            Store.data.entries = [];
+            Store.data.cashflowEntries = [];
+            Store.data.supabaseTransactionIds = [];
+            Store.data.authoritativeAccountTransactions = [];
+          }
+          await doSyncCashflowInflow();
+          try {
+            await syncCashOutflowSummary();
+          } catch (e) {
+            console.warn('syncCashOutflowSummary after deleteAllTransactions error:', e);
+          }
+          try {
+            await syncCreditedDebitedFromEntries([]);
+          } catch (e) {
+            console.warn('syncCreditedDebitedFromEntries after deleteAllTransactions error:', e);
+          }
           setCloudStatus(prev => ({
             ...prev,
             transactionCount: 0,
@@ -4455,6 +4653,7 @@ export const App: React.FC = () => {
               loadSupabaseBankAccounts(),
               loadSupabaseCategories(),
               loadSupabaseOrders(),
+              loadSupabasePIs(),
               loadSupabaseTransactions()
             ]);
             await loadSupabaseCashflowTables();
@@ -4523,6 +4722,9 @@ export const App: React.FC = () => {
       delete (window as any).__supabaseDeleteCategory;
       delete (window as any).__supabaseSaveOrder;
       delete (window as any).__supabaseDeleteOrder;
+      delete (window as any).__supabaseSavePI;
+      delete (window as any).__supabaseDeletePI;
+      delete (window as any).__supabaseDeleteAllPIs;
       delete (window as any).__supabaseSaveTransaction;
       delete (window as any).__supabaseCancelTransaction;
       delete (window as any).__supabaseDeleteTransaction;
@@ -4585,7 +4787,7 @@ export const App: React.FC = () => {
       delete (window as any).openAddBankAccountModal;
       delete (window as any).openAddCategoryModal;
     };
-  }, [loadSupabaseClients, loadSupabaseVendors, loadSupabaseEmployees, loadSupabaseOtherParties, loadSupabaseProjects, loadSupabaseDepartments, loadSupabaseBankAccounts, loadSupabaseCategories, loadSupabaseOrders, loadSupabaseTransactions, loadSupabaseCashflowTables]);
+  }, [loadSupabaseClients, loadSupabaseVendors, loadSupabaseEmployees, loadSupabaseOtherParties, loadSupabaseProjects, loadSupabaseDepartments, loadSupabaseBankAccounts, loadSupabaseCategories, loadSupabaseOrders, loadSupabasePIs, loadSupabaseTransactions, loadSupabaseCashflowTables]);
 
   return (
     <>
@@ -4615,7 +4817,7 @@ export const App: React.FC = () => {
                 onClick={() => setShowCloudModal(true)}
                 title={
                   cloudStatus.connected
-                    ? `Supabase Connected · ${cloudStatus.clientCount ?? 0} clients, ${cloudStatus.vendorCount ?? 0} vendors, ${cloudStatus.transactionCount ?? 0} transactions, ${cloudStatus.orderCount ?? 0} orders · Last synced: ${cloudStatus.lastSynced || 'Just now'}`
+                    ? `Supabase Connected · ${cloudStatus.clientCount ?? 0} clients, ${cloudStatus.vendorCount ?? 0} vendors, ${cloudStatus.transactionCount ?? 0} transactions, ${cloudStatus.orderCount ?? 0} orders, ${cloudStatus.piCount ?? 0} PIs · Last synced: ${cloudStatus.lastSynced || 'Just now'}`
                     : cloudStatus.configured
                       ? 'Supabase Configured (Connecting...)'
                       : 'Local Mode (Click to connect Supabase)'
@@ -4626,7 +4828,7 @@ export const App: React.FC = () => {
                   {cloudStatus.syncing
                     ? 'Syncing...'
                     : cloudStatus.connected
-                      ? `Supabase (${cloudStatus.transactionCount ?? 0} txns · ${cloudStatus.orderCount ?? 0} orders · ${cloudStatus.clientCount ?? 0} clients · ${cloudStatus.vendorCount ?? 0} vendors)`
+                      ? `Supabase (${cloudStatus.transactionCount ?? 0} txns · ${cloudStatus.orderCount ?? 0} orders · ${cloudStatus.piCount ?? 0} PIs · ${cloudStatus.clientCount ?? 0} clients · ${cloudStatus.vendorCount ?? 0} vendors)`
                       : cloudStatus.configured
                         ? 'Connecting'
                         : 'Local Mode'}

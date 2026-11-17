@@ -926,11 +926,37 @@ const api = {
     if (!(p.taxable > 0)) errs.taxable = 'Enter the PI value';
     if (Object.keys(errs).length) { const e = new Error(Object.values(errs)[0]); e.fields = errs; throw e; }
     p.clientId = ord.clientId; p.projectId = ord.projectId;
-    if (id) { api.guard('pi.edit'); return api.update('pis', id, p); }
+    if (id) {
+      api.guard('pi.edit');
+      const updated = await api.update('pis', id, p);
+      if (updated && typeof window !== 'undefined' && typeof (window as any).__supabaseSavePI === 'function') {
+        (window as any).__supabaseSavePI(updated).catch(console.warn);
+      }
+      return updated;
+    }
     api.guard('pi.create');
-    return api.create('pis', { status: 'issued', attachments: [], deleted: false, ...p });
+    const created = await api.create('pis', { status: 'issued', attachments: [], deleted: false, ...p });
+    if (created && typeof window !== 'undefined' && typeof (window as any).__supabaseSavePI === 'function') {
+      try {
+        const sbPI = await (window as any).__supabaseSavePI(created);
+        if (sbPI && sbPI.id) {
+          created.supabase_id = sbPI.id;
+          Store.persist();
+        }
+      } catch (err) {
+        console.warn('Could not sync newly created PI to Supabase:', err);
+      }
+    }
+    return created;
   },
-  async setPIStatus(id, status) { api.guard(status === 'cancelled' ? 'pi.cancel' : 'pi.edit'); return api.update('pis', id, { status }, { action: status === 'cancelled' ? 'cancel' : 'reopen' }); },
+  async setPIStatus(id, status) {
+    api.guard(status === 'cancelled' ? 'pi.cancel' : 'pi.edit');
+    const updated = await api.update('pis', id, { status }, { action: status === 'cancelled' ? 'cancel' : 'reopen' });
+    if (updated && typeof window !== 'undefined' && typeof (window as any).__supabaseSavePI === 'function') {
+      (window as any).__supabaseSavePI(updated).catch(console.warn);
+    }
+    return updated;
+  },
   async removeRecord(col, id) {
     api.guard(col === 'orders' ? 'order.delete' : 'pi.delete');
     const r = api.get(col, id);
@@ -940,6 +966,9 @@ const api = {
     api.log('delete', col, id, describe(col, r)); Store.persist();
     if (col === 'orders' && typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteOrder === 'function') {
       (window as any).__supabaseDeleteOrder(r.supabase_id || r.id || r.orderNo).catch(console.warn);
+    }
+    if (col === 'pis' && typeof window !== 'undefined' && typeof (window as any).__supabaseDeletePI === 'function') {
+      (window as any).__supabaseDeletePI(r.supabase_id || r.id || r.piNo).catch(console.warn);
     }
   },
   async saveTargets(fy, rows) {
@@ -7343,12 +7372,9 @@ const ACT = {
     })) return;
     try {
       toast('Deleting all transactions...');
-      const delAll = typeof window !== 'undefined' && (window as any).__supabaseDeleteAllTransactions;
-      if (typeof delAll === 'function') {
-        await delAll();
-      }
       if (Store.data) {
         Store.data.entries = [];
+        Store.data.cashflowEntries = [];
         Store.data.supabaseTransactionIds = [];
         Store.data.authoritativeAccountTransactions = [];
       }
@@ -7358,6 +7384,12 @@ const ACT = {
       Store.persist();
       syncDisplayedAccountBalances();
       refreshLedger();
+
+      const delAll = typeof window !== 'undefined' && (window as any).__supabaseDeleteAllTransactions;
+      if (typeof delAll === 'function') {
+        await delAll();
+      }
+
       if (typeof (window as any).__onCashflowDataChanged === 'function') {
         (window as any).__onCashflowDataChanged(Store.data);
       }
@@ -8733,13 +8765,17 @@ Object.assign(ACT, {
       if (Store.data) {
         Store.data.pis = [];
       }
-      try {
-        const sb = typeof window !== 'undefined' ? (window as any).supabase : null;
-        if (sb) {
-          await sb.from('proforma_invoices').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      if (typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteAllPIs === 'function') {
+        await (window as any).__supabaseDeleteAllPIs().catch(console.warn);
+      } else {
+        try {
+          const sb = typeof window !== 'undefined' ? (window as any).supabase : null;
+          if (sb) {
+            await sb.from('proforma_invoices').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+          }
+        } catch (sbErr) {
+          console.warn('Could not delete proforma_invoices from Supabase:', sbErr);
         }
-      } catch (sbErr) {
-        console.warn('Could not delete proforma_invoices from Supabase:', sbErr);
       }
       Store.persist();
       await api.log('delete', 'pis', 'all', `Deleted all ${count} proforma invoices`).catch(() => null);
@@ -10489,7 +10525,10 @@ async function issueTaxInvoice(piId, date, no) {
   assertGstOpen([ymOf(date)], 'this invoice');
   no = no || nextInvoiceNo(date);
   if (api.list('pis').some(p => p.id !== piId && p.taxInvoiceNo === no)) throw new Error('Tax invoice no. ' + no + ' is already used');
-  await api.update('pis', piId, { taxInvoiceNo: no, taxInvoiceDate: date }, { summary: `Tax invoice ${no} issued for PI ${pi.piNo} · ${fmtDate(date)}` });
+  const updated = await api.update('pis', piId, { taxInvoiceNo: no, taxInvoiceDate: date }, { summary: `Tax invoice ${no} issued for PI ${pi.piNo} · ${fmtDate(date)}` });
+  if (updated && typeof window !== 'undefined' && typeof (window as any).__supabaseSavePI === 'function') {
+    (window as any).__supabaseSavePI(updated).catch(console.warn);
+  }
   return no;
 }
 function taxInvoiceModal(piId) {
@@ -11226,15 +11265,16 @@ if (typeof window !== 'undefined') {
   (window as any).Store = Store;
   (window as any).api = api;
   (window as any).deleteAllTransactions = async () => {
-    const delAll = (window as any).__supabaseDeleteAllTransactions;
-    if (typeof delAll === 'function') await delAll();
     if (Store.data) {
       Store.data.entries = [];
+      Store.data.cashflowEntries = [];
       Store.data.supabaseTransactionIds = [];
       Store.data.authoritativeAccountTransactions = [];
     }
     ledgerRecords = [];
     excludedLedgerTransactionIds.clear();
+    const delAll = (window as any).__supabaseDeleteAllTransactions;
+    if (typeof delAll === 'function') await delAll();
     Store.persist();
     syncDisplayedAccountBalances();
     refreshLedger();
@@ -11259,13 +11299,17 @@ if (typeof window !== 'undefined') {
     if (Store.data) {
       Store.data.pis = [];
     }
-    try {
-      const sb = typeof window !== 'undefined' ? (window as any).supabase : null;
-      if (sb) {
-        await sb.from('proforma_invoices').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    if (typeof window !== 'undefined' && typeof (window as any).__supabaseDeleteAllPIs === 'function') {
+      await (window as any).__supabaseDeleteAllPIs().catch(console.warn);
+    } else {
+      try {
+        const sb = typeof window !== 'undefined' ? (window as any).supabase : null;
+        if (sb) {
+          await sb.from('proforma_invoices').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        }
+      } catch (sbErr) {
+        console.warn('Could not delete proforma_invoices from Supabase:', sbErr);
       }
-    } catch (sbErr) {
-      console.warn('Could not delete proforma_invoices from Supabase:', sbErr);
     }
     Store.persist();
     afterWrite();

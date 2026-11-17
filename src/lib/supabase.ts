@@ -4140,6 +4140,214 @@ export const SupabaseService = {
   },
 
   /**
+   * Saves a proforma invoice to Supabase table fss.proforma_invoices
+   */
+  async saveProformaInvoice(piData: any, ordersList: any[] = []): Promise<any> {
+    if (!supabase) return null;
+    const isUUID = (s: any) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(s || ''));
+
+    const piNumber = String(piData.piNo || piData.pi_number || '').trim();
+    if (!piNumber) return null;
+
+    // Resolve order_po_id
+    let orderPoId: string | null = null;
+    const orders = (ordersList && ordersList.length > 0)
+      ? ordersList
+      : (typeof window !== 'undefined' && ((window as any).Store?.data?.orders || (window as any).IuovaCore?.Store?.data?.orders || [])) || [];
+
+    if (piData.orderId) {
+      if (isUUID(piData.orderId)) {
+        orderPoId = piData.orderId;
+      } else {
+        const ord = orders.find((o: any) => o.id === piData.orderId || o.orderNo === piData.orderId || o.po_number === piData.orderId);
+        if (ord) {
+          if (ord.supabase_id && isUUID(ord.supabase_id)) {
+            orderPoId = ord.supabase_id;
+          } else if (ord.id && isUUID(ord.id)) {
+            orderPoId = ord.id;
+          }
+        }
+      }
+    }
+    if (!orderPoId && piData.order_po_id && isUUID(piData.order_po_id)) {
+      orderPoId = piData.order_po_id;
+    }
+
+    const preGstAmount = Number(piData.taxable ?? piData.pre_gst_amount ?? 0);
+    const gstRate = Number(piData.gstRate ?? piData.gst_rate ?? 0);
+    const gstAmount = Number(piData.gstAmount ?? piData.gst_amount ?? 0);
+    const tdsAmount = Number(piData.tdsAmount ?? piData.tds_amount ?? 0);
+
+    const payload: any = {
+      pi_number: piNumber,
+      pi_date: piData.date || piData.pi_date || new Date().toISOString().slice(0, 10),
+      payment_due_date: piData.dueDate || piData.payment_due_date || null,
+      pre_gst_amount: preGstAmount,
+      gst_rate: gstRate,
+      gst_type: String(piData.gstType || piData.gst_type || 'intra'),
+      gst_amount: gstAmount,
+      tds_amount: tdsAmount,
+      notes: piData.notes || null,
+      status: String(piData.status || 'issued'),
+      tax_invoice_number: piData.taxInvoiceNo || piData.tax_invoice_number || null,
+      updated_at: new Date().toISOString()
+    };
+
+    if (orderPoId) {
+      payload.order_po_id = orderPoId;
+      payload.order_id = orderPoId;
+    }
+
+    try {
+      // 1. If existing supabase_id (UUID), try update by id
+      const targetId = (piData.supabase_id && isUUID(piData.supabase_id))
+        ? piData.supabase_id
+        : (isUUID(piData.id) ? piData.id : null);
+
+      if (targetId) {
+        const { data: updated, error: updateErr } = await supabase
+          .from('proforma_invoices')
+          .update(payload)
+          .eq('id', targetId)
+          .select()
+          .maybeSingle();
+
+        if (!updateErr && updated) {
+          return updated;
+        }
+      }
+
+      // 2. Otherwise check if pi_number already exists in Supabase
+      const { data: existingPI } = await supabase
+        .from('proforma_invoices')
+        .select('*')
+        .eq('pi_number', piNumber)
+        .maybeSingle();
+
+      if (existingPI && existingPI.id) {
+        const { data: updated, error: updateErr } = await supabase
+          .from('proforma_invoices')
+          .update(payload)
+          .eq('id', existingPI.id)
+          .select()
+          .single();
+        if (!updateErr && updated) return updated;
+      }
+
+      // 3. Otherwise insert new row (omitting total_amount since it is a generated column)
+      const { data: inserted, error: insertErr } = await supabase
+        .from('proforma_invoices')
+        .insert({
+          ...payload,
+          created_at: piData.createdAt || new Date().toISOString()
+        })
+        .select()
+        .single();
+
+      if (insertErr) {
+        console.warn('Error inserting proforma invoice to Supabase:', insertErr.message);
+        return null;
+      }
+      return inserted;
+    } catch (err: any) {
+      console.error('Exception saving proforma invoice to Supabase:', err);
+      return null;
+    }
+  },
+
+  /**
+   * Loads all proforma invoices from Supabase table fss.proforma_invoices
+   */
+  async loadProformaInvoicesFromSupabase(): Promise<any[]> {
+    if (!supabase) return [];
+    try {
+      const { data, error } = await supabase
+        .from('proforma_invoices')
+        .select('*')
+        .order('pi_date', { ascending: false });
+
+      if (error) {
+        console.warn('Error fetching proforma invoices from Supabase:', error.message);
+        return [];
+      }
+      return data || [];
+    } catch (err) {
+      console.error('Unexpected error loading proforma invoices:', err);
+      return [];
+    }
+  },
+
+  /**
+   * Deletes a proforma invoice from fss.proforma_invoices
+   */
+  async deleteProformaInvoice(piIdOrNo: string | number): Promise<boolean> {
+    if (!supabase) return false;
+    try {
+      const idStr = String(piIdOrNo);
+      const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idStr);
+      let query = supabase.from('proforma_invoices').delete();
+      if (isUUID) {
+        query = query.eq('id', idStr);
+      } else {
+        query = query.eq('pi_number', idStr);
+      }
+      const { error } = await query;
+      if (error) {
+        console.error('Error deleting proforma invoice from Supabase:', error);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.error('Exception deleting proforma invoice from Supabase:', err);
+      return false;
+    }
+  },
+
+  /**
+   * Deletes all proforma invoices from fss.proforma_invoices
+   */
+  async deleteAllProformaInvoices(): Promise<boolean> {
+    if (!supabase) return false;
+    try {
+      const { error } = await supabase
+        .from('proforma_invoices')
+        .delete()
+        .neq('id', '00000000-0000-0000-0000-000000000000');
+      if (error) {
+        console.error('Error deleting all proforma invoices from Supabase:', error);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.error('Exception deleting all proforma invoices from Supabase:', err);
+      return false;
+    }
+  },
+
+  /**
+   * Batch syncs initial local proforma invoices into Supabase if proforma_invoices table is empty
+   */
+  async syncLocalPIsToSupabase(localPis: any[], ordersList: any[] = []): Promise<any[]> {
+    if (!supabase || !Array.isArray(localPis) || localPis.length === 0) return [];
+    const valid = localPis.filter((p: any) => (p.piNo || p.pi_number) && !p.deleted);
+    if (valid.length === 0) return [];
+
+    const synced: any[] = [];
+    for (const p of valid) {
+      try {
+        const res = await this.saveProformaInvoice(p, ordersList);
+        if (res) {
+          p.supabase_id = res.id;
+          synced.push(res);
+        }
+      } catch (err) {
+        console.warn('Could not sync initial proforma invoice:', p.piNo || p.pi_number, err);
+      }
+    }
+    return synced;
+  },
+
+  /**
    * Formats a local entry / transaction into the schema expected by fss.fss_table_transactions
    */
   formatTransactionPayload(
@@ -8731,6 +8939,80 @@ export const SupabaseService = {
           }
           row.id = `${row.account_name}::${normType}`;
         }
+      }
+
+      // Also keep fss_account_credit_debit_summary in sync
+      try {
+        const { data: existingSummary } = await supabase
+          .from('fss_account_credit_debit_summary')
+          .select('*')
+          .eq('financial_year', financialYear);
+
+        const accountMap = new Map<string, { credited?: any; debited?: any }>();
+        for (const row of computedRows || []) {
+          if (!row.account_name) continue;
+          const aName = String(row.account_name).trim();
+          const tType = String(row.transaction_type || '').toLowerCase();
+          if (!accountMap.has(aName)) accountMap.set(aName, {});
+          const entry = accountMap.get(aName)!;
+          if (tType === 'credited') entry.credited = row;
+          else if (tType === 'debited') entry.debited = row;
+        }
+
+        for (const [accName, { credited, debited }] of accountMap.entries()) {
+          const sumPayload: any = {
+            financial_year: financialYear,
+            account_name: accName,
+            apr_credited: Number(credited?.apr ?? credited?.apr_26 ?? 0),
+            apr_debited: Number(debited?.apr ?? debited?.apr_26 ?? 0),
+            may_credited: Number(credited?.may ?? credited?.may_26 ?? 0),
+            may_debited: Number(debited?.may ?? debited?.may_26 ?? 0),
+            jun_credited: Number(credited?.jun ?? credited?.jun_26 ?? 0),
+            jun_debited: Number(debited?.jun ?? debited?.jun_26 ?? 0),
+            jul_credited: Number(credited?.jul ?? credited?.jul_26 ?? 0),
+            jul_debited: Number(debited?.jul ?? debited?.jul_26 ?? 0),
+            aug_credited: Number(credited?.aug ?? credited?.aug_26 ?? 0),
+            aug_debited: Number(debited?.aug ?? debited?.aug_26 ?? 0),
+            sep_credited: Number(credited?.sep ?? credited?.sep_26 ?? 0),
+            sep_debited: Number(debited?.sep ?? debited?.sep_26 ?? 0),
+            oct_credited: Number(credited?.oct ?? credited?.oct_26 ?? 0),
+            oct_debited: Number(debited?.oct ?? debited?.oct_26 ?? 0),
+            nov_credited: Number(credited?.nov ?? credited?.nov_26 ?? 0),
+            nov_debited: Number(debited?.nov ?? debited?.nov_26 ?? 0),
+            dec_credited: Number(credited?.dec ?? credited?.dec_26 ?? 0),
+            dec_debited: Number(debited?.dec ?? debited?.dec_26 ?? 0),
+            jan_credited: Number(credited?.jan ?? credited?.jan_26 ?? 0),
+            jan_debited: Number(debited?.jan ?? debited?.jan_26 ?? 0),
+            feb_credited: Number(credited?.feb ?? credited?.feb_26 ?? 0),
+            feb_debited: Number(debited?.feb ?? debited?.feb_26 ?? 0),
+            mar_credited: Number(credited?.mar ?? credited?.mar_26 ?? 0),
+            mar_debited: Number(debited?.mar ?? debited?.mar_26 ?? 0),
+          };
+          const totalCredited = ['apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec', 'jan', 'feb', 'mar']
+            .reduce((s, m) => s + (sumPayload[`${m}_credited`] || 0), 0);
+          const totalDebited = ['apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec', 'jan', 'feb', 'mar']
+            .reduce((s, m) => s + (sumPayload[`${m}_debited`] || 0), 0);
+          sumPayload.fy_credited = totalCredited;
+          sumPayload.fy_debited = totalDebited;
+          sumPayload.net_movement = totalCredited - totalDebited;
+
+          const match = (existingSummary || []).find((s: any) =>
+            normalizeAccountName(s.account_name) === normalizeAccountName(accName)
+          );
+          if (match) {
+            await supabase
+              .from('fss_account_credit_debit_summary')
+              .update(sumPayload)
+              .eq('financial_year', financialYear)
+              .eq('account_name', match.account_name);
+          } else {
+            await supabase
+              .from('fss_account_credit_debit_summary')
+              .insert([sumPayload]);
+          }
+        }
+      } catch (sumErr) {
+        console.warn('Failed to sync fss_account_credit_debit_summary:', sumErr);
       }
 
       return recomputeByAccountCreditedDebitedFyAndShares(computedRows);
