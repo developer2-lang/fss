@@ -4646,15 +4646,14 @@ export const SupabaseService = {
         (UUID_PATTERN.test(value) || /^\d+$/.test(value)) && values.indexOf(value) === index
       );
       for (const canonicalIdCandidate of canonicalIdCandidates) {
-        const { data, error } = await supabase
+        const { error } = await supabase
           .from('fss_table_transactions')
-          .update({ status: 'Cancelled', updated_at: new Date().toISOString() })
-          .eq('id', canonicalIdCandidate)
-          .select('id')
-          .maybeSingle();
-        if (error) throw error;
-        if (data?.id) canonicalId = String(data.id);
-        if (canonicalId) break;
+          .delete()
+          .eq('id', canonicalIdCandidate);
+        if (!error) {
+          canonicalId = canonicalIdCandidate;
+          break;
+        }
       }
 
       if (!canonicalId && wantedDate) {
@@ -4666,15 +4665,11 @@ export const SupabaseService = {
         if (error) throw error;
         const match = findBestTransactionMatch(data || [], entry);
         if (match.row) {
-          const { data: updated, error: updateError } = await supabase
+          const { error: delError } = await supabase
             .from('fss_table_transactions')
-            .update({ status: 'Cancelled', updated_at: new Date().toISOString() })
-            .eq('id', match.row.id)
-            .select('id')
-            .maybeSingle();
-          if (updateError) throw updateError;
-          if (!updated?.id) throw new Error('Supabase did not confirm cancellation of the matching transaction.');
-          canonicalId = String(updated.id);
+            .delete()
+            .eq('id', match.row.id);
+          if (!delError) canonicalId = String(match.row.id);
         }
       }
 
