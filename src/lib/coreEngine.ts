@@ -2279,8 +2279,16 @@ export function getAllDeduplicatedTransactions(): any[] {
   const norm = (s: any) => String(s || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
 
   // 1. Live CRM entries from Store (hydrated with real Supabase rows + local entries)
+  const isCloudActive = Boolean((typeof window !== 'undefined' && (window as any).isSupabaseConfigured) || (typeof ledgerRecords !== 'undefined' && ledgerRecords.length > 0));
   const rawLive = (typeof Calc !== 'undefined' && Calc.live ? Calc.live() : (Store.data?.entries || []))
-    .filter((e: any) => !e.deleted && !String(e.status || '').toLowerCase().includes('cancel'));
+    .filter((e: any) => {
+      if (e.deleted || String(e.status || '').toLowerCase().includes('cancel')) return false;
+      // In cloud mode, remove all phantom mock/seed entries that do not exist in Supabase
+      if (isCloudActive && !e.supabase_id && !e.isLocalPending && (String(e.id || '').startsWith('e_') || String(e.id || '').startsWith('tax_') || String(e.id || '').startsWith('other_') || String(e.id || '').startsWith('client_'))) {
+        return false;
+      }
+      return true;
+    });
   const liveRows = rawLive.map((e: any) => ({
     ...e,
     partyName: e.partyName || (typeof nameOf === 'function' ? nameOf('parties', e.partyId) : '') || '',
@@ -2459,7 +2467,7 @@ PAGES.ledger = {
       <button class="btn" data-act="toggle-filters">${icon('list')} Filters${activeCount ? ` <span class="chip navy">${activeCount}</span>` : ''}</button>
       <button class="btn btn-gold" data-act="add-fss-transaction">+ Add Transaction</button>
       <button class="btn" data-act="refresh-fss-transactions" title="Refresh from Supabase">${icon('refresh')}</button>
-      <button class="btn btn-gold" data-act="store-ui-to-supabase" style="margin-left:4px" title="Store all UI transactions in Supabase fss_transactions table">Store in Supabase</button>
+      <button class="btn btn-gold" data-act="store-ui-to-supabase" style="margin-left:4px" title="Store all UI transactions in Supabase fss_table_transactions table">Store in Supabase</button>
       <button class="btn btn-danger" data-act="delete-all-transactions" style="margin-left:4px" title="Delete all transactions from UI and Supabase">${icon('trash')} Delete All</button>
       ${activeCount || L.q || L.bucket || L.group ? '<button class="btn btn-ghost" data-act="clear-filters">Clear</button>' : ''}
       ${L.bucket || L.group ? `<span class="chip gold" style="height:30px;align-self:flex-end">${esc([BUCKET_LABEL[L.bucket], L.group].filter(Boolean).join(' › '))}<button data-act="clear-bucket" title="Remove" style="display:inline-flex;width:14px">${icon('x')}</button></span>` : ''}

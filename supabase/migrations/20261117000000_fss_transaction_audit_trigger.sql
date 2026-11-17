@@ -96,3 +96,4 @@ FOR EACH ROW
 EXECUTE FUNCTION fss.fss_log_transaction_change();
 
 COMMIT;
+

@@ -1937,91 +1937,18 @@ export const App: React.FC = () => {
       }
 
       if (supabaseTransactions && Store.data?.entries) {
-        const transactionIds = new Set(supabaseTransactions.map((transaction: any) => String(transaction.id)));
-        Store.data.supabaseTransactionIds = [...transactionIds];
-        Store.data.entries = Store.data.entries.filter((entry: any) => {
-          const entryId = String(entry.id || '');
-          const transactionId = String(entry.supabase_id || entryId.replace(/^e_/, ''));
-          const hasTransactionId = Boolean(entry.supabase_id || entryId.startsWith('e_') || transactionIds.has(entryId));
-          const isFormBacked = Boolean(
-            entry.supabase_tax_statutory_id ||
-            entry.supabase_other_expense_id ||
-            entry.supabase_client_payment_id ||
-            entry.supabase_other_income_id ||
-            entry.supabase_vendor_id ||
-            entry.supabase_employee_id ||
-            entry.supabase_pay_vendor_id ||
-            entry.supabase_pay_employee_id
-          );
-          if (hasTransactionId) return transactionIds.has(transactionId) || isFormBacked;
-          return isFormBacked || entry.isUserCreated;
-        });
+        const activeIds = new Set(supabaseTransactions.map((transaction: any) => String(transaction.id)));
+        const cancelledIds = new Set((cancelledTransactions || []).map((transaction: any) => String(transaction.id)));
+        Store.data.supabaseTransactionIds = [...activeIds];
+
+        // Authoritative cloud sync: Keep strictly and only transactions from Supabase fss.fss_table_transactions
+        // Discard all phantom mock/seed entries and unbacked records so UI matches Supabase 1:1
+        const cloudEntries: any[] = [];
+
+        // 1. Active transactions from fss_table_transactions
         supabaseTransactions.forEach((st: any) => {
-          // A Supabase row has a stable ID. Passing every local row here lets
-          // convertFssTransactionToLocal match an unrelated legacy row that
-          // happens to have the same date, type, amount, and description.
-          // That is especially dangerous for transfers and account-specific
-          // inflows. Hydrate by cloud identity; unsynced local rows are kept
-          // by the cleanup above and are not candidates for a cloud row.
-          const matchingCloudEntries = Store.data.entries.filter((entry: any) =>
-            String(entry.supabase_id || '') === String(st.id)
-          );
           const entryRecord = convertFssTransactionToLocal(
             st,
-            matchingCloudEntries,
-            Store.data.parties || [],
-            Store.data.projects || [],
-            Store.data.departments || [],
-            Store.data.categories || [],
-            Store.data.accounts || []
-          );
-          const normStr = (s: any) => String(s || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
-          const sameTransferAccounts = (candidate: any) => {
-            if (String(st.transaction_type || '').toLowerCase() !== 'transfer') return true;
-            return String(candidate.accountId || '') === String(entryRecord.accountId || '') &&
-              String(candidate.toAccountId || '') === String(entryRecord.toAccountId || '');
-          };
-          const existingIdx = Store.data.entries.findIndex(
-            (e: any) => (e.supabase_id && e.supabase_id === st.id) ||
-              (e.id === st.id || e.id === `e_${st.id}`) ||
-              (st.reference_number && e.refNo && normStr(e.refNo) === normStr(st.reference_number)) ||
-              (e.date === st.transaction_date &&
-                String(e.type || '').toLowerCase() === String(st.transaction_type || '').toLowerCase() &&
-                sameTransferAccounts(e) &&
-                Math.abs((Number(e.taxable) || Number(e.amount) || 0) - (Number(st.taxable_amount) || Number(st.net_cash) || 0)) < 1 &&
-                Boolean(normStr(e.description) && normStr(st.description) &&
-                  (normStr(e.description) === normStr(st.description) || normStr(e.description).includes(normStr(st.description)) || normStr(st.description).includes(normStr(e.description)))))
-          );
-          if (existingIdx >= 0) {
-            Store.data.entries[existingIdx] = {
-              ...Store.data.entries[existingIdx],
-              ...entryRecord,
-              id: Store.data.entries[existingIdx].id,
-              supabase_id: st.id
-            };
-          } else {
-            Store.data.entries.unshift(entryRecord);
-          }
-        });
-
-        // Cancelled transactions are the cloud-backed source for Trash. If the
-        // local tombstone is missing (for example after clearing browser data),
-        // rebuild it from the cancelled Supabase row instead of dropping it.
-        for (const cancelledTransaction of cancelledTransactions || []) {
-          const transactionId = String(cancelledTransaction.id || '');
-          const existingDeletedEntry = Store.data.entries.find((entry: any) =>
-            String(entry.supabase_id || '') === transactionId ||
-            String(entry.id || '') === transactionId ||
-            String(entry.id || '') === `e_${transactionId}`
-          );
-          if (existingDeletedEntry) {
-            existingDeletedEntry.deleted = true;
-            existingDeletedEntry.deletedAt = existingDeletedEntry.deletedAt || cancelledTransaction.updated_at || new Date().toISOString();
-            existingDeletedEntry.deletedBy = existingDeletedEntry.deletedBy || cancelledTransaction.deleted_by || null;
-            continue;
-          }
-          const deletedEntry = convertFssTransactionToLocal(
-            cancelledTransaction,
             Store.data.entries,
             Store.data.parties || [],
             Store.data.projects || [],
@@ -2029,267 +1956,36 @@ export const App: React.FC = () => {
             Store.data.categories || [],
             Store.data.accounts || []
           );
-          Store.data.entries.push({
-            ...deletedEntry,
-            supabase_id: cancelledTransaction.id,
-            deleted: true,
-            deletedAt: cancelledTransaction.updated_at || new Date().toISOString(),
-            deletedBy: cancelledTransaction.deleted_by || null
+          cloudEntries.push({
+            ...entryRecord,
+            supabase_id: st.id,
+            id: entryRecord.id || st.id,
+            deleted: false
           });
-        }
-
-        // The dedicated Tax & Statutory table is the source for tax-payment form rows.
-        // Hydrate those rows into the existing entry model so the current UI remains unchanged.
-        if (typeof (window as any).__supabaseLoadTaxStatutoryEntries === 'function') {
-          const taxRows = await (window as any).__supabaseLoadTaxStatutoryEntries();
-          const taxIds = new Set((taxRows || []).map((row: any) => String(row.id)));
-          Store.data.entries = Store.data.entries.filter((e: any) =>
-            !e.supabase_tax_statutory_id || taxIds.has(String(e.supabase_tax_statutory_id))
-          );
-          const taxCategoryId = (type: string) => {
-            const wanted = type === 'GST' ? 'cat_gstpay'
-              : type === 'TDS' ? 'cat_tdsdep'
-                : type === 'Professional tax' ? 'cat_ptax' : 'cat_advtax';
-            return Store.data?.categories?.some((c: any) => c.id === wanted)
-              ? wanted
-              : Store.data?.categories?.find((c: any) => c.type === 'outflow' && /tax|gst|tds/i.test(c.name))?.id || wanted;
-          };
-          for (const row of taxRows || []) {
-            const party = Store.data.parties.find((p: any) => String(p.name || '').trim().toLowerCase() === String(row.party || '').trim().toLowerCase());
-            const department = Store.data.departments.find((d: any) => String(d.name || '').trim().toLowerCase() === String(row.department || '').trim().toLowerCase());
-            const account = Store.data.accounts.find((a: any) => String(a.name || '').trim().toLowerCase() === String(row.paid_from || '').trim().toLowerCase());
-            const entryRecord: any = {
-              id: `tax_${row.id}`,
-              type: 'outflow',
-              date: row.payment_date,
-              categoryId: taxCategoryId(row.paying_type),
-              departmentId: department?.id || '',
-              partyKind: 'other',
-              partyId: party?.id || (row.paying_type === 'GST' ? 'ot_gst' : 'ot_it'),
-              projectId: '',
-              description: row.description || '',
-              refNo: row.challan_no || '',
-              taxable: Number(row.amount_paid) || 0,
-              gstType: 'none',
-              gstRate: 0,
-              gstAmount: 0,
-              itc: false,
-              tdsRate: 0,
-              tdsAmount: 0,
-              amount: Number(row.amount_paid) || 0,
-              paymentMode: row.payment_mode || '',
-              accountId: account?.id || '',
-              txnRef: row.utr_cheque_ref || '',
-              notes: row.notes || '',
-              attachments: formAttachmentsFromValue(row.attachment_url, 'tax_saturatory', `tax_attachment_${row.id}`),
-              taxPeriod: row.tax_month ? String(row.tax_month).slice(0, 7) : undefined,
-              supabase_tax_statutory_id: row.id,
-              deleted: false,
-              createdAt: row.created_at || new Date().toISOString(),
-              updatedAt: row.updated_at || row.created_at || new Date().toISOString()
-            };
-            const existingIdx = Store.data.entries.findIndex((e: any) =>
-              e.supabase_tax_statutory_id === row.id ||
-              (e.type === 'outflow' && ['cat_gstpay', 'cat_tdsdep', 'cat_ptax', 'cat_advtax'].includes(e.categoryId) && e.date === entryRecord.date && e.refNo === entryRecord.refNo && e.categoryId === entryRecord.categoryId)
-            );
-            if (existingIdx >= 0) {
-              Store.data.entries[existingIdx] = { ...Store.data.entries[existingIdx], ...entryRecord, id: Store.data.entries[existingIdx].id };
-            } else {
-              Store.data.entries.unshift(entryRecord);
-            }
-          }
-        }
-        if (typeof (window as any).__supabaseLoadPayEmployeeEntries === 'function') {
-          const employeeRows = await (window as any).__supabaseLoadPayEmployeeEntries();
-          const employeeIds = new Set((employeeRows || []).map((row: any) => String(row.id)));
-          Store.data.entries = Store.data.entries.filter((entry: any) =>
-            !entry.supabase_pay_employee_id || employeeIds.has(String(entry.supabase_pay_employee_id))
-          );
-          const normalize = (value: any) => String(value || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
-          for (const row of employeeRows || []) {
-            const employeeName = normalize(row.employee_name);
-            const accountName = normalize(row.paid_from);
-            const reference = normalize(row.reference_no || row.utr_cheque_ref);
-            const amount = Math.abs(Number(row.amount) || 0);
-            const matchingEntries = Store.data.entries.filter((entry: any) => {
-              if (entry.type !== 'outflow' || String(entry.date || '').slice(0, 10) !== String(row.payment_date || '').slice(0, 10)) return false;
-              const entryParty = normalize(entry.partyName || api.get('parties', entry.partyId)?.name);
-              const entryAccount = normalize(entry.accountName || api.get('accounts', entry.accountId)?.name);
-              if (entryParty !== employeeName || (accountName && entryAccount !== accountName)) return false;
-              if (reference && normalize(entry.refNo || entry.txnRef) !== reference) return false;
-              return Math.abs(Math.abs(Number(entry.amount) || 0) - amount) < 0.01;
-            });
-            const entry = Store.data.entries.find((candidate: any) =>
-              String(candidate.supabase_pay_employee_id || '') === String(row.id)
-            ) || (matchingEntries.length === 1 ? matchingEntries[0] : null);
-            if (!entry) continue;
-            entry.supabase_pay_employee_id = row.id;
-            entry.attachments = formAttachmentsFromValue(
-              row.attachment_url,
-              'pay an employee attachment',
-              `employee_attachment_${row.id}`
-            );
-          }
-        }
-        if (typeof (window as any).__supabaseLoadOtherExpenseEntries === 'function') {
-          const rows = await (window as any).__supabaseLoadOtherExpenseEntries();
-          const ids = new Set((rows || []).map((row: any) => String(row.id)));
-          Store.data.entries = Store.data.entries.filter((e: any) => !e.supabase_other_expense_id || ids.has(String(e.supabase_other_expense_id)));
-          for (const row of rows || []) {
-            const category = Store.data.categories.find((c: any) => String(c.name || '').trim().toLowerCase() === String(row.expense_category || '').trim().toLowerCase());
-            const party = Store.data.parties.find((p: any) => String(p.name || '').trim().toLowerCase() === String(row.paid_to || '').trim().toLowerCase());
-            const department = Store.data.departments.find((d: any) => String(d.name || '').trim().toLowerCase() === String(row.department || '').trim().toLowerCase());
-            const project = Store.data.projects.find((p: any) => String(p.name || '').trim().toLowerCase() === String(row.project || '').trim().toLowerCase());
-            const account = Store.data.accounts.find((a: any) => String(a.name || '').trim().toLowerCase() === String(row.paid_from || '').trim().toLowerCase());
-            const entryRecord: any = {
-              id: `other_${row.id}`, type: 'outflow', date: row.payment_date,
-              categoryId: category?.id || '', departmentId: department?.id || '', partyKind: party?.kind || 'other', partyId: party?.id || '', projectId: project?.id || '',
-              description: row.description || '', refNo: row.reference_no || '', taxable: Number(row.amount_before_gst) || 0,
-              gstType: row.gst_type || 'none', gstRate: Number(row.gst_rate) || 0, gstAmount: Number(row.gst_amount) || 0,
-              itc: row.input_gst_claimable !== false, tdsRate: 0, tdsAmount: Number(row.tds_amount) || 0, amount: Number(row.net_cash_paid) || 0,
-              paymentMode: row.payment_mode || '', accountId: account?.id || '', txnRef: row.utr_cheque_ref || '', notes: row.notes || '',
-              attachments: formAttachmentsFromValue(row.attachment_url, 'other_expense', `expense_attachment_${row.id}`),
-              supabase_other_expense_id: row.id, deleted: false, createdAt: row.created_at || new Date().toISOString(), updatedAt: row.updated_at || row.created_at || new Date().toISOString()
-            };
-            const existingIdx = Store.data.entries.findIndex((e: any) => e.supabase_other_expense_id === row.id || (e.type === 'outflow' && e.categoryId === entryRecord.categoryId && e.date === entryRecord.date && e.refNo === entryRecord.refNo && !e.supabase_tax_statutory_id));
-            if (existingIdx >= 0) Store.data.entries[existingIdx] = { ...Store.data.entries[existingIdx], ...entryRecord, id: Store.data.entries[existingIdx].id };
-            else Store.data.entries.unshift(entryRecord);
-          }
-        }
-        if (typeof (window as any).__supabaseLoadClientPaymentEntries === 'function') {
-          const rows = await (window as any).__supabaseLoadClientPaymentEntries();
-          const ids = new Set((rows || []).map((row: any) => String(row.id)));
-          Store.data.entries = Store.data.entries.filter((e: any) => !e.supabase_client_payment_id || ids.has(String(e.supabase_client_payment_id)));
-          for (const row of rows || []) {
-            const client = Store.data.parties.find((p: any) => String(p.name || '').trim().toLowerCase() === String(row.client_name || '').trim().toLowerCase());
-            const category = Store.data.categories.find((c: any) => String(c.name || '').trim().toLowerCase() === String(row.category || '').trim().toLowerCase());
-            const department = Store.data.departments.find((d: any) => String(d.name || '').trim().toLowerCase() === String(row.department || '').trim().toLowerCase());
-            const project = Store.data.projects.find((p: any) => String(p.name || '').trim().toLowerCase() === String(row.project || '').trim().toLowerCase());
-            const account = Store.data.accounts.find((a: any) => String(a.name || '').trim().toLowerCase() === String(row.received_into || '').trim().toLowerCase());
-            const entryRecord: any = {
-              id: `client_${row.id}`, type: 'inflow', date: row.payment_date,
-              categoryId: category?.id || '', departmentId: department?.id || '', partyKind: 'client', partyId: client?.id || '', projectId: project?.id || '',
-              description: row.description || '', refNo: '', taxable: Number(row.amount_before_gst) || 0,
-              gstType: row.gst_type || 'none', gstRate: Number(row.gst_rate) || 0, gstAmount: Number(row.gst_amount) || 0, itc: false,
-              tdsRate: Number(row.tds_rate) || 0, tdsAmount: Number(row.tds_amount) || 0, amount: Number(row.net_cash_received) || 0,
-              paymentMode: row.payment_mode || '', accountId: account?.id || '', txnRef: row.utr_cheque_ref || '', notes: row.notes || '',
-              attachments: formAttachmentsFromValue(row.attachment_url, 'client_payment', `client_attachment_${row.id}`),
-              supabase_client_payment_id: row.id, deleted: false, createdAt: row.created_at || new Date().toISOString(), updatedAt: row.updated_at || row.created_at || new Date().toISOString()
-            };
-            const existingIdx = Store.data.entries.findIndex((e: any) => e.supabase_client_payment_id === row.id || (e.type === 'inflow' && e.partyId === entryRecord.partyId && e.date === entryRecord.date && e.txnRef === entryRecord.txnRef && !e.supabase_other_expense_id));
-            if (existingIdx >= 0) Store.data.entries[existingIdx] = { ...Store.data.entries[existingIdx], ...entryRecord, id: Store.data.entries[existingIdx].id };
-            else Store.data.entries.unshift(entryRecord);
-          }
-        }
-        if (typeof (window as any).__supabaseLoadOtherIncomeEntries === 'function') {
-          const rows = await (window as any).__supabaseLoadOtherIncomeEntries();
-          const ids = new Set((rows || []).map((row: any) => String(row.id)));
-          Store.data.entries = Store.data.entries.filter((e: any) => !e.supabase_other_income_id || ids.has(String(e.supabase_other_income_id)));
-          for (const row of rows || []) {
-            const category = Store.data.categories.find((c: any) => String(c.name || '').trim().toLowerCase() === String(row.category || '').trim().toLowerCase());
-            const party = Store.data.parties.find((p: any) => String(p.name || '').trim().toLowerCase() === String(row.received_from || '').trim().toLowerCase());
-            const department = Store.data.departments.find((d: any) => String(d.name || '').trim().toLowerCase() === String(row.department || '').trim().toLowerCase());
-            const project = Store.data.projects.find((p: any) => String(p.name || '').trim().toLowerCase() === String(row.project || '').trim().toLowerCase());
-            const account = Store.data.accounts.find((a: any) => String(a.name || '').trim().toLowerCase() === String(row.received_into || '').trim().toLowerCase());
-            let gstDetails: any = {};
-            try { gstDetails = row.gst_details ? JSON.parse(row.gst_details) : {}; } catch { gstDetails = {}; }
-            const attachmentPaths = Array.isArray(row.attachment_paths) ? row.attachment_paths : [];
-            const otherIncomeAttachments = formAttachmentsFromValue(attachmentPaths, 'other_income', `other_income_attachment_${row.id}`);
-            const entryRecord: any = {
-              id: `other_income_${row.id}`, type: 'inflow', date: row.payment_date,
-              categoryId: category?.id || '', departmentId: department?.id || '', partyKind: party?.kind || 'other', partyId: party?.id || '', projectId: project?.id || '',
-              description: row.description || '', refNo: row.reference_no || '', taxable: Number(row.amount) || 0,
-              gstType: gstDetails.type || 'none', gstRate: Number(gstDetails.rate) || 0, gstAmount: Number(gstDetails.amount) || 0, itc: false,
-              tdsRate: Number(row.tds_percent) || 0, tdsAmount: Number(row.tds_amount) || 0, amount: Number(row.net_cash_received) || 0,
-              paymentMode: row.payment_mode || '', accountId: account?.id || '', txnRef: row.utr_reference || '', notes: row.notes || '',
-              attachments: otherIncomeAttachments,
-              otherIncomeAttachmentPaths: attachmentPaths, departmentAuto: row.department_auto !== false, financialYear: row.financial_year || '', supabase_other_income_id: row.id,
-              deleted: false, createdAt: row.created_at || new Date().toISOString(), updatedAt: row.updated_at || row.created_at || new Date().toISOString()
-            };
-            const existingIdx = Store.data.entries.findIndex((e: any) => e.supabase_other_income_id === row.id || (e.type === 'inflow' && e.categoryId === entryRecord.categoryId && e.date === entryRecord.date && e.refNo === entryRecord.refNo && !e.supabase_client_payment_id));
-            if (existingIdx >= 0) Store.data.entries[existingIdx] = { ...Store.data.entries[existingIdx], ...entryRecord, id: Store.data.entries[existingIdx].id };
-            else Store.data.entries.unshift(entryRecord);
-          }
-        }
-        if (typeof (window as any).__supabaseLoadPayVendorEntries === 'function') {
-          try {
-            const rows = await (window as any).__supabaseLoadPayVendorEntries();
-            const normalize = (value: any) => String(value || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
-            for (const row of rows || []) {
-              const vendorName = normalize(row.vendor_name);
-              const accountName = normalize(row.paid_from);
-              const reference = normalize(row.bill_number || row.utr_cheque_reference);
-              const amount = Math.abs(Number(row.amount_paid ?? row.net_cash_paid) || 0);
-              const matches = Store.data.entries.filter((entry: any) => {
-                if (entry.type !== 'outflow' || String(entry.date || '').slice(0, 10) !== String(row.payment_date || '').slice(0, 10)) return false;
-                const entryVendor = normalize(entry.partyName || api.get('parties', entry.partyId)?.name);
-                const entryAccount = normalize(entry.accountName || api.get('accounts', entry.accountId)?.name);
-                if (entryVendor !== vendorName || (accountName && entryAccount !== accountName)) return false;
-                if (reference && normalize(entry.refNo || entry.txnRef) !== reference) return false;
-                return Math.abs(Math.abs(Number(entry.amount) || 0) - amount) < 0.01;
-              });
-              const entry = Store.data.entries.find((candidate: any) => String(candidate.supabase_pay_vendor_id || '') === String(row.id))
-                || (matches.length === 1 ? matches[0] : null);
-              if (!entry) continue;
-              entry.supabase_pay_vendor_id = row.id;
-              entry.attachments = formAttachmentsFromValue(
-                row.attachments,
-                'pay a vendor attachment',
-                `vendor_attachment_${row.id}`
-              );
-            }
-          } catch (attachmentLoadError: any) {
-            console.warn('Could not load Pay a Vendor attachment metadata:', attachmentLoadError);
-            payVendorAttachmentLoadError = attachmentLoadError?.message || 'Could not load Pay a Vendor attachments from Supabase.';
-          }
-        }
-        for (const deletedEntry of deletedEntrySnapshots) {
-          const currentEntry = Store.data.entries.find((entry: any) =>
-            String(entry.id) === String(deletedEntry.id) ||
-            (deletedEntry.supabase_id && String(entry.supabase_id || '') === String(deletedEntry.supabase_id)) ||
-            Object.keys(deletedEntry).some(key =>
-              key.startsWith('supabase_') &&
-              deletedEntry[key] &&
-              String(entry[key] || '') === String(deletedEntry[key])
-            )
-          );
-          if (currentEntry) {
-            Object.assign(currentEntry, {
-              deleted: true,
-              deletedBy: deletedEntry.deletedBy,
-              deletedAt: deletedEntry.deletedAt
-            });
-          } else {
-            Store.data.entries.push(deletedEntry);
-          }
-        }
-        const cancelledIds = new Set(cancelledTransactions.map((transaction: any) => String(transaction.id)));
-        const activeIds = new Set(supabaseTransactions.map((transaction: any) => String(transaction.id)));
-        const normalize = (value: any) => String(value || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
-        Store.data.entries = Store.data.entries.filter((entry: any) => {
-          const entryId = String(entry.supabase_id || String(entry.id || '').replace(/^e_/, ''));
-          if (cancelledIds.has(entryId) || activeIds.has(entryId)) {
-            return cancelledIds.has(entryId) ? Boolean(entry.deleted) : true;
-          }
-          const entryDate = String(entry.date || '').slice(0, 10);
-          const entryType = String(entry.type || '').toLowerCase();
-          const entryCategory = normalize(api.get('categories', entry.categoryId)?.name || entry.categoryName || entry.category);
-          const entryParty = normalize(entry.partyName || api.get('parties', entry.partyId)?.name);
-          const entryAccount = normalize(entry.accountName || api.get('accounts', entry.accountId)?.name);
-          const entryProject = api.get('projects', entry.projectId);
-          const entryProjectCode = normalize(entry.projectCode || entryProject?.code);
-          const entryTaxable = Number(entry.taxable ?? entry.amount);
-          return !cancelledTransactions.some((transaction: any) => {
-            if (String(transaction.transaction_date || '').slice(0, 10) !== entryDate) return false;
-            if (String(transaction.transaction_type || '').toLowerCase() !== entryType) return false;
-            if (normalize(transaction.party_name) !== entryParty || !entryParty) return false;
-            if (normalize(transaction.account_name) !== entryAccount || !entryAccount) return false;
-            if (!Number.isFinite(entryTaxable) || Math.abs(Number(transaction.taxable_amount) - entryTaxable) >= 0.01) return false;
-            if (entryCategory && normalize(transaction.category) !== entryCategory) return false;
-            if (entryProjectCode && normalize(transaction.project_code) !== entryProjectCode) return false;
-            return Boolean(entryCategory || entryProjectCode);
-          }) || Boolean(entry.deleted);
         });
+
+        // 2. Cancelled transactions from fss_table_transactions for Trash
+        (cancelledTransactions || []).forEach((ct: any) => {
+          const deletedEntry = convertFssTransactionToLocal(
+            ct,
+            Store.data.entries,
+            Store.data.parties || [],
+            Store.data.projects || [],
+            Store.data.departments || [],
+            Store.data.categories || [],
+            Store.data.accounts || []
+          );
+          cloudEntries.push({
+            ...deletedEntry,
+            supabase_id: ct.id,
+            id: deletedEntry.id || ct.id,
+            deleted: true,
+            deletedAt: ct.updated_at || new Date().toISOString(),
+            deletedBy: ct.deleted_by || null
+          });
+        });
+
+        Store.data.entries = cloudEntries;
         refreshCashflowEntriesFromStore();
         const wasHydratingSupabase = isHydratingSupabase.current;
         isHydratingSupabase.current = true;
@@ -2974,7 +2670,7 @@ export const App: React.FC = () => {
         }
         const entries = Store.data?.entries || [];
         const valid = entries.filter((e: any) => e.date && !e.deleted && e.type !== 'transfer');
-        (window as any).IuovaCore?.toast?.(`Storing ${valid.length} transactions into Supabase fss_transactions...`);
+        (window as any).IuovaCore?.toast?.(`Storing ${valid.length} transactions into Supabase fss_table_transactions...`);
 
         const res = await SupabaseService.syncUiTransactionsToFssTransactions(entries, {
           force: opts?.force ?? true,
@@ -2984,7 +2680,7 @@ export const App: React.FC = () => {
         });
 
         if (res.success) {
-          (window as any).IuovaCore?.toast?.(`✓ Successfully stored ${res.inserted || valid.length} transactions in Supabase table fss_transactions!`, 'good');
+          (window as any).IuovaCore?.toast?.(`✓ Successfully stored ${res.inserted || valid.length} transactions in Supabase table fss_table_transactions!`, 'good');
           setCloudStatus(prev => ({
             ...prev,
             connected: true,

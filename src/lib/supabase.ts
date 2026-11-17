@@ -4949,14 +4949,13 @@ export const SupabaseService = {
   },
 
   /**
-   * Syncs / stores all UI transactions into Supabase fss_transactions table
+   * Syncs / stores all UI transactions into Supabase fss_table_transactions table
    */
   async syncUiTransactionsToFssTransactions(
     entries?: any[],
     options: { force?: boolean; onProgress?: (msg: string) => void } = {}
   ): Promise<{ success: boolean; total: number; inserted: number; error?: string }> {
     if (!supabase) return { success: false, total: 0, inserted: 0, error: 'Supabase is not configured' };
-    if (!(await isFssTransactionsAvailable())) return { success: true, total: 0, inserted: 0 };
 
     try {
       const allEntries = entries && entries.length
@@ -4968,14 +4967,14 @@ export const SupabaseService = {
         return { success: true, total: 0, inserted: 0 };
       }
 
-      // Check if fss_transactions already has records when force is false
+      // Check if fss_table_transactions already has records when force is false
       if (!options.force) {
         const { count, error: countErr } = await supabase
-          .from('fss_transactions')
+          .from('fss_table_transactions')
           .select('id', { count: 'exact', head: true });
 
         if (!countErr && typeof count === 'number' && count > 0) {
-          console.log(`Supabase table fss_transactions already has ${count} records. Auto-sync skipped.`);
+          console.log(`Supabase table fss_table_transactions already has ${count} records. Auto-sync skipped.`);
           return { success: true, total: valid.length, inserted: 0 };
         }
       }
@@ -4986,11 +4985,15 @@ export const SupabaseService = {
       const categories = (typeof (window as any).Store !== 'undefined' && (window as any).Store.data?.categories) || [];
       const accounts = (typeof (window as any).Store !== 'undefined' && (window as any).Store.data?.accounts) || [];
 
-      const allowedCols = await getFssTransactionColumns();
-
-      const payloads = valid.map((e: any) =>
-        formatFssTransactionRow(e, allowedCols, parties, projects, departments, categories, accounts)
-      );
+      const payloads = valid.map((e: any) => {
+        const payload: any = this.formatTransactionPayload(e, parties, projects, departments, categories, accounts);
+        if (e.supabase_id && UUID_PATTERN.test(String(e.supabase_id))) {
+          payload.id = e.supabase_id;
+        } else if (e.id && UUID_PATTERN.test(String(e.id))) {
+          payload.id = e.id;
+        }
+        return payload;
+      });
 
       let totalInserted = 0;
       const CHUNK_SIZE = 100;
@@ -4999,42 +5002,39 @@ export const SupabaseService = {
         const originalChunk = valid.slice(i, i + CHUNK_SIZE);
 
         if (options.onProgress) {
-          options.onProgress(`Storing ${Math.min(i + CHUNK_SIZE, payloads.length)} of ${payloads.length} transactions in Supabase...`);
+          options.onProgress(`Storing ${Math.min(i + CHUNK_SIZE, payloads.length)} of ${payloads.length} transactions in Supabase fss_table_transactions...`);
         }
 
-        // Try upsert first
         let res = await supabase
-          .from('fss_transactions')
+          .from('fss_table_transactions')
           .upsert(chunk, { onConflict: 'id' })
           .select('id');
 
         if (res.error) {
-          console.warn(`Upsert batch failed on fss_transactions, trying insert:`, res.error.message);
+          console.warn(`Upsert batch failed on fss_table_transactions, trying insert:`, res.error.message);
           res = await supabase
-            .from('fss_transactions')
+            .from('fss_table_transactions')
             .insert(chunk)
             .select('id');
         }
 
         if (res.error) {
-          console.error(`Error inserting batch into fss_transactions:`, res.error);
+          console.error(`Error inserting batch into fss_table_transactions:`, res.error);
         } else if (res.data) {
           res.data.forEach((row: any, idx: number) => {
             if (originalChunk[idx]) {
+              originalChunk[idx].supabase_id = row.id;
               originalChunk[idx].supabase_fss_transaction_id = row.id;
-              if (!originalChunk[idx].supabase_id) {
-                originalChunk[idx].supabase_id = row.id;
-              }
             }
           });
           totalInserted += res.data.length;
         }
       }
 
-      console.log(`✓ Stored ${totalInserted} of ${valid.length} transactions into Supabase fss_transactions.`);
+      console.log(`✓ Stored ${totalInserted} of ${valid.length} transactions into Supabase fss_table_transactions.`);
       return { success: true, total: valid.length, inserted: totalInserted };
     } catch (err: any) {
-      console.error('Exception syncing UI transactions to Supabase fss_transactions:', err);
+      console.error('Exception syncing UI transactions to Supabase fss_table_transactions:', err);
       return { success: false, total: 0, inserted: 0, error: err.message || String(err) };
     }
   },
