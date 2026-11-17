@@ -277,7 +277,7 @@ create policy "Allow all actions on audit_logs" on audit_logs for all using (tru
 
 -- 15. FSS CUSTOM TABLES
 -- 15.1 fss_departments
-create table if not exists public.fss_departments (
+create table if not exists fss.fss_departments (
     id bigint generated always as identity primary key,
     department_name varchar(150) not null,
     manager varchar(150),
@@ -286,11 +286,11 @@ create table if not exists public.fss_departments (
     updated_at timestamptz default now()
 );
 
-alter table public.fss_departments enable row level security;
-create policy "Allow all actions on fss_departments" on public.fss_departments for all using (true) with check (true);
+alter table fss.fss_departments enable row level security;
+create policy "Allow all actions on fss_departments" on fss.fss_departments for all using (true) with check (true);
 
 -- 15.2 fss_bank_accounts
-create table if not exists public.fss_bank_accounts (
+create table if not exists fss.fss_bank_accounts (
     id bigint generated always as identity primary key,
     account_name varchar(150) not null,
     account_type varchar(50) not null default 'Bank',
@@ -301,11 +301,11 @@ create table if not exists public.fss_bank_accounts (
     updated_at timestamptz not null default now()
 );
 
-alter table public.fss_bank_accounts enable row level security;
-create policy "Allow all actions on fss_bank_accounts" on public.fss_bank_accounts for all using (true) with check (true);
+alter table fss.fss_bank_accounts enable row level security;
+create policy "Allow all actions on fss_bank_accounts" on fss.fss_bank_accounts for all using (true) with check (true);
 
 -- 15.3 fss_form_tax_statutory
-create table if not exists public.fss_form_tax_statutory (
+create table if not exists fss.fss_form_tax_statutory (
     id uuid primary key default gen_random_uuid(),
     paying_type text not null check (paying_type in ('GST', 'TDS', 'Professional tax', 'Advance tax')),
     tax_month date not null,
@@ -326,11 +326,11 @@ create table if not exists public.fss_form_tax_statutory (
     updated_at timestamptz default now()
 );
 
-alter table public.fss_form_tax_statutory enable row level security;
-create policy "Allow all actions on fss_form_tax_statutory" on public.fss_form_tax_statutory for all using (true) with check (true);
+alter table fss.fss_form_tax_statutory enable row level security;
+create policy "Allow all actions on fss_form_tax_statutory" on fss.fss_form_tax_statutory for all using (true) with check (true);
 
 -- 15.4 fss_form_other_expense
-create table if not exists public.fss_form_other_expense (
+create table if not exists fss.fss_form_other_expense (
     id uuid primary key default gen_random_uuid(),
     expense_category text not null,
     paid_to text,
@@ -356,11 +356,11 @@ create table if not exists public.fss_form_other_expense (
     updated_at timestamptz default now()
 );
 
-alter table public.fss_form_other_expense enable row level security;
-create policy "Allow all actions on fss_form_other_expense" on public.fss_form_other_expense for all using (true) with check (true);
+alter table fss.fss_form_other_expense enable row level security;
+create policy "Allow all actions on fss_form_other_expense" on fss.fss_form_other_expense for all using (true) with check (true);
 
 -- 15.5 fss_form_client_payment
-create table if not exists public.fss_form_client_payment (
+create table if not exists fss.fss_form_client_payment (
     id uuid primary key default gen_random_uuid(),
     client_name text not null,
     category text,
@@ -388,7 +388,7 @@ create table if not exists public.fss_form_client_payment (
     updated_at timestamptz default now()
 );
 
-alter table public.fss_form_client_payment enable row level security;
-create policy "Allow all actions on fss_form_client_payment" on public.fss_form_client_payment for all using (true) with check (true);
+alter table fss.fss_form_client_payment enable row level security;
+create policy "Allow all actions on fss_form_client_payment" on fss.fss_form_client_payment for all using (true) with check (true);
 
 

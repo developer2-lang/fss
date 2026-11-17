@@ -100,7 +100,10 @@ Deno.serve(async request => {
   if (operation === 'select' && id && !UUID_RE.test(id)) return json(400, { error: 'The row id must be a valid UUID.' });
 
   const database = createClient(supabaseUrl, serviceRoleKey, {
-    auth: { autoRefreshToken: false, persistSession: false }
+    auth: { autoRefreshToken: false, persistSession: false },
+    db: {
+      schema: 'fss'
+    }
   });
   const scopeOwner = (query: any) => ownerId ? query.eq('created_by', ownerId) : query.is('created_by', null);
 

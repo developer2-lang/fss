@@ -4705,7 +4705,7 @@ export const App: React.FC = () => {
                   People Outflow: <code>fss_outflow_oc_people</code> ({cloudStatus.peopleCount ?? '—'}), <code>fss_outflow_oc_people_report</code> (View).
                 </p>
                 <div style={{ marginTop: '8px', fontSize: '12px', color: 'var(--muted)' }}>
-                  Target tables: <code>public.fss_operation_receipts</code>, <code>public.fss_income</code>, <code>public.fss_financing</code>, <code>public.fss_cash_inflow</code>, <code>public.fss_outflow_oc_people</code>, <code>public.fss_table_transactions</code>, <code>public.fss_table_orders</code>, <code>public.fss_client</code>, <code>public.fss_vendor</code>, <code>public.fss_employe</code>, <code>public.fss_other_parties</code>, <code>public.fss_projects</code>, <code>public.fss_departments</code>, <code>public.fss_bank_accounts</code>, <code>public.fss_categories</code>
+                  Target tables: <code>fss.fss_operation_receipts</code>, <code>fss.fss_income</code>, <code>fss.fss_financing</code>, <code>fss.fss_cash_inflow</code>, <code>fss.fss_outflow_oc_people</code>, <code>fss.fss_table_transactions</code>, <code>fss.fss_table_orders</code>, <code>fss.fss_client</code>, <code>fss.fss_vendor</code>, <code>fss.fss_employe</code>, <code>fss.fss_other_parties</code>, <code>fss.fss_projects</code>, <code>fss.fss_departments</code>, <code>fss.fss_bank_accounts</code>, <code>fss.fss_categories</code>
                 </div>
               </div>
 

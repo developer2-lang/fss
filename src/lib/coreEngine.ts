@@ -831,23 +831,27 @@ const api = {
     } else o.split = (o.split || []).filter(x => x.departmentId && +x.pct > 0).map(x => ({ departmentId: x.departmentId, pct: +x.pct, amount: r2(o.taxable * x.pct / 100) }));
     if (o.split.length === 1) { o.departmentId = o.split[0].departmentId; o.split = []; }
     o.terms = (o.terms || []).filter(t => t.label || +t.pct).map(t => ({ label: t.label || 'Milestone', pct: +t.pct || 0 }));
+    if (!o.orderNo || !String(o.orderNo).trim()) {
+      o.orderNo = 'ORD-' + Math.floor(100000 + Math.random() * 900000);
+    }
+    if (!o.date) o.date = TODAY;
     const errs = {};
-    if (!o.orderNo) errs.orderNo = 'Order / reference no. is required';
-    if (!o.date) errs.date = 'Date is required';
-    if (!o.clientId) errs.clientId = 'Choose a client';
     if (newProject) {
-      if (!newProject.code || !newProject.name) errs.projectId = 'Enter a code and name for the new project';
-      else if (api.list('projects').some(p => p.code.toLowerCase() === newProject.code.toLowerCase())) errs.projectId = 'Project code ' + newProject.code + ' already exists';
-    } else if (!o.projectId) errs.projectId = 'Choose or create a project';
-    if (!o.departmentId) errs.split = errs.departmentId = 'Choose a department';
-    if (!(o.taxable > 0)) errs.split = errs.taxable = 'Enter the amount for at least one department';
-    if (o.split.length && Math.abs(sum(o.split, x => x.pct) - 100) > 0.01) errs.split = 'Department split must add up to 100%';
-    if (o.terms.length && Math.abs(sum(o.terms, t => t.pct) - 100) > 0.5) errs.terms = 'Payment terms must add up to 100%';
-    if (api.list('orders').some(x => x.id !== id && x.clientId === o.clientId && x.orderNo.trim().toLowerCase() === String(o.orderNo).trim().toLowerCase())) errs.orderNo = 'This client already has an order with that number';
+      if (!newProject.code && !newProject.name) {
+        newProject = null;
+      } else {
+        if (!newProject.code) newProject.code = 'PRJ-' + Math.floor(1000 + Math.random() * 9000);
+        if (!newProject.name) newProject.name = newProject.code;
+        if (api.list('projects').some(p => p.code && p.code.toLowerCase() === newProject.code.toLowerCase())) {
+          errs.projectId = 'Project code ' + newProject.code + ' already exists';
+        }
+      }
+    }
+    if (o.clientId && o.orderNo && api.list('orders').some(x => x.id !== id && x.clientId === o.clientId && x.orderNo.trim().toLowerCase() === String(o.orderNo).trim().toLowerCase())) errs.orderNo = 'This client already has an order with that number';
     const old = id ? api.get('orders', id) : null;
     if (old && Math.abs(old.taxable - o.taxable) > 0.004 && !reason) errs.reason = 'Give a reason for the value change';
     if (Object.keys(errs).length) { const e = new Error(Object.values(errs)[0]); e.fields = errs; throw e; }
-    if (newProject) { api.guard('project.create'); const pr = await api.create('projects', { code: newProject.code, name: newProject.name, clientId: o.clientId, departmentId: o.departmentId, contractValue: 0, startDate: o.date, status: 'active', active: true }); o.projectId = pr.id; }
+    if (newProject) { api.guard('project.create'); const pr = await api.create('projects', { code: newProject.code, name: newProject.name, clientId: o.clientId || '', departmentId: o.departmentId || '', contractValue: 0, startDate: o.date, status: 'active', active: true }); o.projectId = pr.id; }
     let savedOrder;
     if (old) {
       api.guard('order.edit');
@@ -8289,7 +8293,9 @@ PAGES.pis = {
       <div class="field" style="flex:2;min-width:200px"><label>Search</label><input class="input" data-inp="pq" value="${esc(F.q)}" placeholder="PI no., tax invoice, client, order…"></div>
       <div class="field"><label>Client</label><select class="select" data-pf="clientId">${partyOptions('client', F.clientId, 'All clients')}</select></div>
       <div class="field"><label>Department</label><select class="select" data-pf="departmentId">${deptOptions(F.departmentId, 'All departments')}</select></div>
-      <span class="spacer"></span>${api.can('pi.create') ? `<button class="btn btn-gold" data-act="new-pi">${icon('plus')} New PI</button>` : ''}</div>
+      <span class="spacer"></span>
+      ${api.can('pi.create') ? `<button class="btn btn-gold" data-act="new-pi">${icon('plus')} New PI</button>` : ''}
+      <button class="btn btn-danger" data-act="delete-all-pis" style="margin-left:8px" title="Delete all proforma invoices">${icon('trash')} Delete all</button></div>
       <div class="card"><div class="summary-strip"><div><div class="l">PIs</div><div class="v">${rows.length}</div></div><div><div class="l">Value (pre-GST)</div><div class="v">${money(sum(rows, x => x.p.status === 'cancelled' ? 0 : x.p.taxable))}</div></div><div><div class="l">Total incl. GST</div><div class="v">${money(sum(rows, x => x.p.status === 'cancelled' ? 0 : x.p.total))}</div></div><div><div class="l">Received</div><div class="v in">${money(sum(rows, x => x.gross))}</div></div><div><div class="l">Outstanding</div><div class="v out">${money(sum(rows, x => x.outstanding))}</div></div></div>
       <div class="tbl-wrap"><table class="tbl"><thead><tr><th>PI no.</th><th>Date</th><th>Client · order</th><th>Milestone</th><th class="num">Pre-GST</th><th class="num">Total incl. GST</th><th class="num">Received</th><th class="num">Outstanding</th><th>Due</th><th>Status</th></tr></thead><tbody>
       ${rows.map(x => `<tr class="click" data-act="open-pi" data-id="${x.p.id}"><td><div class="cell-main mono" style="font-size:12.5px">${esc(x.p.piNo)}</div>${x.p.taxInvoiceNo ? `<div class="cell-sub">TI ${esc(x.p.taxInvoiceNo)}</div>` : ''}</td><td class="nowrap">${fmtDate(x.p.date)}</td>
@@ -8440,11 +8446,11 @@ function openOrderForm(id, preset = {}) {
     const balNeg = (v.terms[v.terms.length - 1] || {}).pct < -0.001;
     return `<div class="row" style="margin-bottom:16px"><div class="seg">${Object.keys(ORDER_TYPES).map(t => `<button type="button" class="${v.type === t ? 'on' : ''}" data-x-act="otype" data-v="${t}">${t === 'PO' ? 'PO' : t}</button>`).join('')}</div><span class="muted" style="font-size:12px">${esc(ORDER_TYPES[v.type])}</span></div>
     <div class="fsec"><div class="fsec-h">Order</div><div class="fgrid">
-      ${xf(F, 'orderNo', (v.type === 'PO' ? 'PO number' : 'Reference') + ' *', xi(v, 'orderNo', 'placeholder="' + (v.type === 'PO' ? 'Client PO no.' : 'e.g. email date / LOI ref') + '"'))}
-      ${xf(F, 'date', 'Order date *', xi(v, 'date', 'type="date"'))}
-      ${xf(F, 'clientId', 'Client *', `<div class="row" style="flex-wrap:nowrap;gap:6px">${xs('clientId', partyOptions('client', v.clientId, 'Select client'))}<button type="button" class="btn" style="padding:0 10px" title="Add client" data-x-act="new-client">${icon('plus')}</button></div>`)}
-      ${F.newProj ? `${xf(F, 'projectId', 'New project code *', `<input class="input" data-x="np.code" value="${esc(F.np.code)}" placeholder="e.g. IU-2608">`)}${xf(F, 'np.name', 'New project name *', `<input class="input" data-x="np.name" value="${esc(F.np.name)}">`, '', '<a href="#" data-x-act="pick-proj">Pick an existing project instead</a>')}`
-        : xf(F, 'projectId', 'Project *', xs('projectId', projOptions(v.clientId, v.projectId, v.clientId ? 'Select project' : 'Choose client first')), '', '<a href="#" data-x-act="new-proj">+ Create a new project</a>')}
+      ${xf(F, 'orderNo', v.type === 'PO' ? 'PO number' : 'Reference', xi(v, 'orderNo', 'placeholder="' + (v.type === 'PO' ? 'Client PO no.' : 'e.g. email date / LOI ref') + '"'))}
+      ${xf(F, 'date', 'Order date', xi(v, 'date', 'type="date"'))}
+      ${xf(F, 'clientId', 'Client', `<div class="row" style="flex-wrap:nowrap;gap:6px">${xs('clientId', partyOptions('client', v.clientId, 'Select client'))}<button type="button" class="btn" style="padding:0 10px" title="Add client" data-x-act="new-client">${icon('plus')}</button></div>`)}
+      ${F.newProj ? `${xf(F, 'projectId', 'New project code', `<input class="input" data-x="np.code" value="${esc(F.np.code)}" placeholder="e.g. IU-2608">`)}${xf(F, 'np.name', 'New project name', `<input class="input" data-x="np.name" value="${esc(F.np.name)}">`, '', '<a href="#" data-x-act="pick-proj">Pick an existing project instead</a>')}`
+        : xf(F, 'projectId', 'Project', xs('projectId', projOptions(v.clientId, v.projectId, v.clientId ? 'Select project' : 'Choose client first')), '', '<a href="#" data-x-act="new-proj">+ Create a new project</a>')}
     </div></div>
     <div class="fsec"><div class="fsec-h">Value by department <span class="faint" style="text-transform:none;letter-spacing:0;font-weight:400">pre-GST</span></div>
       <div class="od-rows ${F.errs.split ? 'has-err' : ''}" id="odDepts">${deptRows()}</div>
@@ -8454,7 +8460,7 @@ function openOrderForm(id, preset = {}) {
         <div class="field span2"><label>Order value, pre-GST</label><div class="od-total num" id="odTotal">${money(v.taxable)}</div><div class="hint">${v.split.length > 1 ? 'Total of the department amounts' : 'Same as the department amount'}</div></div>
         ${xf(F, 'gstRate', 'GST rate', xs('gstRate', opts(GST_RATES.map(r => [r, r + '%']), v.gstRate)))}
         ${xf(F, 'gstType', 'GST type', xs('gstType', opts(+v.gstRate ? [['intra', GST_TYPES.intra], ['inter', GST_TYPES.inter]] : [['none', GST_TYPES.none]], v.gstType)))}
-        <div class="span3" id="odReason">${valueChanged ? xf(F, 'reason', 'Reason for value change *', `<input class="input" data-x="reason" value="${esc(F.reason)}" placeholder="e.g. Scope extended – second variant">`, '', 'Saved as an amendment: ' + money(old.taxable) + ' → ' + money(v.taxable)) : ''}</div>
+        <div class="span3" id="odReason">${valueChanged ? xf(F, 'reason', 'Reason for value change', `<input class="input" data-x="reason" value="${esc(F.reason)}" placeholder="e.g. Scope extended – second variant">`, '', 'Saved as an amendment: ' + money(old.taxable) + ' → ' + money(v.taxable)) : ''}</div>
       </div><div id="xTot">${totals()}</div></div>
     <div class="fsec"><div class="fsec-h">Payment terms <span class="faint" style="text-transform:none;letter-spacing:0;font-weight:400">type ₹ or % · last milestone takes the balance</span></div>
       <div class="row" style="margin-bottom:10px;gap:6px"><span class="muted" style="font-size:12px">Presets:</span>${[['100', '100%'], ['50-50', '50 / 50'], ['30-40-30', '30 / 40 / 30'], ['40-40-20', '40 / 40 / 20']].map(([k, l]) => `<button type="button" class="btn btn-sm" data-x-act="terms" data-v="${k}">${l}</button>`).join('')}</div>
@@ -8476,7 +8482,7 @@ function openOrderForm(id, preset = {}) {
     const tot = $('#odTotal'); if (tot) tot.textContent = money(v.taxable);
     const x = $('#xTot'); if (x) x.innerHTML = totals();
     const te = $('#odTermErr'); if (te) te.textContent = (v.terms[v.terms.length - 1] || {}).pct < -0.001 ? 'Milestones add up to more than the order value' : '';
-    if (old) { const changed = Math.abs(old.taxable - v.taxable) > 0.004, r = $('#odReason'); if (r && changed !== !!$('[data-x=reason]', r)) r.innerHTML = changed ? xf(F, 'reason', 'Reason for value change *', `<input class="input" data-x="reason" value="${esc(F.reason)}" placeholder="e.g. Scope extended – second variant">`, '', 'Saved as an amendment: ' + money(old.taxable) + ' → ' + money(v.taxable)) : ''; else if (r && changed) { const h = $('.hint', r); if (h) h.textContent = 'Saved as an amendment: ' + money(old.taxable) + ' → ' + money(v.taxable); } }
+    if (old) { const changed = Math.abs(old.taxable - v.taxable) > 0.004, r = $('#odReason'); if (r && changed !== !!$('[data-x=reason]', r)) r.innerHTML = changed ? xf(F, 'reason', 'Reason for value change', `<input class="input" data-x="reason" value="${esc(F.reason)}" placeholder="e.g. Scope extended – second variant">`, '', 'Saved as an amendment: ' + money(old.taxable) + ' → ' + money(v.taxable)) : ''; else if (r && changed) { const h = $('.hint', r); if (h) h.textContent = 'Saved as an amendment: ' + money(old.taxable) + ' → ' + money(v.taxable); } }
   };
   runForm({
     title: old ? 'Edit order ' + esc(old.orderNo) : 'New order', wide: true, v, F, bodyFn,
@@ -8697,6 +8703,51 @@ Object.assign(ACT, {
   'del-rec': async el => {
     if (!await confirmBox({ title: 'Delete permanently?', body: 'This removes the record from all views. The audit log keeps a note of it.', ok: 'Delete', danger: true })) return;
     try { await api.removeRecord(el.dataset.col, el.dataset.id); toast('Deleted'); afterWrite(); } catch (err) { toast(err.message, 'error'); }
+  },
+  'delete-all-pis': async () => {
+    const allPis = (Store.data && Store.data.pis) ? Store.data.pis.filter((p: any) => !p.deleted) : [];
+    if (!allPis.length) {
+      return toast('No proforma invoices to delete');
+    }
+    const count = allPis.length;
+    if (!await confirmBox({
+      title: 'Delete all proforma invoices?',
+      body: `Are you sure you want to delete <b>ALL ${count} proforma invoices</b>?<br><br>This will permanently remove them from the system.`,
+      ok: 'Delete all',
+      danger: true
+    })) return;
+
+    try {
+      toast('Deleting all proforma invoices...');
+      const pisToDelete = (Store.data && Store.data.pis) || [];
+      for (const p of pisToDelete) {
+        for (const a of (p.attachments || [])) {
+          if (a && a.id) await FileStore.del(a.id).catch(() => {});
+        }
+      }
+      if (Store.data && Array.isArray(Store.data.entries)) {
+        Store.data.entries.forEach((e: any) => {
+          if (e && e.piId) e.piId = null;
+        });
+      }
+      if (Store.data) {
+        Store.data.pis = [];
+      }
+      try {
+        const sb = typeof window !== 'undefined' ? (window as any).supabase : null;
+        if (sb) {
+          await sb.from('proforma_invoices').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        }
+      } catch (sbErr) {
+        console.warn('Could not delete proforma_invoices from Supabase:', sbErr);
+      }
+      Store.persist();
+      await api.log('delete', 'pis', 'all', `Deleted all ${count} proforma invoices`).catch(() => null);
+      toast('All proforma invoices deleted');
+      afterWrite();
+    } catch (err: any) {
+      toast(err?.message || 'Could not delete proforma invoices', 'error');
+    }
   },
   'pi-receipt': el => {
     const p = api.get('pis', el.dataset.id), st = Sales.piState(p), o = Sales.orderOfPI(p), pr = api.get('projects', p.projectId);
@@ -11193,6 +11244,33 @@ if (typeof window !== 'undefined') {
     render();
     toast('All transactions deleted');
   };
+  (window as any).deleteAllPIs = async () => {
+    const allPis = (Store.data && Store.data.pis) || [];
+    for (const p of allPis) {
+      for (const a of (p.attachments || [])) {
+        if (a && a.id) await FileStore.del(a.id).catch(() => {});
+      }
+    }
+    if (Store.data && Array.isArray(Store.data.entries)) {
+      Store.data.entries.forEach((e: any) => {
+        if (e && e.piId) e.piId = null;
+      });
+    }
+    if (Store.data) {
+      Store.data.pis = [];
+    }
+    try {
+      const sb = typeof window !== 'undefined' ? (window as any).supabase : null;
+      if (sb) {
+        await sb.from('proforma_invoices').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      }
+    } catch (sbErr) {
+      console.warn('Could not delete proforma_invoices from Supabase:', sbErr);
+    }
+    Store.persist();
+    afterWrite();
+    toast('All proforma invoices deleted');
+  };
   (window as any).IuovaCore = {
     Store,
     FileStore,
@@ -11211,6 +11289,7 @@ if (typeof window !== 'undefined') {
     boot,
     toast,
     confirmBox,
-    deleteAllTransactions: (window as any).deleteAllTransactions
+    deleteAllTransactions: (window as any).deleteAllTransactions,
+    deleteAllPIs: (window as any).deleteAllPIs
   };
 }

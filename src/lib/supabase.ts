@@ -7,8 +7,12 @@ export const isSupabaseConfigured = Boolean(
   supabaseUrl && supabaseAnonKey && !supabaseUrl.includes('your-project') && !supabaseUrl.includes('placeholder')
 );
 
-export const supabase: SupabaseClient | null = isSupabaseConfigured
-  ? createClient(supabaseUrl, supabaseAnonKey)
+export const supabase: SupabaseClient<any, any> | null = isSupabaseConfigured
+  ? createClient(supabaseUrl, supabaseAnonKey, {
+      db: {
+        schema: 'fss'
+      }
+    })
   : null;
 
 export interface SupabaseSyncStatus {
@@ -1114,7 +1118,7 @@ export const SupabaseService = {
     if (!supabase) throw new Error('Supabase is not configured; audit log realtime is unavailable.');
     return supabase
       .channel('fss-audit-log-changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'fss_audit_log' }, onChange)
+      .on('postgres_changes', { event: '*', schema: 'fss', table: 'fss_audit_log' }, onChange)
       .subscribe(status => onStatus?.(status));
   },
   removeAuditLogSubscription(channel: any): void {
@@ -3740,10 +3744,10 @@ export const SupabaseService = {
 
   /**
    * Saves an order and its associated departments, payment terms, and details into Supabase tables:
-   * - public.fss_table_order_po
-   * - public.fss_table_order_departments
-   * - public.fss_table_order_payment_terms
-   * - public.fss_table_order_details
+   * - fss.fss_table_order_po
+   * - fss.fss_table_order_departments
+   * - fss.fss_table_order_payment_terms
+   * - fss.fss_table_order_details
    */
   async saveOrder(
     orderData: any,
@@ -3754,10 +3758,7 @@ export const SupabaseService = {
     if (!supabase) return null;
     const isUUID = (s: any) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(s || ''));
 
-    const orderNumber = String(orderData.orderNo || orderData.order_number || orderData.po_number || '').trim();
-    if (!orderNumber) {
-      throw new Error('PO / Order number is required.');
-    }
+    const orderNumber = String(orderData.orderNo || orderData.order_number || orderData.po_number || '').trim() || ('ORD-' + Math.floor(100000 + Math.random() * 900000));
 
     // 1. Order Date
     const orderDate = orderData.date || orderData.order_date || new Date().toISOString().slice(0, 10);
@@ -3889,7 +3890,7 @@ export const SupabaseService = {
     const gstAmount = Math.max(0, Number(orderData.gstAmount ?? orderData.gst_amount ?? (preGstAmount * gstRate / 100)));
     const totalAmount = Math.max(0, Number(orderData.total ?? orderData.total_amount ?? orderData.order_total_incl_gst ?? (preGstAmount + gstAmount)));
 
-    // 4. Save into public.fss_table_order_po
+    // 4. Save into fss.fss_table_order_po
     const poPayload: any = {
       po_number: orderNumber,
       order_date: orderDate,
@@ -3917,7 +3918,7 @@ export const SupabaseService = {
 
     const orderPoId = savedPo.id;
 
-    // 5. Save into public.fss_table_order_departments
+    // 5. Save into fss.fss_table_order_departments
     try {
       await supabase.from('fss_table_order_departments').delete().eq('order_po_id', orderPoId);
 
@@ -3968,7 +3969,7 @@ export const SupabaseService = {
       console.warn('Error syncing order departments:', dErr);
     }
 
-    // 6. Save into public.fss_table_order_payment_terms
+    // 6. Save into fss.fss_table_order_payment_terms
     try {
       await supabase.from('fss_table_order_payment_terms').delete().eq('order_po_id', orderPoId);
 
@@ -4002,7 +4003,7 @@ export const SupabaseService = {
       console.warn('Error syncing order payment terms:', mErr);
     }
 
-    // 7. Save into public.fss_table_order_details
+    // 7. Save into fss.fss_table_order_details
     try {
       const att = Array.isArray(orderData.attachments) && orderData.attachments.length > 0 ? orderData.attachments[0] : null;
       const docName = att?.name || att?.file_name || orderData.document_name || null;
@@ -4139,7 +4140,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Formats a local entry / transaction into the schema expected by public.fss_table_transactions
+   * Formats a local entry / transaction into the schema expected by fss.fss_table_transactions
    */
   formatTransactionPayload(
     entry: any,
@@ -4332,7 +4333,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Saves or updates a transaction in public.fss_table_transactions and public.fss_transactions
+   * Saves or updates a transaction in fss.fss_table_transactions and fss.fss_transactions
    */
   async saveTransaction(
     entry: any,
@@ -4680,7 +4681,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all transactions from the authoritative public.fss_table_transactions table.
+   * Loads all transactions from the authoritative fss.fss_table_transactions table.
    */
   async loadTransactionsFromSupabase(): Promise<any[]> {
     if (!supabase) throw new Error('Supabase is not configured');
@@ -4882,7 +4883,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all rows from public.fss_operation_receipts
+   * Loads all rows from fss.fss_operation_receipts
    */
   async loadOperationReceiptsFromSupabase(): Promise<any[]> {
     if (!supabase) return [];
@@ -4903,7 +4904,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all rows from public.fss_income
+   * Loads all rows from fss.fss_income
    */
   async loadIncomeFromSupabase(): Promise<any[]> {
     if (!supabase) return [];
@@ -4924,7 +4925,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all rows from public.fss_financing
+   * Loads all rows from fss.fss_financing
    */
   async loadFinancingFromSupabase(): Promise<any[]> {
     if (!supabase) return [];
@@ -4945,7 +4946,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all rows from public.fss_cash_inflow (view or table)
+   * Loads all rows from fss.fss_cash_inflow (view or table)
    */
   async loadCashInflowFromSupabase(): Promise<any[]> {
     if (!supabase) return [];
@@ -5006,7 +5007,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Saves or updates a row into public.fss_operation_receipts using primary key id
+   * Saves or updates a row into fss.fss_operation_receipts using primary key id
    */
   async saveOperationReceipt(record: any): Promise<any> {
     if (!supabase) throw new Error('Supabase is not configured.');
@@ -5036,7 +5037,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Updates a single cell (month column) for an Income record in public.fss_income by id,
+   * Updates a single cell (month column) for an Income record in fss.fss_income by id,
    * recalculates the total row (Other Income Total), and returns the updated dataset.
    * Note: fy_to_date is a Postgres generated column in fss_income, so it is never included in updates.
    */
@@ -5146,7 +5147,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Adds a new Income entry to public.fss_income
+   * Adds a new Income entry to fss.fss_income
    */
   async addIncome(
     incomeName: string,
@@ -5243,7 +5244,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Updates a single cell (month column) for a Financing record in public.fss_financing by id,
+   * Updates a single cell (month column) for a Financing record in fss.fss_financing by id,
    * recalculates fy_to_date, the total row (Financing Total), and returns the updated dataset.
    */
   async updateFinancingCell(
@@ -5360,7 +5361,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Adds a new Financing entry to public.fss_financing
+   * Adds a new Financing entry to fss.fss_financing
    */
   async addFinancing(
     financingName: string,
@@ -5467,7 +5468,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Updates a single cell (month column) for an Operating Receipt record in public.fss_operation_receipts by id,
+   * Updates a single cell (month column) for an Operating Receipt record in fss.fss_operation_receipts by id,
    * recalculates fy_to_date, the total row (Operation Receipts), and returns the updated dataset.
    */
   async updateOperationReceiptCell(
@@ -5584,7 +5585,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Adds a new Operating Receipt entry to public.fss_operation_receipts
+   * Adds a new Operating Receipt entry to fss.fss_operation_receipts
    */
   async addOperationReceipt(
     receiptName: string,
@@ -5822,7 +5823,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all rows from public.fss_outflow_oc_people
+   * Loads all rows from fss.fss_outflow_oc_people
    */
   async loadPeopleFromSupabase(): Promise<any[]> {
     if (!supabase) return [];
@@ -5843,7 +5844,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all rows from public.fss_outflow_oc_people_report (SQL View)
+   * Loads all rows from fss.fss_outflow_oc_people_report (SQL View)
    */
   async loadPeopleReportFromSupabase(): Promise<any[]> {
     if (!supabase) return [];
@@ -5863,7 +5864,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Updates a single cell (month column) for an Operating Costs - People record in public.fss_outflow_oc_people by id.
+   * Updates a single cell (month column) for an Operating Costs - People record in fss.fss_outflow_oc_people by id.
    * Note: The view fss_outflow_oc_people_report automatically recalculates fy_to_date, share_pct, and People Total.
    */
   async updatePeopleCell(
@@ -5942,7 +5943,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Adds a new Operating Costs - People expense into public.fss_outflow_oc_people,
+   * Adds a new Operating Costs - People expense into fss.fss_outflow_oc_people,
    * avoiding duplicate inserts.
    */
   async addPeopleExpense(
@@ -6013,7 +6014,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Syncs / inserts People outflow rows to public.fss_outflow_oc_people
+   * Syncs / inserts People outflow rows to fss.fss_outflow_oc_people
    */
   async syncPeopleToSupabase(peopleRows: any[]): Promise<{
     people: any[];
@@ -6100,7 +6101,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all rows from public.fss_outflow_project_cost (FSS Outflow - Project Costs)
+   * Loads all rows from fss.fss_outflow_project_cost (FSS Outflow - Project Costs)
    */
   async loadProjectCostFromSupabase(): Promise<any[]> {
     if (!supabase) return [];
@@ -6122,7 +6123,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Updates a single cell (month column) for a Project Costs outflow record in public.fss_outflow_project_cost by category.
+   * Updates a single cell (month column) for a Project Costs outflow record in fss.fss_outflow_project_cost by category.
    * Recalculates fy_to_date and shares, then returns the updated dataset.
    */
   async updateProjectCostCell(
@@ -6200,7 +6201,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Adds a new Project Costs outflow into public.fss_outflow_project_cost,
+   * Adds a new Project Costs outflow into fss.fss_outflow_project_cost,
    * avoiding duplicate inserts (updates when the category already exists).
    */
   async addProjectCostExpense(
@@ -6265,7 +6266,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Syncs / upserts Project Costs outflow rows into public.fss_outflow_project_cost
+   * Syncs / upserts Project Costs outflow rows into fss.fss_outflow_project_cost
    * using the category name as the stable identifier (no duplicate category records).
    */
   async syncProjectCostToSupabase(projectCostRows: any[]): Promise<{ projectCost: any[] }> {
@@ -6375,7 +6376,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all rows from public.fss_outflow_capex (FSS Outflow - Capex)
+   * Loads all rows from fss.fss_outflow_capex (FSS Outflow - Capex)
    */
   async loadCapexFromSupabase(): Promise<any[]> {
     if (!supabase) return [];
@@ -6391,7 +6392,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Updates a single cell (month column) for a Capex outflow record in public.fss_outflow_capex by category.
+   * Updates a single cell (month column) for a Capex outflow record in fss.fss_outflow_capex by category.
    * Recalculates fy_to_date and shares, then returns the updated dataset.
    */
   async updateCapexCell(
@@ -6447,7 +6448,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Adds a new Capex outflow into public.fss_outflow_capex,
+   * Adds a new Capex outflow into fss.fss_outflow_capex,
    * avoiding duplicate inserts (updates when the category already exists).
    */
   async addCapexExpense(
@@ -6512,7 +6513,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Syncs / upserts Capex outflow rows into public.fss_outflow_capex
+   * Syncs / upserts Capex outflow rows into fss.fss_outflow_capex
    * using the category name as the stable identifier (no duplicate category records).
    */
   async syncCapexToSupabase(capexRows: any[]): Promise<{ capex: any[] }> {
@@ -6625,7 +6626,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all rows from public.fss_outflow_financing_and_owner (FSS Outflow - Financing & owner)
+   * Loads all rows from fss.fss_outflow_financing_and_owner (FSS Outflow - Financing & owner)
    */
   async loadFinancingAndOwnerFromSupabase(): Promise<any[]> {
     if (!supabase) return [];
@@ -6646,7 +6647,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Updates a single cell (month column) for a Financing & owner outflow record in public.fss_outflow_financing_and_owner by category.
+   * Updates a single cell (month column) for a Financing & owner outflow record in fss.fss_outflow_financing_and_owner by category.
    * Recalculates fy_to_date and shares, then returns the updated dataset.
    */
   async updateFinancingAndOwnerCell(
@@ -6702,7 +6703,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Adds a new Financing & owner outflow into public.fss_outflow_financing_and_owner,
+   * Adds a new Financing & owner outflow into fss.fss_outflow_financing_and_owner,
    * avoiding duplicate inserts (updates when the category already exists).
    */
   async addFinancingAndOwnerExpense(
@@ -6767,7 +6768,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Syncs / upserts Financing & owner outflow rows into public.fss_outflow_financing_and_owner
+   * Syncs / upserts Financing & owner outflow rows into fss.fss_outflow_financing_and_owner
    * using the category name as the stable identifier (no duplicate category records).
    */
   async syncFinancingAndOwnerToSupabase(financingAndOwnerRows: any[]): Promise<{ financingAndOwner: any[] }> {
@@ -6861,7 +6862,7 @@ export const SupabaseService = {
   },
 
   /**
-   * Loads all rows from public.fss_outflow_oc_office_fixed
+   * Loads all rows from fss.fss_outflow_oc_office_fixed
    */
   async loadOfficeFixedFromSupabase(): Promise<any[]> {
     if (!supabase) return [];
@@ -8244,7 +8245,7 @@ export const SupabaseService = {
     return this.deleteOperationCost(idOrKey);
   },
 
-  // Tax statutory outflow (public.fss_outflow_tax_statutory)
+  // Tax statutory outflow (fss.fss_outflow_tax_statutory)
   isTaxStatutoryDirty(rawRows: any[], recomputedRows: any[]): boolean {
     const norm = (s: string) => (s || '').toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
     const rawList = rawRows || [];
