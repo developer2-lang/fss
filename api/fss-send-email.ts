@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { InvoiceEmailError, sendInvoiceEmail } from './invoice-email-sender.ts';
 
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 
@@ -56,14 +57,11 @@ export default async function handler(request: IncomingMessage, response: Server
   }
 
   try {
-    const { sendInvoiceEmail } = await import('./invoice-email-sender.ts');
     const result = await sendInvoiceEmail(body, process.env);
     json(response, 200, result);
   } catch (error) {
     console.error('Invoice email delivery failed:', error);
-    const statusCode = error instanceof Error && 'statusCode' in error && typeof error.statusCode === 'number'
-      ? error.statusCode
-      : 500;
+    const statusCode = error instanceof InvoiceEmailError ? error.statusCode : 500;
     json(response, statusCode, {
       success: false,
       error: error instanceof Error ? error.message : 'Invoice email delivery failed.'
