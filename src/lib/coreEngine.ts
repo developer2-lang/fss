@@ -1037,11 +1037,13 @@ const api = {
     const rec = { kind: m.kind, entity: m.entity, entityId: m.entityId, partyId: m.partyId, from: emailSettings().from, to, cc, subject: m.subject, body: m.body, attachments: m.attachments || [], status: 'queued', sentAt: null, error: null, events: [{ ts: nowISO(), status: 'queued', by: api.me().id }] };
     return api.create('emails', rec);
   },
-  async setEmailStatus(id, status, note) {
+  async setEmailStatus(id, status, note, from) {
     api.guard(status === 'cancelled' ? 'email.cancel' : 'email.status');
     const m = api.get('emails', id);
     const patch = { status, events: [...(m.events || []), { ts: nowISO(), status, by: api.me().id, note: note || '' }] };
-    if (status === 'sent') patch.sentAt = nowISO(); if (status === 'failed') patch.error = note || 'Delivery failed';
+    if (from) patch.from = from;
+    if (status === 'sent') { patch.sentAt = nowISO(); patch.error = null; }
+    if (status === 'failed') patch.error = note || 'Delivery failed';
     return api.update('emails', id, patch, { action: status === 'cancelled' ? 'cancel' : 'update', summary: describe('emails', m) + ' · ' + EMAIL_STATUS[status] });
   },
   async saveEmailSettings(patch) {
@@ -6477,11 +6479,20 @@ async function syncSavedEntryToCloud(F: any, saved: any) {
     delete F._pendingCloudOtherIncomeSaved;
   }
   if (F.email?.on) {
-    void finalizeEmail(F.email, { entity: 'entries', entityId: saved.id, docs: saved.attachments || [] })
+    void finalizeEmail(F.email, {
+      entity: 'entries',
+      entityId: saved.id,
+      docs: saved.attachments || [],
+      sendNow: F.email.kind === 'vendor_payment'
+    })
       .then(mail => {
-        if (mail) toast('Email queued to ' + mail.to.join(', '));
+        if (mail) toast(mail.status === 'sent' ? 'Payment advice sent to ' + mail.to.join(', ') : 'Email queued to ' + mail.to.join(', '));
+      refreshEmailSection('entries', saved.id, !saved.deleted && api.can('email.queue'));
       })
-      .catch(err => toast('Entry saved, but the email was not queued: ' + err.message, 'error'));
+    .catch(err => {
+      toast('Entry saved, but the email was not sent: ' + err.message, 'error');
+      refreshEmailSection('entries', saved.id, !saved.deleted && api.can('email.queue'));
+    });
   }
   for (const id of (F.removed || [])) await FileStore.del(id).catch(() => { });
   if (typeof window !== 'undefined' && typeof (window as any).__syncByAccountCreditedDebited === 'function') {
@@ -8750,8 +8761,8 @@ function openPIForm(id, orderId) {
         throw error;
       }
       await finishSalesAttachmentSave(F, 'proforma-invoices');
-      const mail = await finalizeEmail(F.email, { entity: 'pis', entityId: r.id, docs: r.attachments || [] }).catch(err => { toast('PI saved, but the email was not queued: ' + err.message, 'error'); return null; });
-      toast((old ? 'PI updated' : 'PI ' + r.piNo + ' issued') + (mail ? ' · emailed to ' + mail.to.join(', ') + ' (queued)' : ''));
+      const mail = await finalizeEmail(F.email, { entity: 'pis', entityId: r.id, docs: r.attachments || [], sendNow: true }).catch(err => { toast('PI saved, but the email was not sent: ' + err.message, 'error'); return null; });
+      toast((old ? 'PI updated' : 'PI ' + r.piNo + ' issued') + (mail ? ' · emailed to ' + mail.to.join(', ') : ''));
     },
   });
   bindEmailEvents($('#xBody', piOv), () => F.email, F.redraw);
@@ -8991,7 +9002,7 @@ function emailBoxHTML(E, { docs = 0, standalone = false } = {}) {
         <div class="files" style="margin-top:6px">${E.files.map((f, i) => `<div class="file" style="border-color:var(--gold-line);background:var(--gold-soft)"><span>${esc(f.name)}</span><button type="button" data-em-act="rm-file" data-i="${i}">${icon('x').replace('<svg', '<svg style="width:12px;height:12px"')}</button></div>`).join('')}
         <button type="button" class="btn btn-sm" data-em-act="pick">${icon('clip')} Upload file for this email</button></div><input type="file" class="em-files" multiple accept="image/*,application/pdf" style="display:none"></div>
     </div>
-    <div class="em-note">${icon('info').replace('<svg', '<svg style="width:14px;height:14px;flex:none"')}<span>Saving puts this email in the <b>outbox</b>; it is sent from <b>${esc(emailSettings().from)}</b> once the mail server is connected. Until then you can open any outbox email in your mail app.</span></div></div>`;
+    <div class="em-note">${icon('info').replace('<svg', '<svg style="width:14px;height:14px;flex:none"')}<span>${['pi_issued', 'vendor_payment'].includes(E.kind) ? 'Sending delivers this email through the configured SMTP server and records the result in the outbox.' : `Saving puts this email in the <b>outbox</b>; it is sent from <b>${esc(emailSettings().from)}</b> once the mail server is connected. Until then you can open any outbox email in your mail app.`}</span></div></div>`;
 }
 /** Delegated handler. Returns true if the event was an email event. */
 function handleEmail(ev, E, redraw) {
@@ -9024,7 +9035,77 @@ function checkEmail(E) {
   if (!E.to.length) throw new Error('Pick or add at least one email address, or untick “Email this”');
   const badCc = splitEmails(E.cc).filter(x => !validEmail(x)); if (badCc.length) throw new Error('Not a valid CC address: ' + badCc.join(', '));
 }
-async function finalizeEmail(E, { entity, entityId, docs = [] }) {
+async function base64FromBlob(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)));
+  }
+  return btoa(binary);
+}
+async function emailAttachments(attachments, defaultBucket = 'proforma-invoices') {
+  const payload = [];
+  let localBytes = 0;
+  for (const attachment of attachments || []) {
+    const filename = String(attachment.name || attachment.file_name || 'invoice-attachment').slice(0, 255);
+    const storagePath = attachment.storagePath || attachment.storage_path || attachment.path;
+    if (storagePath) {
+      const bucket = attachment.bucket || defaultBucket;
+      payload.push({ filename, contentType: attachment.type || attachment.content_type || 'application/pdf', bucket, storagePath });
+      continue;
+    }
+
+    const stored = attachment.id ? await FileStore.get(attachment.id) : null;
+    if (!stored?.blob) {
+      throw new Error(`Cannot attach "${filename}": its file is no longer available in this browser.`);
+    }
+    const blob = stored.blob;
+    localBytes += blob.size || 0;
+    if (localBytes > 2.5 * 1024 * 1024) {
+      throw new Error('Email attachments saved only in this browser must total 2.5 MB or less. Store larger documents on the record first.');
+    }
+    payload.push({
+      filename,
+      contentType: attachment.type || blob.type || 'application/pdf',
+      contentBase64: await base64FromBlob(blob)
+    });
+  }
+  return payload;
+}
+async function deliverEmail(record, attachments, bucket = 'proforma-invoices') {
+  let result;
+  try {
+    result = await SupabaseService.sendInvoiceEmail({
+      to: record.to,
+      cc: record.cc || [],
+      subject: record.subject,
+      text: record.body,
+      attachments: await emailAttachments(attachments, bucket)
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      await api.setEmailStatus(record.id, 'failed', message);
+    } catch (statusError) {
+      console.error('Could not record invoice email failure in the outbox:', statusError);
+      throw new Error(`Email delivery failed: ${message}. The outbox status could not be updated.`);
+    }
+    throw new Error(`Email delivery failed: ${message}`);
+  }
+  if (result.rejected.length) {
+    const note = `SMTP accepted ${result.accepted} recipient(s) and rejected: ${result.rejected.join(', ')}`;
+    await api.setEmailStatus(record.id, 'failed', note);
+    throw new Error(note);
+  }
+  try {
+    await api.setEmailStatus(record.id, 'sent', result.messageId ? `Accepted by SMTP · ${result.messageId}` : 'Accepted by SMTP', result.from);
+  } catch (error) {
+    console.error('Email was accepted by SMTP but its outbox status could not be updated:', error);
+    throw new Error(`Email was accepted by SMTP, but the outbox could not record success: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return api.get('emails', record.id);
+}
+async function finalizeEmail(E, { entity, entityId, docs = [], sendNow = false }) {
   if (!E || !E.on) return null;
   const metas = [];
   for (const fl of E.files) { const id = uid('f'); const meta = { id, name: fl.name, type: fl.type, size: fl.size }; await FileStore.put({ ...meta, blob: fl }); metas.push(meta); }
@@ -9032,7 +9113,13 @@ async function finalizeEmail(E, { entity, entityId, docs = [] }) {
   if (p && E.saveNew) { const saved = partyEmails(p); const add = E.to.filter(x => !saved.includes(x)); if (add.length && api.can('party.edit')) {
     const contacts = [...partyContacts(p), ...add.map((x, i) => ({ id: uid('ct'), name: '', designation: '', email: x, phone: '', whatsapp: false, tags: partyContacts(p).length || i ? ['projects'] : ['accounts'] }))];
     await api.update('parties', p.id, { contacts, email: [...saved, ...add].join(', ') }, { summary: 'Email added for ' + p.name }); } }
-  return api.queueEmail({ kind: E.kind, entity, entityId, partyId: E.partyId, to: E.to, cc: splitEmails(E.cc), subject: E.subject, body: E.body, attachments: [...(E.attachDocs ? docs : []), ...metas] });
+  const attachments = [...(E.attachDocs ? docs : []), ...metas];
+  const record = await api.queueEmail({ kind: E.kind, entity, entityId, partyId: E.partyId, to: E.to, cc: splitEmails(E.cc), subject: E.subject, body: E.body, attachments });
+  if (sendNow) {
+    const bucket = E.kind === 'vendor_payment' ? 'pay a vendor attachment' : 'proforma-invoices';
+    return deliverEmail(record, attachments, bucket);
+  }
+  return record;
 }
 
 /** Standalone composer for an existing entry or PI. */
@@ -9045,7 +9132,7 @@ function composeEmail(entity, id) {
   const vars = () => entity === 'pis' ? piEmailVars(rec) : entryEmailVars(rec);
   closeDrawer();
   const ov = openModal(`<div class="modal-h"><h2>${icon('mail').replace('<svg', '<svg style="width:18px;height:18px;display:inline;vertical-align:-3px;margin-right:6px"')}${esc(EMAIL_KINDS[kind])}</h2><button class="icon-btn" data-c="close">${icon('x')}</button></div><div class="modal-b" id="emBody"></div>
-    <div class="modal-f"><button class="btn" data-c="close">Cancel</button><button class="btn" data-c="mailapp">Open in mail app</button><button class="btn btn-gold" data-c="queue">${icon('send')} Queue email</button></div>`);
+    <div class="modal-f"><button class="btn" data-c="close">Cancel</button><button class="btn" data-c="mailapp">Open in mail app</button><button class="btn btn-gold" data-c="queue">${icon('send')} ${entity === 'pis' || kind === 'vendor_payment' ? 'Send email' : 'Queue email'}</button></div>`);
   const body = $('#emBody', ov); const draw = () => { refreshEmail(E, vars()); body.innerHTML = `<div class="muted" style="font-size:13px;margin-bottom:12px">For ${esc(entity === 'pis' ? 'PI ' + rec.piNo : describe('entries', rec))}</div>` + emailBoxHTML(E, { docs: (rec.attachments || []).length, standalone: true }); };
   draw(); bindEmailEvents(body, () => E, draw);
   ov.addEventListener('click', async ev => {
@@ -9053,9 +9140,10 @@ function composeEmail(entity, id) {
     if (b.dataset.c === 'close') return ov.remove();
     try {
       checkEmail(E);
-      const m = await finalizeEmail(E, { entity, entityId: id, docs: rec.attachments || [] });
+      const sendNow = b.dataset.c === 'queue' && (entity === 'pis' || kind === 'vendor_payment');
+      const m = await finalizeEmail(E, { entity, entityId: id, docs: rec.attachments || [], sendNow });
       if (b.dataset.c === 'mailapp') { window.location.href = mailtoHref(m); await api.setEmailStatus(m.id, 'mailapp', 'Opened in mail app by ' + api.me().name); }
-      ov.remove(); toast(b.dataset.c === 'mailapp' ? 'Opened in your mail app · logged in the outbox' : 'Email queued to ' + m.to.join(', ')); afterWrite();
+      ov.remove(); toast(b.dataset.c === 'mailapp' ? 'Opened in your mail app · logged in the outbox' : m.status === 'sent' ? 'Email sent to ' + m.to.join(', ') : 'Email queued to ' + m.to.join(', ')); afterWrite();
     } catch (err) { toast(err.message, 'error'); }
   });
 }
@@ -9063,8 +9151,13 @@ function emailsFor(entity, id) { return api.list('emails').filter(m => m.entity 
 const emailStatusChip = s => `<span class="chip ${{ queued: 'gold', sent: 'inflow', failed: 'overdue', cancelled: '', mailapp: 'transfer' }[s] || ''}">${EMAIL_STATUS[s] || s}</span>`;
 function emailSectionHTML(entity, id, canSend) {
   const list = emailsFor(entity, id);
-  return `<div class="fsec-h" style="margin-top:22px">Emails (${list.length})</div>${list.map(m => `<div class="list-row" style="padding:8px 0;cursor:pointer" data-act="view-email" data-id="${m.id}"><span class="faint" style="width:16px;flex:none">${icon('mail')}</span><div class="grow"><div class="t" style="font-size:13px">${esc(m.subject)}</div><div class="s">${esc(m.to.join(', '))} · ${fmtDateTime(m.createdAt)}</div></div>${emailStatusChip(m.status)}</div>`).join('') || '<div class="muted" style="font-size:13px">No emails sent for this record.</div>'}
-    ${canSend ? `<button class="btn btn-sm" style="margin-top:10px" data-act="compose-email" data-entity="${entity}" data-id="${id}">${icon('mail')} ${list.length ? 'Send another email' : 'Email this'}</button>` : ''}`;
+  return `<div data-email-section="${esc(entity + ':' + id)}"><div class="fsec-h" style="margin-top:22px">Emails (${list.length})</div>${list.map(m => `<div class="list-row" style="padding:8px 0;cursor:pointer" data-act="view-email" data-id="${m.id}"><span class="faint" style="width:16px;flex:none">${icon('mail')}</span><div class="grow"><div class="t" style="font-size:13px">${esc(m.subject)}</div><div class="s">${esc(m.to.join(', '))} · ${fmtDateTime(m.createdAt)}</div></div>${emailStatusChip(m.status)}</div>`).join('') || '<div class="muted" style="font-size:13px">No emails sent for this record.</div>'}
+    ${canSend ? `<button class="btn btn-sm" style="margin-top:10px" data-act="compose-email" data-entity="${entity}" data-id="${id}">${icon('mail')} ${list.length ? 'Send another email' : 'Email this'}</button>` : ''}</div>`;
+}
+function refreshEmailSection(entity, id, canSend) {
+  const key = `${entity}:${id}`;
+  const section = $$('#drawer [data-email-section]').find(element => element.dataset.emailSection === key);
+  if (section) section.outerHTML = emailSectionHTML(entity, id, canSend);
 }
 
 /* ---------------- outbox page ---------------- */
@@ -9076,7 +9169,7 @@ PAGES.outbox = {
     const cnt = st => all.filter(m => st === 'open' ? ['queued', 'failed'].includes(m.status) : st === 'all' || m.status === st).length;
     let rows = all.filter(m => (F.status === 'all' || (F.status === 'open' ? ['queued', 'failed'].includes(m.status) : m.status === F.status)) && (!q || [m.subject, m.to.join(' '), nameOf('parties', m.partyId)].join(' ').toLowerCase().includes(q)));
     rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    return `<div class="notice info" style="margin-bottom:16px">${icon('info')}<div>Emails are <b>queued</b> here when entries and PIs are saved. Once the backend mail service is connected it sends every queued email from <b>${esc(emailSettings().from)}</b> and marks it Sent or Failed. Until then, use <b>Open in mail app</b> to send any email from Outlook or Gmail.</div></div>
+    return `<div class="notice info" style="margin-bottom:16px">${icon('info')}<div>Some email categories are queued here when records are saved. PI emails and Pay a Vendor payment advice are sent through the configured SMTP service and marked Sent or Failed. Until other email categories are connected, use <b>Open in mail app</b> to send them from Outlook or Gmail.</div></div>
     <div class="toolbar"><div class="seg">${[['open', 'Needs attention'], ['queued', 'Queued'], ['sent', 'Sent'], ['failed', 'Failed'], ['all', 'All']].map(([k, l]) => `<button class="${F.status === k ? 'on' : ''}" data-act="ob-set" data-v="${k}">${l} <span class="faint">${cnt(k)}</span></button>`).join('')}</div>
       <div class="field" style="flex:1;min-width:220px"><input class="input" data-inp="obq" value="${esc(F.q)}" placeholder="Search recipient, subject, party…"></div>${api.can('settings.edit') ? '<a class="btn" href="#/settings">Templates & sender</a>' : ''}</div>
     <div class="card"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Created</th><th>Type</th><th>To</th><th style="width:34%">Subject</th><th>Record</th><th>Status</th><th></th></tr></thead><tbody>
@@ -9095,7 +9188,7 @@ function viewEmail(id) {
     <pre class="em-pre">${esc(m.body)}</pre>
     ${m.attachments.length ? `<div class="fsec-h" style="margin-top:16px">Attachments</div><div class="files">${m.attachments.map(a => `<button class="file" data-act="view-file" data-id="${a.id}">${icon('file').replace('<svg', '<svg style="width:14px;height:14px"')}<span>${esc(a.name)}</span></button>`).join('')}</div>` : ''}
     <div class="fsec-h" style="margin-top:16px">History</div>${(m.events || []).map(e => `<div class="tl"><div style="flex:1"><b>${esc(EMAIL_STATUS[e.status] || e.status)}</b> <span class="muted">· ${e.by === 'system' ? 'Mail server' : esc(userName(e.by))}</span><div class="when">${fmtDateTime(e.ts)}${e.note ? ' · ' + esc(e.note) : ''}</div></div></div>`).join('')}</div>
-    <div class="modal-f">${canStatus && m.status !== 'cancelled' ? `<span class="muted" style="font-size:11.5px;margin-right:auto;align-self:center">Status buttons are for testing until the mail server updates them.</span>${m.status !== 'sent' ? '<button class="btn btn-sm" data-v="sent">Mark sent</button>' : ''}${m.status !== 'failed' ? '<button class="btn btn-sm" data-v="failed">Mark failed</button>' : ''}${['failed', 'mailapp', 'sent'].includes(m.status) ? '<button class="btn btn-sm" data-v="queued">Re-queue</button>' : ''}` : ''}
+    <div class="modal-f">${canStatus && m.status !== 'cancelled' ? `<span class="muted" style="font-size:11.5px;margin-right:auto;align-self:center">Status buttons are for testing until the mail server updates them.</span>${m.status !== 'sent' ? '<button class="btn btn-sm" data-v="sent">Mark sent</button>' : ''}${m.status !== 'failed' ? '<button class="btn btn-sm" data-v="failed">Mark failed</button>' : ''}${m.status === 'failed' && ['vendor_payment', 'pi_issued'].includes(m.kind) ? '<button class="btn btn-sm" data-v="retry">Retry send</button>' : ['failed', 'mailapp', 'sent'].includes(m.status) ? '<button class="btn btn-sm" data-v="queued">Re-queue</button>' : ''}` : ''}
       ${api.can('email.cancel') && ['queued', 'failed'].includes(m.status) ? '<button class="btn btn-sm btn-danger" data-v="cancelled">Cancel</button>' : ''}
       <a class="btn btn-gold" href="${esc(mailtoHref(m))}" data-v="mailapp">${icon('ext')} Open in mail app</a></div>`);
   ov.addEventListener('click', async ev => {
@@ -9103,6 +9196,20 @@ function viewEmail(id) {
     if (v === 'close') return ov.remove();
     if (v === 'record') { ev.preventDefault(); ov.remove(); return m.entity === 'pis' ? openPI(m.entityId) : openEntry(m.entityId); }
     if (v === 'mailapp') { if (m.status === 'queued' || m.status === 'failed') { try { await api.setEmailStatus(m.id, 'mailapp', 'Opened in mail app by ' + api.me().name); } catch (e) {} } setTimeout(() => { ov.remove(); render({ keepScroll: true }); }, 300); return; }
+    if (v === 'retry') {
+      b.disabled = true;
+      b.textContent = 'Sending…';
+      try {
+        const bucket = m.kind === 'vendor_payment' ? 'pay a vendor attachment' : 'proforma-invoices';
+        const sent = await deliverEmail(m, m.attachments || [], bucket);
+        toast('Email sent to ' + sent.to.join(', '));
+      } catch (error) {
+        toast(error instanceof Error ? error.message : String(error), 'error');
+      }
+      ov.remove();
+      render({ keepScroll: true });
+      return;
+    }
     let note = '';
     if (v === 'failed') { note = prompt('Failure reason (e.g. bounced)?', 'Bounced – mailbox unavailable'); if (note === null) return; }
     try { await api.setEmailStatus(m.id, v, note); ov.remove(); toast('Email marked ' + EMAIL_STATUS[v].toLowerCase()); render({ keepScroll: true }); } catch (err) { toast(err.message, 'error'); }
@@ -9114,12 +9221,12 @@ function emailSettingsCard() {
   const es = emailSettings(), owner = api.can('settings.edit'), dis = owner ? '' : 'disabled';
   return `<div class="card"><div class="card-h"><div class="grow"><h3>Email</h3><div class="sub">Sender, default CC and the templates used for payment advices, receipts and PIs</div></div>${owner ? '<button class="btn btn-sm" data-act="em-reset-tpl">Reset templates</button>' : ''}</div><div class="card-b"><form id="emForm">
     <div class="fgrid">
-      <div class="field"><label>Send from</label><input class="input" name="from" value="${esc(es.from)}" ${dis}><div class="hint">The backend sends as this address</div></div>
+      <div class="field"><label>Send from</label><input class="input" name="from" value="${esc(es.from)}" ${dis}><div class="hint">Used for queued email records; PI and vendor payment emails use the server-configured sender.</div></div>
       <div class="field"><label>Always CC</label><input class="input" name="cc" value="${esc((es.cc || []).join(', '))}" placeholder="Optional, comma-separated" ${dis}></div>
       <div class="field" style="justify-content:flex-end"><label class="check" style="height:38px"><input type="checkbox" name="autoTick" ${es.autoTick ? 'checked' : ''} ${dis}> Tick “Email this” automatically when the party has an email</label></div>
     </div>
     ${Object.keys(DEFAULT_EMAIL_TEMPLATES).map(k => [k, EMAIL_KINDS[k]]).map(([k, l]) => `<div class="fsec" style="margin-top:18px"><div class="fsec-h">${esc(l)}</div><div class="fgrid c2"><div class="field span3"><label>Subject</label><input class="input" name="${k}.subject" value="${esc((es.templates[k] || DEFAULT_EMAIL_TEMPLATES[k]).subject)}" ${dis}></div><div class="field span3"><label>Message</label><textarea class="textarea em-body" rows="8" name="${k}.body" ${dis}>${esc((es.templates[k] || DEFAULT_EMAIL_TEMPLATES[k]).body)}</textarea></div></div></div>`).join('')}
-    <div class="hint" style="margin-top:6px">Placeholders: ${Object.entries(EMAIL_VARS).map(([k, l]) => `<code class="mono" title="${esc(l)}">{${k}}</code>`).join(' ')}</div>
+    <div class="hint" style="margin-top:6px">PI and vendor payment emails use the sender configured for the SMTP service. Other email records use the sender address above. Placeholders: ${Object.entries(EMAIL_VARS).map(([k, l]) => `<code class="mono" title="${esc(l)}">{${k}}</code>`).join(' ')}</div>
     </form>${owner ? '<div class="row" style="margin-top:14px;justify-content:flex-end"><button class="btn btn-navy" data-act="em-save-settings">Save email settings</button></div>' : ''}</div></div>`;
 }
 
@@ -10089,9 +10196,10 @@ async function sendReminder(pi, stage, { manual = false } = {}) {
   const mgmt = days >= (R.escalateAfter || 15) ? partyContacts(c).filter(x => x.email && (x.tags || []).includes('management')).map(x => x.email) : [];
   const t = emailSettings().templates.pi_reminder || DEFAULT_EMAIL_TEMPLATES.pi_reminder, vars = reminderVars(pi, stage ? stage.offset : days);
   const m = await api.queueEmail({ kind: 'pi_reminder', entity: 'pis', entityId: pi.id, partyId: pi.clientId, to: r.to, cc: [...new Set([...r.cc, ...mgmt, ...(emailSettings().cc || [])])].filter(x => !r.to.includes(x)), subject: fillTemplate(t.subject, vars), body: fillTemplate(t.body, vars), attachments: pi.attachments || [] });
-  pi.reminders = [...(pi.reminders || []), { stage: stage ? stage.stage : -1, offset: stage ? stage.offset : days, at: nowISO(), emailId: m.id, manual }];
-  api.log('update', 'pis', pi.id, `Reminder ${manual ? 'sent' : 'queued automatically'} for PI ${pi.piNo} → ${r.to.join(', ')}`);
-  Store.persist(); return m;
+  const delivered = await deliverEmail(m, m.attachments || []);
+  pi.reminders = [...(pi.reminders || []), { stage: stage ? stage.stage : -1, offset: stage ? stage.offset : days, at: nowISO(), emailId: delivered.id, manual }];
+  api.log('update', 'pis', pi.id, `Reminder ${manual ? 'sent manually' : 'sent automatically'} for PI ${pi.piNo} → ${r.to.join(', ')}`);
+  Store.persist(); return delivered;
 }
 let lastReminderRun = null;
 async function runReminders() {

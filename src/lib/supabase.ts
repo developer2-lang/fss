@@ -1049,6 +1049,47 @@ if (typeof window !== 'undefined') {
 }
 
 export const SupabaseService = {
+  async sendInvoiceEmail(payload: {
+    to: string[];
+    cc?: string[];
+    subject: string;
+    text: string;
+    attachments?: Array<{
+      filename: string;
+      contentType: string;
+      contentBase64?: string;
+      bucket?: string;
+      storagePath?: string;
+    }>;
+  }): Promise<{ messageId?: string; from?: string; accepted: number; rejected: string[] }> {
+    let response: Response;
+    try {
+      response = await fetch('/api/fss-send-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+    } catch (error) {
+      throw new Error(`Could not reach the protected email service: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    let result: any;
+    try {
+      result = await response.json();
+    } catch {
+      throw new Error(`The email service returned an invalid response (HTTP ${response.status}).`);
+    }
+    if (!response.ok || result?.success !== true) {
+      throw new Error(result?.error || `Email delivery failed (HTTP ${response.status}).`);
+    }
+    return {
+      messageId: result.messageId,
+      from: result.from,
+      accepted: Number(result.accepted) || 0,
+      rejected: Array.isArray(result.rejected) ? result.rejected : []
+    };
+  },
+
   async getAuditIdentity(): Promise<{ user_id: string | null; user_name: string }> {
     const appUser = typeof window !== 'undefined' ? (window as any).api?.me?.() : null;
     return {
