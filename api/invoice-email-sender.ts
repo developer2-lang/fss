@@ -19,9 +19,12 @@ const ALLOWED_ATTACHMENT_TYPES = new Set([
 type EmailEnvironment = Record<string, string | undefined>;
 
 export class InvoiceEmailError extends Error {
-  constructor(message: string, readonly statusCode = 500) {
+  readonly statusCode: number;
+
+  constructor(message: string, statusCode = 500) {
     super(message);
     this.name = 'InvoiceEmailError';
+    this.statusCode = statusCode;
   }
 }
 
