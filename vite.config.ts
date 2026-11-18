@@ -1,7 +1,7 @@
 import { defineConfig, loadEnv, Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import { resolve } from 'node:path';
-import { InvoiceEmailError, sendInvoiceEmail } from './api/invoice-email-sender.ts';
+import { InvoiceEmailError, sendInvoiceEmail } from './api/fss-send-email.ts';
 
 function isLoopbackAddress(address = ''): boolean {
   return address === '::1'
