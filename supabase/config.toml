@@ -1,0 +1,8 @@
+[api]
+schemas = ["public", "fss"]
+
+[functions.fss-pay-vendor]
+# The function performs its own constant-time secret check. Calls are only
+# forwarded by the loopback-only Vite development proxy, which keeps the
+# development access token out of the browser bundle.
+verify_jwt = false

@@ -1,0 +1,53 @@
+[
+  {
+    "category": "Loan EMI",
+    "jan_26": null,
+    "feb_26": null,
+    "mar_26": null,
+    "apr_26": 85000,
+    "may_26": 85000,
+    "jun_26": 85000,
+    "jul_26": 85000,
+    "aug_26": 85000,
+    "sep_26": 85000,
+    "oct_26": 85000,
+    "nov_26": 0,
+    "dec_26": 0,
+    "fy_to_date": 595000,
+    "shares": 66.5
+  },
+  {
+    "category": "Owner Drawings",
+    "jan_26": null,
+    "feb_26": null,
+    "mar_26": null,
+    "apr_26": 0,
+    "may_26": 0,
+    "jun_26": 0,
+    "jul_26": 0,
+    "aug_26": 0,
+    "sep_26": 300000,
+    "oct_26": 0,
+    "nov_26": 0,
+    "dec_26": 0,
+    "fy_to_date": 300000,
+    "shares": 33.5
+  },
+  {
+    "category": "Financing & owner",
+    "jan_26": null,
+    "feb_26": null,
+    "mar_26": null,
+    "apr_26": 85000,
+    "may_26": 85000,
+    "jun_26": 85000,
+    "jul_26": 85000,
+    "aug_26": 85000,
+    "sep_26": 385000,
+    "oct_26": 85000,
+    "nov_26": 0,
+    "dec_26": 0,
+    "fy_to_date": 895000,
+    "shares": 100
+  }
+]

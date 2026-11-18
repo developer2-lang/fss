@@ -1,0 +1,13 @@
+/* ---------- tables ---------- */
+.tbl-wrap{overflow:auto;-webkit-overflow-scrolling:touch}
+table.tbl{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+.tbl th{font-size:11.5px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;text-align:left;padding:9px 12px;background:var(--surface-2);border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;z-index:2}
+.tbl td{padding:9px 12px;border-bottom:1px solid var(--line-2);vertical-align:middle}
+.tbl tr:last-child td{border-bottom:0}
+.tbl td.num,.tbl th.num{text-align:right;white-space:nowrap}
+.tbl tbody tr.click{cursor:pointer} .tbl tbody tr.click:hover td{background:#FBFAF6}
+.tbl tfoot td{font-weight:600;background:var(--surface-2);border-top:1px solid var(--line);border-bottom:0}
+.tbl .cell-main{font-weight:500} .tbl .cell-sub{font-size:12px;color:var(--muted);margin-top:1px}
+.tbl th.sort{cursor:pointer} .tbl th.sort:hover{color:var(--ink)}
+.tbl.sticky-first th:first-child,.tbl.sticky-first td:first-child{position:sticky;left:0;z-index:1;background:var(--surface);box-shadow:1px 0 0 var(--line-2)}
+.tbl.sticky-first th:first-child{z-index:3;background:var(--surface-2)}

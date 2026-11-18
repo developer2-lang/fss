@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+/.pnp
+.pnp.js
+
+# Production build
+dist/
+build/
+
+# Local env files
+.env
+.env.local
+.env.*.local
+supabase/.env*.local
+
+# Editor & OS files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
+
+.vercel/
+node_modules/
+dist/
+.vercel/
+.env
+.env.*
+!.env.example

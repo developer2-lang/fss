@@ -1,0 +1,4 @@
+ALTER TABLE public.fss_outflow_oc_office_variable
+  ALTER COLUMN jan26 DROP NOT NULL,
+  ALTER COLUMN feb26 DROP NOT NULL,
+  ALTER COLUMN mar26 DROP NOT NULL;
