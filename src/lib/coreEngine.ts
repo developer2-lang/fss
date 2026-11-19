@@ -231,8 +231,7 @@ function bucketOf(c) {
 }
 
 /* ----------------------------- email (outbox) ----------------------------- */
-/* The prototype only QUEUES emails. The backend picks up status 'queued' records, sends them from
-   settings.email.from with the listed attachments, and sets status 'sent' / 'failed' (+ sentAt / error). */
+/* Emails are kept in the outbox; vendor payments, client receipts, and PIs can also be delivered immediately. */
 const EMAIL_KINDS = { vendor_payment: 'Payment advice to vendor', client_receipt: 'Payment received – client', pi_issued: 'Proforma invoice to client', pi_reminder: 'PI payment reminder', statement: 'Statement of account', tds_request: 'TDS certificate request', digest: 'Weekly digest (owner)', gst_pack: 'Monthly GST working to CA', tds_pack: 'Monthly TDS working to CA', tds_return: 'Quarterly TDS return pack to CA', tds_cert: 'Form 16A / 16 to deductee' };
 const EMAIL_STATUS = { queued: 'Queued', sent: 'Sent', failed: 'Failed', cancelled: 'Cancelled', mailapp: 'Opened in mail app' };
 const EMAIL_VARS = { party: 'Client / vendor name', payee_bank: 'Vendor bank account paid into', date: 'Payment / PI date', ref: 'Bill / invoice no. (or description)', taxable: 'Value before GST', gst: 'GST', tds: 'TDS', net: 'Net amount paid / received', gross: 'Value incl. GST', mode: 'Payment mode', utr: 'Txn ref / UTR', project: 'Project', description: 'Description', pi_no: 'PI number', pi_total: 'PI total incl. GST', pi_balance: 'Balance due on the PI', milestone: 'Milestone', order_no: 'Order no.', due_date: 'PI due date', total: 'PI total', expected_net: 'PI total less expected TDS', company: 'Company name', status_line: 'Reminder: "is due on …" / "is due today" / "is N days overdue"', subject_prefix: 'Reminder subject start: Reminder / Due today / Overdue', days_overdue: 'Days past due', msme_line: 'MSME (Udyam) payment clause, if Udyam no. is set', statement_table: 'Table of open PIs', total_due: 'Total outstanding', tds_table: 'Receipts with TDS for the quarter', quarter: 'TDS quarter, e.g. Q2 FY 2026-27', tds_gap: 'TDS deducted but not in 26AS', month: 'GST month, e.g. September 2026', gst_summary: 'GSTR-3B summary table', gst_checks: 'Open points for the CA', tds_summary: 'TDS section-wise table', tds_checks: 'TDS open points for the CA', form: 'Form 16A or Form 16', fy: 'Financial year, e.g. FY 2026-27' };
@@ -6483,10 +6482,12 @@ async function syncSavedEntryToCloud(F: any, saved: any) {
       entity: 'entries',
       entityId: saved.id,
       docs: saved.attachments || [],
-      sendNow: F.email.kind === 'vendor_payment'
+      sendNow: ['vendor_payment', 'client_receipt'].includes(F.email.kind)
     })
       .then(mail => {
-        if (mail) toast(mail.status === 'sent' ? 'Payment advice sent to ' + mail.to.join(', ') : 'Email queued to ' + mail.to.join(', '));
+        if (mail) toast(mail.status === 'sent'
+          ? (mail.kind === 'client_receipt' ? 'Payment receipt sent to ' : 'Payment advice sent to ') + mail.to.join(', ')
+          : 'Email queued to ' + mail.to.join(', '));
       refreshEmailSection('entries', saved.id, !saved.deleted && api.can('email.queue'));
       })
     .catch(err => {
@@ -9002,7 +9003,7 @@ function emailBoxHTML(E, { docs = 0, standalone = false } = {}) {
         <div class="files" style="margin-top:6px">${E.files.map((f, i) => `<div class="file" style="border-color:var(--gold-line);background:var(--gold-soft)"><span>${esc(f.name)}</span><button type="button" data-em-act="rm-file" data-i="${i}">${icon('x').replace('<svg', '<svg style="width:12px;height:12px"')}</button></div>`).join('')}
         <button type="button" class="btn btn-sm" data-em-act="pick">${icon('clip')} Upload file for this email</button></div><input type="file" class="em-files" multiple accept="image/*,application/pdf" style="display:none"></div>
     </div>
-    <div class="em-note">${icon('info').replace('<svg', '<svg style="width:14px;height:14px;flex:none"')}<span>${['pi_issued', 'vendor_payment'].includes(E.kind) ? 'Sending delivers this email through the configured SMTP server and records the result in the outbox.' : `Saving puts this email in the <b>outbox</b>; it is sent from <b>${esc(emailSettings().from)}</b> once the mail server is connected. Until then you can open any outbox email in your mail app.`}</span></div></div>`;
+    <div class="em-note">${icon('info').replace('<svg', '<svg style="width:14px;height:14px;flex:none"')}<span>${['pi_issued', 'vendor_payment', 'client_receipt'].includes(E.kind) ? 'Sending delivers this email through the configured SMTP server and records the result in the outbox.' : `Saving puts this email in the <b>outbox</b>; it is sent from <b>${esc(emailSettings().from)}</b> once the mail server is connected. Until then you can open any outbox email in your mail app.`}</span></div></div>`;
 }
 /** Delegated handler. Returns true if the event was an email event. */
 function handleEmail(ev, E, redraw) {
@@ -9116,7 +9117,11 @@ async function finalizeEmail(E, { entity, entityId, docs = [], sendNow = false }
   const attachments = [...(E.attachDocs ? docs : []), ...metas];
   const record = await api.queueEmail({ kind: E.kind, entity, entityId, partyId: E.partyId, to: E.to, cc: splitEmails(E.cc), subject: E.subject, body: E.body, attachments });
   if (sendNow) {
-    const bucket = E.kind === 'vendor_payment' ? 'pay a vendor attachment' : 'proforma-invoices';
+    const bucket = E.kind === 'vendor_payment'
+      ? 'pay a vendor attachment'
+      : E.kind === 'client_receipt'
+        ? 'client_payment'
+        : 'proforma-invoices';
     return deliverEmail(record, attachments, bucket);
   }
   return record;
@@ -9132,7 +9137,7 @@ function composeEmail(entity, id) {
   const vars = () => entity === 'pis' ? piEmailVars(rec) : entryEmailVars(rec);
   closeDrawer();
   const ov = openModal(`<div class="modal-h"><h2>${icon('mail').replace('<svg', '<svg style="width:18px;height:18px;display:inline;vertical-align:-3px;margin-right:6px"')}${esc(EMAIL_KINDS[kind])}</h2><button class="icon-btn" data-c="close">${icon('x')}</button></div><div class="modal-b" id="emBody"></div>
-    <div class="modal-f"><button class="btn" data-c="close">Cancel</button><button class="btn" data-c="mailapp">Open in mail app</button><button class="btn btn-gold" data-c="queue">${icon('send')} ${entity === 'pis' || kind === 'vendor_payment' ? 'Send email' : 'Queue email'}</button></div>`);
+    <div class="modal-f"><button class="btn" data-c="close">Cancel</button><button class="btn" data-c="mailapp">Open in mail app</button><button class="btn btn-gold" data-c="queue">${icon('send')} ${entity === 'pis' || ['vendor_payment', 'client_receipt'].includes(kind) ? 'Send email' : 'Queue email'}</button></div>`);
   const body = $('#emBody', ov); const draw = () => { refreshEmail(E, vars()); body.innerHTML = `<div class="muted" style="font-size:13px;margin-bottom:12px">For ${esc(entity === 'pis' ? 'PI ' + rec.piNo : describe('entries', rec))}</div>` + emailBoxHTML(E, { docs: (rec.attachments || []).length, standalone: true }); };
   draw(); bindEmailEvents(body, () => E, draw);
   ov.addEventListener('click', async ev => {
@@ -9140,7 +9145,7 @@ function composeEmail(entity, id) {
     if (b.dataset.c === 'close') return ov.remove();
     try {
       checkEmail(E);
-      const sendNow = b.dataset.c === 'queue' && (entity === 'pis' || kind === 'vendor_payment');
+      const sendNow = b.dataset.c === 'queue' && (entity === 'pis' || ['vendor_payment', 'client_receipt'].includes(kind));
       const m = await finalizeEmail(E, { entity, entityId: id, docs: rec.attachments || [], sendNow });
       if (b.dataset.c === 'mailapp') { window.location.href = mailtoHref(m); await api.setEmailStatus(m.id, 'mailapp', 'Opened in mail app by ' + api.me().name); }
       ov.remove(); toast(b.dataset.c === 'mailapp' ? 'Opened in your mail app · logged in the outbox' : m.status === 'sent' ? 'Email sent to ' + m.to.join(', ') : 'Email queued to ' + m.to.join(', ')); afterWrite();
@@ -9188,7 +9193,7 @@ function viewEmail(id) {
     <pre class="em-pre">${esc(m.body)}</pre>
     ${m.attachments.length ? `<div class="fsec-h" style="margin-top:16px">Attachments</div><div class="files">${m.attachments.map(a => `<button class="file" data-act="view-file" data-id="${a.id}">${icon('file').replace('<svg', '<svg style="width:14px;height:14px"')}<span>${esc(a.name)}</span></button>`).join('')}</div>` : ''}
     <div class="fsec-h" style="margin-top:16px">History</div>${(m.events || []).map(e => `<div class="tl"><div style="flex:1"><b>${esc(EMAIL_STATUS[e.status] || e.status)}</b> <span class="muted">· ${e.by === 'system' ? 'Mail server' : esc(userName(e.by))}</span><div class="when">${fmtDateTime(e.ts)}${e.note ? ' · ' + esc(e.note) : ''}</div></div></div>`).join('')}</div>
-    <div class="modal-f">${canStatus && m.status !== 'cancelled' ? `<span class="muted" style="font-size:11.5px;margin-right:auto;align-self:center">Status buttons are for testing until the mail server updates them.</span>${m.status !== 'sent' ? '<button class="btn btn-sm" data-v="sent">Mark sent</button>' : ''}${m.status !== 'failed' ? '<button class="btn btn-sm" data-v="failed">Mark failed</button>' : ''}${m.status === 'failed' && ['vendor_payment', 'pi_issued'].includes(m.kind) ? '<button class="btn btn-sm" data-v="retry">Retry send</button>' : ['failed', 'mailapp', 'sent'].includes(m.status) ? '<button class="btn btn-sm" data-v="queued">Re-queue</button>' : ''}` : ''}
+    <div class="modal-f">${canStatus && m.status !== 'cancelled' ? `<span class="muted" style="font-size:11.5px;margin-right:auto;align-self:center">Status buttons are for testing until the mail server updates them.</span>${m.status !== 'sent' ? '<button class="btn btn-sm" data-v="sent">Mark sent</button>' : ''}${m.status !== 'failed' ? '<button class="btn btn-sm" data-v="failed">Mark failed</button>' : ''}${m.status === 'failed' && ['vendor_payment', 'client_receipt', 'pi_issued'].includes(m.kind) ? '<button class="btn btn-sm" data-v="retry">Retry send</button>' : ['failed', 'mailapp', 'sent'].includes(m.status) ? '<button class="btn btn-sm" data-v="queued">Re-queue</button>' : ''}` : ''}
       ${api.can('email.cancel') && ['queued', 'failed'].includes(m.status) ? '<button class="btn btn-sm btn-danger" data-v="cancelled">Cancel</button>' : ''}
       <a class="btn btn-gold" href="${esc(mailtoHref(m))}" data-v="mailapp">${icon('ext')} Open in mail app</a></div>`);
   ov.addEventListener('click', async ev => {
@@ -9200,7 +9205,11 @@ function viewEmail(id) {
       b.disabled = true;
       b.textContent = 'Sending…';
       try {
-        const bucket = m.kind === 'vendor_payment' ? 'pay a vendor attachment' : 'proforma-invoices';
+        const bucket = m.kind === 'vendor_payment'
+          ? 'pay a vendor attachment'
+          : m.kind === 'client_receipt'
+            ? 'client_payment'
+            : 'proforma-invoices';
         const sent = await deliverEmail(m, m.attachments || [], bucket);
         toast('Email sent to ' + sent.to.join(', '));
       } catch (error) {

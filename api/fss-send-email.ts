@@ -124,7 +124,7 @@ export async function sendInvoiceEmail(
     const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY || '';
     if (!supabaseUrl || !serviceRoleKey) {
       throw new InvoiceEmailError(
-        'PI storage attachments require SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in the server environment.'
+        'Stored email attachments require SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in the server environment.'
       );
     }
     try {
@@ -163,13 +163,18 @@ export async function sendInvoiceEmail(
       }
     } else if (
       typeof attachment.storagePath === 'string'
-      && (attachment.bucket === 'proforma-invoices' || attachment.bucket === 'pay a vendor attachment')
+      && (
+        attachment.bucket === 'proforma-invoices'
+        || attachment.bucket === 'pay a vendor attachment'
+        || attachment.bucket === 'client_payment'
+      )
       && attachment.contentBase64 === undefined
     ) {
       const path = attachment.storagePath;
-      const pathPattern = attachment.bucket === 'proforma-invoices'
-        ? /^fss-form-attachments\/proforma-invoices\/(?:development|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/[A-Za-z0-9._-]+$/i
-        : /^fss-form-attachments\/pay a vendor attachment\/(?:development|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/[A-Za-z0-9._-]+$/i;
+      const pathPattern = new RegExp(
+        `^fss-form-attachments/${attachment.bucket}/(?:development|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})/[A-Za-z0-9._-]+$`,
+        'i'
+      );
       if (!pathPattern.test(path)) {
         invalid(`Attachment "${filename}" is not in the approved storage path.`);
       }
@@ -178,7 +183,7 @@ export async function sendInvoiceEmail(
       }
       const { data, error } = await storageClient.storage.from(attachment.bucket).download(path);
       if (error || !data) {
-        throw new InvoiceEmailError(`Could not load PI attachment "${filename}" from Supabase Storage.`);
+        throw new InvoiceEmailError(`Could not load email attachment "${filename}" from Supabase Storage.`);
       }
       if (data.size > MAX_ATTACHMENT_BYTES - attachmentBytes) {
         throw new InvoiceEmailError('Email attachments exceed the 15 MB total limit.', 413);
