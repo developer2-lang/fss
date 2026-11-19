@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { SupabaseService } from './supabase';
+import { isSupabaseConfigured, SupabaseService } from './supabase';
 
 /* ==========================================================================
    IUOVA CASHFLOW TRACKER — v2.0  (single-file prototype)
@@ -9109,7 +9109,24 @@ async function deliverEmail(record, attachments, bucket = 'proforma-invoices') {
 async function finalizeEmail(E, { entity, entityId, docs = [], sendNow = false }) {
   if (!E || !E.on) return null;
   const metas = [];
-  for (const fl of E.files) { const id = uid('f'); const meta = { id, name: fl.name, type: fl.type, size: fl.size }; await FileStore.put({ ...meta, blob: fl }); metas.push(meta); }
+  const emailAttachmentBucket = sendNow && E.kind === 'pi_issued' && E.files.length && isSupabaseConfigured
+    ? 'proforma-invoices'
+    : null;
+  const uploadedEmailFiles = emailAttachmentBucket
+    ? await SupabaseService.uploadFormAttachments(emailAttachmentBucket, E.files)
+    : [];
+  for (const [index, fl] of E.files.entries()) {
+    const id = uid('f');
+    const meta = {
+      id,
+      name: fl.name,
+      type: fl.type,
+      size: fl.size,
+      ...(uploadedEmailFiles[index] ? { ...uploadedEmailFiles[index], bucket: emailAttachmentBucket } : {})
+    };
+    await FileStore.put({ ...meta, blob: fl });
+    metas.push(meta);
+  }
   const p = api.get('parties', E.partyId);
   if (p && E.saveNew) { const saved = partyEmails(p); const add = E.to.filter(x => !saved.includes(x)); if (add.length && api.can('party.edit')) {
     const contacts = [...partyContacts(p), ...add.map((x, i) => ({ id: uid('ct'), name: '', designation: '', email: x, phone: '', whatsapp: false, tags: partyContacts(p).length || i ? ['projects'] : ['accounts'] }))];
