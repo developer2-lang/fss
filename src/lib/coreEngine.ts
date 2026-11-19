@@ -1856,7 +1856,7 @@ const fmtPct = v => (isFinite(v) ? v.toFixed(1) : '0.0') + '%';
 /* ============================ state & routing ============================ */
 const S = {
   page: 'dashboard', fy: fyOf(TODAY), dashDept: '',
-  ledger: { q: '', bucket: '', group: '', from: '', to: '', type: '', categoryId: '', departmentId: '', partyId: '', projectId: '', accountId: '', paymentMode: '', page: 0, sort: 'date', dir: -1, open: window.innerWidth > 900 },
+  ledger: { q: '', bucket: '', group: '', from: '', to: '', type: '', categoryId: '', departmentId: '', partyId: '', projectId: '', accountId: '', transferDirection: '', paymentMode: '', page: 0, sort: 'date', dir: -1, open: window.innerWidth > 900 },
   cf: { by: 'category', period: 'monthly' },
   byAccountCdOpen: true,
   byAccountCdFilter: '',
@@ -2426,6 +2426,7 @@ function ledgerFiltered() {
     if (from && entryDate && entryDate < from) return false;
     if (to && entryDate && entryDate > to) return false;
     if (L.type && e.type !== L.type) return false;
+    if (L.transferDirection && (e.type !== 'transfer' || ledgerTransferDirection(e) !== L.transferDirection)) return false;
     if (L.categoryId) {
       const targetCat = api.get('categories', L.categoryId);
       const targetName = norm(targetCat?.name);
@@ -2503,7 +2504,7 @@ PAGES.ledger = {
   title: 'Transactions',
   render() {
     const L = S.ledger; const [fyF, fyT] = fyRange(S.fy);
-    const activeCount = ['type', 'categoryId', 'departmentId', 'partyId', 'projectId', 'accountId', 'paymentMode', 'from', 'to'].filter(k => L[k]).length;
+    const activeCount = ['type', 'categoryId', 'departmentId', 'partyId', 'projectId', 'accountId', 'transferDirection', 'paymentMode', 'from', 'to'].filter(k => L[k]).length;
     return `<div class="toolbar">
       <div class="field" style="flex:2;min-width:220px"><label>Search</label><input class="input" data-inp="lq" value="${esc(L.q)}" placeholder="Description, ref no., party, amount…"></div>
       <div class="field"><label>From</label><input class="input" type="date" data-lf="from" value="${L.from || fyF}"></div>
@@ -2535,18 +2536,35 @@ function ledgerResults() {
 const transfers = rows.filter(e => e.type === 'transfer');
   const transIn = transfers.filter(e => ledgerTransferDirection(e) === 'in');
   const transOut = transfers.filter(e => ledgerTransferDirection(e) === 'out');
+  const selectedAccount = L.accountId
+    ? api.get('accounts', L.accountId) || (Store.data.accounts || []).find((a: any) =>
+      String(a.id) === String(L.accountId) || String(a.name || '').trim().toLowerCase() === String(L.accountId).trim().toLowerCase()
+    )
+    : null;
+  const balanceDate = to > TODAY ? TODAY : to;
+  const openingBalance = selectedAccount ? Calc.balance(selectedAccount.id, addDays(from, -1)) : null;
+  const availableBalance = selectedAccount ? Calc.balance(selectedAccount.id, balanceDate) : null;
+  const transfersOnly = L.type === 'transfer';
+  const accountTransfersOnly = transfersOnly && Boolean(selectedAccount);
   const per = 50, pages = Math.max(1, Math.ceil(rows.length / per)); if (L.page >= pages) L.page = pages - 1;
   const slice = rows.slice(L.page * per, L.page * per + per);
   const sortI = k => L.sort === k ? (L.dir < 0 ? ' ↓' : ' ↑') : '';
   const strip = `<div class="summary-strip">
     <div><div class="l">Entries</div><div class="v">${rows.length}</div></div>
+    ${accountTransfersOnly ? `
+    <div><div class="l">Transfer In</div><div class="v in">${money(sum(transIn, e => e.amount))}</div></div>
+    <div><div class="l">Transfer Out</div><div class="v out">${money(sum(transOut, e => e.amount))}</div></div>` : transfersOnly ? `
+    <div><div class="l">Transfer amount</div><div class="v">${money(sum(transfers, e => e.amount))}</div></div>` : `
     <div><div class="l">Inflow</div><div class="v in">${money(sum(ins, e => e.amount))}</div></div>
     <div><div class="l">Outflow</div><div class="v out">${money(sum(outs, e => e.amount))}</div></div>
     <div><div class="l">Transfer In</div><div class="v in">${money(sum(transIn, e => e.amount))}</div></div>
     <div><div class="l">Transfer Out</div><div class="v out">${money(sum(transOut, e => e.amount))}</div></div>
     <div><div class="l">Net</div><div class="v">${money(sum(ins, e => e.amount) + sum(transIn, e => e.amount) - sum(outs, e => e.amount) - sum(transOut, e => e.amount), { sign: true })}</div></div>
     <div><div class="l">GST in / out</div><div class="v">${money(sum(ins, e => e.gstAmount))} / ${money(sum(outs, e => e.gstAmount))}</div></div>
-    <div><div class="l">TDS in / out</div><div class="v">${money(sum(ins, e => e.tdsAmount))} / ${money(sum(outs, e => e.tdsAmount))}</div></div></div>`;
+    <div><div class="l">TDS in / out</div><div class="v">${money(sum(ins, e => e.tdsAmount))} / ${money(sum(outs, e => e.tdsAmount))}</div></div>`}
+    ${selectedAccount ? `<div><div class="l">Opening balance · ${fmtDate(addDays(from, -1))}</div><div class="v">${money(openingBalance)}</div></div>` : ''}
+    ${selectedAccount ? `<div><div class="l">Available balance · ${fmtDate(balanceDate)}</div><div class="v">${money(availableBalance)}</div></div>` : ''}
+    </div>`;
   const loadStatus = ledgerLoadError
     ? `<div class="notice" role="alert" style="margin:12px">${esc(ledgerLoadError)}</div>`
     : '';
@@ -4633,6 +4651,30 @@ PAGES.cashflow = {
     const transactionEntries = typeof getAllTransactions === 'function'
       ? getAllTransactions()
       : (Array.isArray(Store.data?.cashflowEntries) ? Store.data.cashflowEntries : Calc.inRange(fyF, lastTo));
+    const transferThrough = lastTo < TODAY ? lastTo : TODAY;
+    const transferEntries = transactionEntries.filter((entry: any) => {
+      const date = String(entry.date || entry.transaction_date || '').slice(0, 10);
+      return String(entry.type || entry.transaction_type || '').toLowerCase() === 'transfer' &&
+        !entry.deleted && !String(entry.status || '').toLowerCase().includes('cancel') &&
+        date >= fyF && date <= transferThrough;
+    });
+    const accountTransferInTotal = (accountNode: any, from: string, to: string) => {
+      const account = api.get('accounts', accountNode.id);
+      const accountIds = new Set([accountNode.id, account?.supabase_id].filter(Boolean).map(String));
+      const normalizeAccountName = (value: any) =>
+        String(value || '').trim().toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ');
+      const accountName = normalizeAccountName(account?.name || accountNode.label);
+      return sum(transferEntries.filter((entry: any) => {
+        const date = String(entry.date || entry.transaction_date || '').slice(0, 10);
+        if (date < from || date > to) return false;
+        const destinationId = entry.toAccountId ?? entry.to_account_id ?? entry.transfer_to_account_id;
+        const destinationName = normalizeAccountName(
+          entry.transferToAccountName || entry.transfer_to_account_name || entry.toAccountName
+        );
+        return (destinationId != null && accountIds.has(String(destinationId))) ||
+          Boolean(destinationName && destinationName === accountName);
+      }), (entry: any) => Math.abs(Number(entry.amount ?? entry.netCash ?? entry.net_cash ?? entry.taxable) || 0));
+    };
     const ents = transactionEntries.filter((entry: any) =>
       !entry.deleted && !String(entry.status || '').toLowerCase().includes('cancel') &&
       entry.date >= fyF && entry.date <= lastTo && entry.type !== 'transfer'
@@ -5414,24 +5456,21 @@ PAGES.cashflow = {
     }).join('')
       + `<td class="num tot-c" ${n.drill ? drillAttr(type, n.drill, fyF, lastTo) : ''}>${money(sum(n.vals))}</td><td class="num share"><span class="${depth ? 'faint' : 'muted'}">${fmtPct(pct(sum(n.vals), base))}</span></td>`;
     const balCells = vals => periods.map((p, i) => `<td class="num ${p.cur ? 'cur' : ''} ${vals[i] < 0 ? 'out' : ''}">${money(vals[i])}</td>`).join('') + '<td class="num tot-c"></td><td></td>';
-    const accBalCells = (accountNode: any) => {
-      const latestVal = accountNode.vals && accountNode.vals.length ? accountNode.vals[accountNode.vals.length - 1] : 0;
-      return periods.map((p: any, i: number) => {
-        const val = accountNode.vals[i];
-        const numVal = (val !== null && val !== undefined && !isNaN(Number(val))) ? Number(val) : 0;
-        const mKey = p.months?.[0] || p.label || '';
-        const mCol = M_COL_MAP[String(p.months?.[0] || '').slice(5, 7)] || '';
-        return `<td class="num acc-bal-cell ${p.cur ? 'cur' : ''} ${numVal < 0 ? 'out' : ''}"
+    const accountTransferInCells = (accountNode: any) => {
+      const transferCell = (from: string, to: string, label: string, isTotal = false) => {
+        const total = accountTransferInTotal(accountNode, from, to);
+        return `<td class="num acc-transfer-in-cell in ${isTotal ? 'tot-c' : ''}"
           data-acc-id="${esc(accountNode.id)}"
-          data-acc-name="${esc(accountNode.label)}"
-          data-period-idx="${i}"
-          data-period-key="${esc(mKey)}"
-          data-period-col="${esc(mCol)}"
-          data-period-label="${esc(p.label)}"
-          data-val="${numVal}"
-          title="Double-click to edit ${esc(accountNode.label)} balance (${esc(p.label)})"
-          style="cursor:pointer;">${money(numVal)}</td>`;
-      }).join('') + `<td class="num tot-c ${latestVal < 0 ? 'out' : ''}">${money(latestVal)}</td><td class="num share"></td>`;
+          data-period-from="${esc(from)}"
+          data-period-to="${esc(to)}"
+          title="Click to view ${esc(accountNode.label)} transfers received ${esc(label)}"
+          style="cursor:pointer;"><button type="button" aria-label="${esc(accountNode.label)} transfers received ${esc(label)}" style="display:block;width:100%;border:0;background:none;color:inherit;padding:0;text-align:right;font:inherit;cursor:pointer;">${money(total)}</button></td>`;
+      };
+      return periods.map((period: any) =>
+        transferCell(period.from, period.to < TODAY ? period.to : TODAY, period.label)
+      ).join('') +
+        transferCell(fyF, transferThrough, 'FY to date', true) +
+        '<td class="num share"></td>';
     };
     const secRow = (label, vals, total, cls) => `<tr class="sec ${cls}"><td>${label}</td>${vals.map((v, i) => `<td class="num ${periods[i].cur ? 'cur' : ''}">${money(v)}</td>`).join('')}<td class="num tot-c">${money(total)}</td><td class="num share">${fmtPct(total > 0 ? 100 : 0)}</td></tr>`;
     const accOpen = OPEN.has(accNode.key);
@@ -5452,9 +5491,9 @@ PAGES.cashflow = {
         <tr class="net"><td>Net cashflow</td>${periods.map((p, i) => `<td class="num ${p.cur ? 'cur' : ''} ${netCashFlow[i] >= 0 ? 'in' : 'out'}">${money(netCashFlow[i], { sign: true })}</td>`).join('')}<td class="num tot-c ${NET >= 0 ? 'in' : 'out'}">${money(NET, { sign: true })}</td><td></td></tr>
         <tr class="bal"><td>Closing balance</td>${balCells(closing)}</tr>
         <tr class="d0 node ${accOpen ? 'is-open' : ''}"><td><button class="tw ${accOpen ? 'open' : ''}" data-act="tree" data-k="${accNode.key}">${icon('chev')}<span>By account</span><span class="tw-n">${accNode.children.length}</span></button></td>${periods.map(() => '<td></td>').join('')}<td></td><td></td></tr>
-        ${accOpen ? accNode.children.map(a => `<tr class="d1 leaf"><td><span class="tw-leaf">${esc(a.label)}</span></td>${accBalCells(a)}</tr>`).join('') : ''}
+        ${accOpen ? accNode.children.map(a => `<tr class="d1 leaf"><td><span class="tw-leaf">${esc(a.label)}</span></td>${accountTransferInCells(a)}</tr>`).join('') : ''}
       </tbody></table></div></div>
-      <div class="muted" style="font-size:12px;margin-top:10px">Net cash after GST and TDS. Balances include bank, FD and petty cash; transfers between them are excluded. Months that haven't started are hidden. Click a row name to expand it, or any figure to see its entries.</div>
+      <div class="muted" style="font-size:12px;margin-top:10px">Net cash after GST and TDS. The By account rows show transfers received in each displayed period; FY to date shows the total received during this financial year. Months that haven't started are hidden. Click a By account amount to see the incoming transfers for that period.</div>
       ${renderByAccountCreditedDebitedHTML()}`;
   },
 };
@@ -7802,7 +7841,7 @@ const ACT = {
   'close-side': () => { $('#sidebar').classList.remove('open'); $('.drawer-ov.side')?.remove(); },
   'add-entry': () => openEntryForm(),
 };
-const LEDGER_RESET = () => ({ q: '', bucket: '', group: '', from: '', to: '', type: '', categoryId: '', departmentId: '', partyId: '', projectId: '', accountId: '', paymentMode: '', page: 0 });
+const LEDGER_RESET = () => ({ q: '', bucket: '', group: '', from: '', to: '', type: '', categoryId: '', departmentId: '', partyId: '', projectId: '', accountId: '', transferDirection: '', paymentMode: '', page: 0 });
 
 async function resetToTestData() {
   const { data, attachments } = buildSeed();
@@ -7833,7 +7872,6 @@ function getSeedOtherPartyMaster() {
 
 /* ============================ boot ============================ */
 let _globalBound = false;
-
 function initCdCellEdit(td: HTMLElement) {
   if (!td || td.querySelector('input')) return;
   const rowId = td.dataset.cdId;
@@ -7896,103 +7934,10 @@ function initCdCellEdit(td: HTMLElement) {
   });
 }
 
-function initAccBalCellEdit(td: HTMLElement) {
-  if (!td || td.querySelector('input')) return;
-  const accId = td.dataset.accId || '';
-  const accName = td.dataset.accName || 'Account';
-  const periodKey = td.dataset.periodKey || '';
-  const periodCol = td.dataset.periodCol || '';
-  const periodLabel = td.dataset.periodLabel || '';
-  const periodIdx = parseInt(td.dataset.periodIdx || '0', 10);
-  const initialVal = td.dataset.val !== undefined ? td.dataset.val : '0';
-  const origHTML = td.innerHTML;
-
-  td.innerHTML = `<input type="number" step="any" class="acc-bal-inline-input" value="${Number(initialVal) || 0}" style="width:100%;min-width:70px;text-align:right;background:var(--surface);border:1px solid var(--accent, #1E7A4F);color:var(--ink);border-radius:4px;padding:2px 4px;font-family:inherit;font-size:inherit;font-weight:600;outline:none;box-sizing:border-box;" />`;
-  const inp = td.querySelector('input') as HTMLInputElement;
-  if (!inp) return;
-  inp.focus();
-  inp.select();
-
-  let committed = false;
-  const commit = async () => {
-    if (committed) return;
-    committed = true;
-    const raw = inp.value.trim();
-    if (raw === '') {
-      td.innerHTML = origHTML;
-      return;
-    }
-    const newVal = Number(raw);
-    if (isNaN(newVal)) {
-      td.innerHTML = origHTML;
-      return;
-    }
-    if (newVal === Number(initialVal)) {
-      td.innerHTML = origHTML;
-      return;
-    }
-
-    td.innerHTML = `<span style="opacity:0.6">${money(newVal)}</span>`;
-    try {
-      if (typeof (window as any).__updateAccountBalanceCell === 'function') {
-        await (window as any).__updateAccountBalanceCell(accId, accName, periodKey, periodCol, periodIdx, newVal);
-        toast(`Updated ${accName} balance for ${periodLabel || periodKey}: ${money(newVal)}`);
-      } else {
-        let acc = api.get('accounts', accId) || (Store.data?.accounts || []).find((a: any) =>
-          String(a.id) === String(accId) ||
-          String(a.name || '').trim().toLowerCase() === String(accName || '').trim().toLowerCase()
-        );
-        if (acc) {
-          (acc as any).monthlyBalances = (acc as any).monthlyBalances || {};
-          if (periodKey) (acc as any).monthlyBalances[periodKey] = newVal;
-          if (periodCol) (acc as any).monthlyBalances[periodCol] = newVal;
-          if (periodIdx === 0) (acc as any).openingBalance = newVal;
-        }
-        if (Store.data) {
-          Store.data.account_monthly_balances = Store.data.account_monthly_balances || {};
-          const key = String(acc?.id || accId);
-          Store.data.account_monthly_balances[key] = Store.data.account_monthly_balances[key] || {};
-          if (periodKey) Store.data.account_monthly_balances[key][periodKey] = newVal;
-          if (periodCol) Store.data.account_monthly_balances[key][periodCol] = newVal;
-          Store.persist();
-        }
-        toast(`Updated ${accName} balance: ${money(newVal)}`);
-        render({ keepScroll: true });
-      }
-    } catch (err: any) {
-      toast(`Failed to save balance: ${err?.message || err}`, 'error');
-      td.innerHTML = origHTML;
-    }
-  };
-
-  inp.addEventListener('keydown', (e: KeyboardEvent) => {
-    if (e.key === 'Enter') {
-      if ((e as any).isComposing) return;
-      e.preventDefault();
-      inp.blur();
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      committed = true;
-      td.innerHTML = origHTML;
-    }
-  });
-
-  inp.addEventListener('blur', () => {
-    commit();
-  });
-}
-
 function bindGlobal() {
   if (_globalBound) return;
   _globalBound = true;
   document.addEventListener('dblclick', async (ev: any) => {
-    const accTd = ev.target?.closest?.('td.acc-bal-cell');
-    if (accTd) {
-      ev.preventDefault();
-      ev.stopPropagation();
-      initAccBalCellEdit(accTd);
-      return;
-    }
     const cdTd = ev.target?.closest?.('td.cd-cell');
     if (cdTd) {
       ev.preventDefault();
@@ -8099,6 +8044,20 @@ function bindGlobal() {
     });
   });
   document.addEventListener('click', (ev: any) => {
+    const transferInCell = ev.target?.closest?.('td.acc-transfer-in-cell');
+    if (transferInCell) {
+      const accountId = transferInCell.dataset.accId || '';
+      if (!accountId) return;
+      go('ledger', {
+        ...LEDGER_RESET(),
+        accountId,
+        type: 'transfer',
+        transferDirection: 'in',
+        from: transferInCell.dataset.periodFrom || '',
+        to: transferInCell.dataset.periodTo || ''
+      });
+      return;
+    }
     const cdTd = ev.target?.closest?.('td.cd-cell, td[data-act="cd-drill"]');
     if (cdTd && !cdTd.querySelector('input')) {
       const val = cdTd.dataset.cdVal ?? cdTd.textContent?.trim();
