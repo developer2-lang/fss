@@ -9,7 +9,10 @@ const ATTACHMENT_BUCKETS = new Set([
   'pay an employee attachment',
   'pay a vendor attachment',
   'order_pos_storage',
-  'proforma-invoices'
+  'proforma-invoices',
+  'peformance_invoice_email_attachment',
+  'client_payment_email_attchment',
+  'pay_vendor_email_attachment'
 ]);
 const ATTACHMENT_ROOT = 'fss-form-attachments';
 const ALLOWED_ATTACHMENT_TYPES = new Set([
@@ -129,7 +132,14 @@ Deno.serve(async request => {
         data: {
           path,
           token: signedUpload.token,
-          url: bucket === 'proforma-invoices' ? null : storage.getPublicUrl(path).data.publicUrl
+          url: [
+            'proforma-invoices',
+            'peformance_invoice_email_attachment',
+            'client_payment_email_attchment',
+            'pay_vendor_email_attachment'
+          ].includes(bucket)
+            ? null
+            : storage.getPublicUrl(path).data.publicUrl
         }
       });
     }

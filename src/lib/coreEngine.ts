@@ -1,5 +1,11 @@
 // @ts-nocheck
-import { isSupabaseConfigured, SupabaseService } from './supabase';
+import {
+  CLIENT_PAYMENT_EMAIL_ATTACHMENT_BUCKET,
+  isSupabaseConfigured,
+  PI_EMAIL_ATTACHMENT_BUCKET,
+  SupabaseService,
+  VENDOR_PAYMENT_EMAIL_ATTACHMENT_BUCKET
+} from './supabase';
 
 /* ==========================================================================
    IUOVA CASHFLOW TRACKER — v2.0  (single-file prototype)
@@ -9109,8 +9115,12 @@ async function deliverEmail(record, attachments, bucket = 'proforma-invoices') {
 async function finalizeEmail(E, { entity, entityId, docs = [], sendNow = false }) {
   if (!E || !E.on) return null;
   const metas = [];
-  const emailAttachmentBucket = sendNow && E.kind === 'pi_issued' && E.files.length && isSupabaseConfigured
-    ? 'proforma-invoices'
+  const emailAttachmentBucket = sendNow && E.files.length && isSupabaseConfigured
+    ? ({
+      pi_issued: PI_EMAIL_ATTACHMENT_BUCKET,
+      client_receipt: CLIENT_PAYMENT_EMAIL_ATTACHMENT_BUCKET,
+      vendor_payment: VENDOR_PAYMENT_EMAIL_ATTACHMENT_BUCKET
+    })[E.kind] || null
     : null;
   const uploadedEmailFiles = emailAttachmentBucket
     ? await SupabaseService.uploadFormAttachments(emailAttachmentBucket, E.files)

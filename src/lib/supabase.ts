@@ -15,6 +15,10 @@ export const supabase: SupabaseClient<any, any> | null = isSupabaseConfigured
     })
   : null;
 
+export const PI_EMAIL_ATTACHMENT_BUCKET = 'peformance_invoice_email_attachment' as const;
+export const CLIENT_PAYMENT_EMAIL_ATTACHMENT_BUCKET = 'client_payment_email_attchment' as const;
+export const VENDOR_PAYMENT_EMAIL_ATTACHMENT_BUCKET = 'pay_vendor_email_attachment' as const;
+
 export interface SupabaseSyncStatus {
   configured: boolean;
   connected: boolean;
@@ -62,7 +66,10 @@ export type FormAttachmentBucket =
   | 'pay an employee attachment'
   | 'pay a vendor attachment'
   | 'order_pos_storage'
-  | 'proforma-invoices';
+  | 'proforma-invoices'
+  | typeof PI_EMAIL_ATTACHMENT_BUCKET
+  | typeof CLIENT_PAYMENT_EMAIL_ATTACHMENT_BUCKET
+  | typeof VENDOR_PAYMENT_EMAIL_ATTACHMENT_BUCKET;
 
 const FSS_TRANSACTION_COLUMNS = [
   'id', 'transaction_date', 'type', 'category', 'description', 'reference_no',
@@ -1585,6 +1592,9 @@ export const SupabaseService = {
             size: file.size,
             storagePath: path,
             url: bucket === 'proforma-invoices'
+              || bucket === PI_EMAIL_ATTACHMENT_BUCKET
+              || bucket === CLIENT_PAYMENT_EMAIL_ATTACHMENT_BUCKET
+              || bucket === VENDOR_PAYMENT_EMAIL_ATTACHMENT_BUCKET
               ? null
               : signedUpload.url || supabase.storage.from(bucket).getPublicUrl(path).data?.publicUrl || null
           });

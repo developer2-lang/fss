@@ -31,7 +31,12 @@ const SUPABASE_SERVICE_ROLE_KEY =
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
 const MAX_INLINE_ATTACHMENT_BYTES = 2.5 * 1024 * 1024;
-const INLINE_ATTACHMENT_BUCKETS = new Set(["proforma-invoices"]);
+const INLINE_ATTACHMENT_BUCKETS = new Set([
+  "proforma-invoices",
+  "peformance_invoice_email_attachment",
+  "client_payment_email_attchment",
+  "pay_vendor_email_attachment",
+]);
 const ALLOWED_ATTACHMENT_TYPES = new Set([
   "application/pdf",
   "image/jpeg",
@@ -323,9 +328,13 @@ Deno.serve(async (req: Request) => {
       ) {
         const bucket = rawAttachment.bucket;
         const path = rawAttachment.storagePath;
+        const pathPattern = new RegExp(
+          `^fss-form-attachments/${bucket}/(?:development|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})/[A-Za-z0-9._-]+$`,
+          "i",
+        );
         if (
           !INLINE_ATTACHMENT_BUCKETS.has(bucket) ||
-          !/^fss-form-attachments\/proforma-invoices\/(?:development|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/[A-Za-z0-9._-]+$/i.test(path)
+          !pathPattern.test(path)
         ) {
           return Response.json(
             { success: false, error: `Attachment "${filename}" is not in the PI attachment storage path` },
