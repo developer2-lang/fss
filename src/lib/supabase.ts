@@ -16,7 +16,7 @@ export const supabase: SupabaseClient<any, any> | null = isSupabaseConfigured
   : null;
 
 export const PI_EMAIL_ATTACHMENT_BUCKET = 'peformance_invoice_email_attachment' as const;
-export const CLIENT_PAYMENT_EMAIL_ATTACHMENT_BUCKET = 'client_payment_email_attchment' as const;
+export const CLIENT_PAYMENT_EMAIL_ATTACHMENT_BUCKET = 'clent_payment_email_attchment' as const;
 export const VENDOR_PAYMENT_EMAIL_ATTACHMENT_BUCKET = 'pay_vendor_email_attachment' as const;
 
 export interface SupabaseSyncStatus {

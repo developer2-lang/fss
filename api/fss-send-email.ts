@@ -166,7 +166,7 @@ export async function sendInvoiceEmail(
       && (
         attachment.bucket === 'proforma-invoices'
         || attachment.bucket === 'peformance_invoice_email_attachment'
-        || attachment.bucket === 'client_payment_email_attchment'
+        || attachment.bucket === 'clent_payment_email_attchment'
         || attachment.bucket === 'pay_vendor_email_attachment'
         || attachment.bucket === 'pay a vendor attachment'
         || attachment.bucket === 'client_payment'

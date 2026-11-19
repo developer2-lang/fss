@@ -34,7 +34,7 @@ const MAX_INLINE_ATTACHMENT_BYTES = 2.5 * 1024 * 1024;
 const INLINE_ATTACHMENT_BUCKETS = new Set([
   "proforma-invoices",
   "peformance_invoice_email_attachment",
-  "client_payment_email_attchment",
+  "clent_payment_email_attchment",
   "pay_vendor_email_attachment",
 ]);
 const ALLOWED_ATTACHMENT_TYPES = new Set([

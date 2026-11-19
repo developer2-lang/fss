@@ -11,7 +11,7 @@ const ATTACHMENT_BUCKETS = new Set([
   'order_pos_storage',
   'proforma-invoices',
   'peformance_invoice_email_attachment',
-  'client_payment_email_attchment',
+  'clent_payment_email_attchment',
   'pay_vendor_email_attachment'
 ]);
 const ATTACHMENT_ROOT = 'fss-form-attachments';
@@ -135,7 +135,7 @@ Deno.serve(async request => {
           url: [
             'proforma-invoices',
             'peformance_invoice_email_attachment',
-            'client_payment_email_attchment',
+            'clent_payment_email_attchment',
             'pay_vendor_email_attachment'
           ].includes(bucket)
             ? null
